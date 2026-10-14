@@ -1,0 +1,11 @@
+# Cargo output: the workspace root shares one target dir
+/target/
+
+# axum_dsl build output: generated crates and their own target dirs
+/build/
+/vendor/
+
+.DS_Store
+
+# Built gems
+*.gem

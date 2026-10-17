@@ -8,15 +8,14 @@ Gem::Specification.new do |spec|
   spec.authors = ["rajangdavis"]
   spec.email = ["rajangdavis@gmail.com"]
 
-  spec.summary = "Write MCP servers as strict Ruby and compile them to Rust."
-  spec.description = "A compiler from a small Ruby DSL to Rust MCP server crates (rmcp). It has a command " \
+  spec.summary = "Write axum services as strict Ruby and compile them to Rust."
+  spec.description = "A compiler from a small Ruby DSL to Rust axum HTTP service crates. It has a command " \
                      "line (check, build, run, skill), escape hatches for subprocesses, bindings and injected " \
                      "Rust, and writes an agent skill that teaches the DSL."
   # Tested on the version in .tool-versions; loosen it once an older Ruby has run `make check`.
   spec.required_ruby_version = ">= 4.0"
   spec.license = "AGPL-3.0-only"
   spec.metadata["rubygems_mfa_required"] = "true"
-  spec.metadata["rmcp_version"] = AxumDsl::RMCP_VERSION # the rmcp the servers it generates are built against
   spec.homepage = "https://github.com/rajangdavis/axum_dsl"
   spec.metadata["source_code_uri"] = "https://github.com/rajangdavis/axum_dsl"
 

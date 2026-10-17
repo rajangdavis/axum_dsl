@@ -1,0 +1,3 @@
+--dir=examples
+--dir=rbi
+--dir=sorbet/rbi/axum_dsl

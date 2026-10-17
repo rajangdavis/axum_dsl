@@ -1,0 +1,604 @@
+# Shim catalog: string methods. Format described in SPEC.md section 2.
+# receiver: native_ruby -> a plain Ruby String; rust_type -> Rust::Str.
+# Expected values are literal. Never compute them in the test.
+- name: String#strip
+  receiver: native_ruby
+  method: strip
+  rust: "s.trim_matches(|c: char| matches!(c, '\\u{0}' | '\\t' | '\\n' | '\\u{b}' | '\\u{c}' | '\\r' | ' '))"
+  kind: reimplemented
+  notes: "Ruby strips NUL, \\t \\n \\v \\f \\r and space. NBSP (U+00A0) is NOT stripped."
+  notify: { code: N-STR-STRIP-RUBY, level: notice }
+  examples:
+    - { in: { s: "" },              out: "" }
+    - { in: { s: "  hi \n" },       out: "hi" }
+    - { in: { s: "\u000bx\u000b" }, out: "x" }
+    - { in: { s: "\u00a0x\u00a0" }, out: "\u00a0x\u00a0" }
+    - { in: { s: "日本 " },          out: "日本" }
+
+- name: Rust::Str#strip
+  receiver: rust_type
+  method: strip
+  rust: "s.trim()"
+  kind: plain_alias
+  notes: "Rust trim(): strips Unicode White_Space, including NBSP. NUL is not whitespace."
+  notify: { code: N-STR-STRIP-RUST, level: notice }
+  examples:
+    - { in: { s: "" },              out: "" }
+    - { in: { s: "  hi \n" },       out: "hi" }
+    - { in: { s: "\u000bx\u000b" }, out: "x" }
+    - { in: { s: "\u00a0x\u00a0" }, out: "x" }
+    - { in: { s: "　日本　" }, out: "日本" }
+    - { in: { s: "\u0000x\u0000" }, out: "\u0000x\u0000" }
+
+- name: String#downcase
+  receiver: native_ruby
+  method: downcase
+  rust: "s.to_lowercase()"
+  kind: plain_alias
+  examples:
+    - { in: { s: "" },      out: "" }
+    - { in: { s: "ABC" },   out: "abc" }
+    - { in: { s: "ÉCOLE" }, out: "école" }
+
+- name: Rust::Str#to_lowercase
+  receiver: rust_type
+  method: to_lowercase
+  rust: "s.to_lowercase()"
+  kind: plain_alias
+  examples:
+    - { in: { s: "" },      out: "" }
+    - { in: { s: "ABC" },   out: "abc" }
+    - { in: { s: "ÉCOLE" }, out: "école" }
+
+- name: String#length
+  receiver: native_ruby
+  method: length
+  rust: "s.chars().count()"
+  kind: reimplemented
+  notes: "Ruby counts characters. Emitted Rust must use chars().count(), not len()."
+  examples:
+    - { in: { s: "" },      out: 0 }
+    - { in: { s: "abc" },   out: 3 }
+    - { in: { s: "héllo" }, out: 5 }
+    - { in: { s: "日本" },   out: 2 }
+
+- name: Rust::Str#len
+  receiver: rust_type
+  method: len
+  rust: "s.len()"
+  kind: plain_alias
+  notes: "Rust len() is the byte length."
+  examples:
+    - { in: { s: "" },      out: 0 }
+    - { in: { s: "abc" },   out: 3 }
+    - { in: { s: "héllo" }, out: 6 }
+    - { in: { s: "日本" },   out: 6 }
+
+# gsub/sub: String patterns are literal; Regexp patterns are translated to Rust's regex
+# crate by AxumDsl::RegexTranslate (bin/gen_shim_tests applies it to `regex_args`).
+# `args` names the keys of `in` passed after the receiver. Replacements have no backslash.
+- name: String#gsub(string, string)
+  receiver: native_ruby
+  method: gsub
+  args: [pat, repl]
+  kind: reimplemented
+  notes: "Literal replacement of every occurrence: Rust str::replace."
+  rust: "s.replace(pat, repl)"
+  examples:
+    - { in: { s: "", pat: "a", repl: "b" },        out: "" }
+    - { in: { s: "aXa", pat: "a", repl: "b" },     out: "bXb" }
+    - { in: { s: "a.a", pat: ".", repl: "!" },     out: "a!a" }
+    - { in: { s: "日本日", pat: "日", repl: "x" },  out: "x本x" }
+    - { in: { s: "$a$", pat: "a", repl: "$1" },    out: "$$1$" }
+    - { in: { s: "x", pat: "", repl: "-" },        out: "-x-" }
+
+- name: String#sub(string, string)
+  receiver: native_ruby
+  method: sub
+  args: [pat, repl]
+  kind: reimplemented
+  notes: "Literal replacement of the first occurrence: Rust str::replacen(.., 1)."
+  rust: "s.replacen(pat, repl, 1)"
+  examples:
+    - { in: { s: "", pat: "a", repl: "b" },        out: "" }
+    - { in: { s: "aaa", pat: "a", repl: "b" },     out: "baa" }
+    - { in: { s: "xyz", pat: "q", repl: "b" },     out: "xyz" }
+    - { in: { s: "日本日", pat: "日", repl: "x" },  out: "x本日" }
+
+- name: String#gsub(regex, string)
+  receiver: native_ruby
+  method: gsub
+  args: [pat, repl]
+  regex_args: [pat]
+  kind: reimplemented
+  notes: "pat is Ruby regex source; the Rust side gets RegexTranslate output. \\d is ASCII-only in Ruby."
+  rust: "regex::Regex::new(pat).unwrap().replace_all(s, regex::NoExpand(repl)).into_owned()"
+  examples:
+    - { in: { s: "", pat: "x", repl: "y" },              out: "" }
+    - { in: { s: "a1b22", pat: "\\d+", repl: "#" },      out: "a#b#" }
+    - { in: { s: "a\nb", pat: "^b", repl: "X" },         out: "a\nX" }
+    - { in: { s: "cost", pat: "o", repl: "$" },          out: "c$st" }
+    - { in: { s: "a٣b", pat: "\\d", repl: "#" },    out: "a٣b" }
+    - { in: { s: "héllo", pat: "[^a-z]", repl: "_" },    out: "h_llo" }
+    - { in: { s: "--a--", pat: "\\A-+|-+\\z", repl: "" }, out: "a" }
+
+- name: String#sub(regex, string)
+  receiver: native_ruby
+  method: sub
+  args: [pat, repl]
+  regex_args: [pat]
+  kind: reimplemented
+  notes: "First match only."
+  rust: "regex::Regex::new(pat).unwrap().replace(s, regex::NoExpand(repl)).into_owned()"
+  examples:
+    - { in: { s: "", pat: "x", repl: "y" },          out: "" }
+    - { in: { s: "a1b22", pat: "\\d+", repl: "#" },  out: "a#b22" }
+    - { in: { s: "abc", pat: "z", repl: "y" },       out: "abc" }
+    - { in: { s: "x\ny", pat: "^y", repl: "Z" },     out: "x\nZ" }
+
+# split with no argument splits on runs of ASCII whitespace (space, \t \n \v \f \r) and
+# ignores leading and trailing runs. NBSP and NUL are NOT separators in Ruby.
+- name: String#split.length
+  receiver: native_ruby
+  method: [split, length]
+  kind: reimplemented
+  notes: "Ruby awk-style split. Rust: split on the explicit set, drop empty pieces, count."
+  rust: "s.split(|c: char| matches!(c, ' ' | '\\t' | '\\n' | '\\u{b}' | '\\u{c}' | '\\r')).filter(|w| !w.is_empty()).count() as i64"
+  examples:
+    - { in: { s: "" },                   out: 0 }
+    - { in: { s: "one" },                out: 1 }
+    - { in: { s: "  a  b\tc\n" },        out: 3 }
+    - { in: { s: "a\u00a0b" },           out: 1 }
+    - { in: { s: "a\u0000b" },           out: 1 }
+    - { in: { s: "日本 語" },             out: 2 }
+    - { in: { s: " \u000b x \u000c " },  out: 1 }
+
+# Ruby capitalize: first character titlecased, the rest downcased. Rust has no titlecase
+# mapping, so characters like ß ("Ss" in Ruby, "SS" via to_uppercase) and ǆ differ. Those are
+# why this entry carries a warning; the examples below avoid them on purpose.
+- name: String#capitalize
+  receiver: native_ruby
+  method: capitalize
+  kind: reimplemented
+  notify: { code: W-STR-CAPITALIZE, level: warning }
+  rust: "{ let mut cs = s.chars(); match cs.next() { Some(f) => f.to_uppercase().collect::<String>() + &cs.as_str().to_lowercase(), None => String::new() } }"
+  examples:
+    - { in: { s: "" },        out: "" }
+    - { in: { s: "hello" },   out: "Hello" }
+    - { in: { s: "HELLO" },   out: "Hello" }
+    - { in: { s: "éCOLE" },   out: "École" }
+    - { in: { s: "1abc" },    out: "1abc" }
+    - { in: { s: "日本" },     out: "日本" }
+
+# Tests and small reshapers added with the body language's first string predicates. Each is a
+# one-to-one Ruby/Rust mapping on valid UTF-8 (prefix, suffix and substring tests are byte-wise in
+# both). Regex arguments to start_with? and include? are a different Ruby method and are refused.
+- name: String#start_with?
+  receiver: native_ruby
+  method: start_with?
+  args: [pre]
+  kind: plain_alias
+  rust: "s.starts_with(pre)"
+  examples:
+    - { in: { s: "", pre: "" },                out: true }
+    - { in: { s: "", pre: "a" },               out: false }
+    - { in: { s: "abc", pre: "" },             out: true }
+    - { in: { s: "https://x", pre: "https" },  out: true }
+    - { in: { s: "abc", pre: "abcd" },         out: false }
+    - { in: { s: "ABC", pre: "a" },            out: false }
+    - { in: { s: "日本語", pre: "日本" },        out: true }
+
+- name: String#end_with?
+  receiver: native_ruby
+  method: end_with?
+  args: [suf]
+  kind: plain_alias
+  rust: "s.ends_with(suf)"
+  examples:
+    - { in: { s: "", suf: "" },                out: true }
+    - { in: { s: "", suf: "a" },               out: false }
+    - { in: { s: "abc", suf: "" },             out: true }
+    - { in: { s: "a/b/", suf: "/" },           out: true }
+    - { in: { s: "abc", suf: "xabc" },         out: false }
+    - { in: { s: "日本語", suf: "本語" },        out: true }
+
+- name: String#include?
+  receiver: native_ruby
+  method: include?
+  args: [sub]
+  kind: plain_alias
+  rust: "s.contains(sub)"
+  examples:
+    - { in: { s: "", sub: "" },                out: true }
+    - { in: { s: "", sub: "a" },               out: false }
+    - { in: { s: "abc", sub: "" },             out: true }
+    - { in: { s: "http://x", sub: "://" },     out: true }
+    - { in: { s: "abc", sub: "ac" },           out: false }
+    - { in: { s: "日本語", sub: "本" },          out: true }
+
+- name: String#empty?
+  receiver: native_ruby
+  method: empty?
+  kind: plain_alias
+  rust: "s.is_empty()"
+  examples:
+    - { in: { s: "" },      out: true }
+    - { in: { s: " " },     out: false }
+    - { in: { s: "a" },     out: false }
+    - { in: { s: "\u0000" }, out: false }
+
+# match?: an unanchored search, like Rust is_match. The pattern goes through RegexTranslate.
+- name: String#match?(regex)
+  receiver: native_ruby
+  method: match?
+  args: [pat]
+  regex_args: [pat]
+  kind: reimplemented
+  notes: "Ruby ^ and $ are line anchors; \\d is ASCII-only. Both are handled by RegexTranslate."
+  rust: "regex::Regex::new(pat).unwrap().is_match(s)"
+  examples:
+    - { in: { s: "", pat: "x" },                    out: false }
+    - { in: { s: "", pat: "\\A\\z" },               out: true }
+    - { in: { s: "a1", pat: "\\d" },                out: true }
+    - { in: { s: "abc", pat: "\\d" },               out: false }
+    - { in: { s: "https://x", pat: "\\Ahttps?://" }, out: true }
+    - { in: { s: "xhttp://", pat: "\\Ahttps?://" },  out: false }
+    - { in: { s: "a\nb", pat: "^b" },               out: true }
+    - { in: { s: "a٣b", pat: "\\d" },               out: false }
+
+# reverse works by code point in both languages (combining marks are not kept with their base).
+- name: String#reverse
+  receiver: native_ruby
+  method: reverse
+  kind: plain_alias
+  rust: "s.chars().rev().collect::<String>()"
+  examples:
+    - { in: { s: "" },        out: "" }
+    - { in: { s: "abc" },     out: "cba" }
+    - { in: { s: "héllo" },   out: "olléh" }
+    - { in: { s: "日本" },     out: "本日" }
+
+# Nil-able results (`option: true`): Ruby returns nil where Rust returns None. The DSL only lets a
+# body use them through `|| default`, `.nil?` and `.to_s`.
+- name: String#index(string)
+  receiver: native_ruby
+  method: index
+  args: [sub]
+  option: true
+  kind: reimplemented
+  notes: "Character offset of the first match, or nil. Ruby counts characters, so the Rust maps the byte offset back."
+  rust: "{ let hay = s; hay.find(sub).map(|b| hay[..b].chars().count() as i64) }"
+  examples:
+    - { in: { s: "", sub: "" },          out: 0 }
+    - { in: { s: "", sub: "a" },         out: null }
+    - { in: { s: "hello", sub: "l" },    out: 2 }
+    - { in: { s: "héllo", sub: "l" },    out: 2 }
+    - { in: { s: "日本語", sub: "語" },    out: 2 }
+    - { in: { s: "abc", sub: "" },       out: 0 }
+    - { in: { s: "abc", sub: "d" },      out: null }
+
+# split(string): Ruby keeps leading empty pieces and drops trailing ones. The separator " " (awk
+# mode) and "" (every character) behave differently in Ruby and are refused by the compiler.
+- name: String#split(string).length
+  receiver: native_ruby
+  method: [split, length]
+  args: [sep]
+  kind: reimplemented
+  rust: "{ let mut v: Vec<String> = s.split(sep).map(|p| p.to_string()).collect(); while v.last().is_some_and(|l| l.is_empty()) { v.pop(); } v.len() as i64 }"
+  examples:
+    - { in: { s: "", sep: "," },         out: 0 }
+    - { in: { s: "a,b", sep: "," },      out: 2 }
+    - { in: { s: "a,b,,", sep: "," },    out: 2 }
+    - { in: { s: ",a", sep: "," },       out: 2 }
+    - { in: { s: ",,", sep: "," },       out: 0 }
+    - { in: { s: "a--b", sep: "--" },    out: 2 }
+    - { in: { s: "日,本", sep: "," },     out: 2 }
+
+- name: String#split(string).first
+  receiver: native_ruby
+  method: [split, first]
+  args: [sep]
+  option: true
+  kind: reimplemented
+  rust: "{ let mut v: Vec<String> = s.split(sep).map(|p| p.to_string()).collect(); while v.last().is_some_and(|l| l.is_empty()) { v.pop(); } v.first().cloned() }"
+  examples:
+    - { in: { s: "", sep: "," },         out: null }
+    - { in: { s: ",a", sep: "," },       out: "" }
+    - { in: { s: "a,b", sep: "," },      out: "a" }
+    - { in: { s: ",,", sep: "," },       out: null }
+    - { in: { s: "日,本", sep: "," },     out: "日" }
+
+- name: String#split(string).last
+  receiver: native_ruby
+  method: [split, last]
+  args: [sep]
+  option: true
+  kind: reimplemented
+  rust: "{ let mut v: Vec<String> = s.split(sep).map(|p| p.to_string()).collect(); while v.last().is_some_and(|l| l.is_empty()) { v.pop(); } v.last().cloned() }"
+  examples:
+    - { in: { s: "", sep: "," },         out: null }
+    - { in: { s: "a,b", sep: "," },      out: "b" }
+    - { in: { s: "a,b,,", sep: "," },    out: "b" }
+    - { in: { s: ",a", sep: "," },       out: "a" }
+    - { in: { s: "日,本", sep: "," },     out: "本" }
+
+# tr, delete and squeeze take Ruby character sets. The compiler supports plain characters only (no
+# a-z ranges, no ^, no backslashes), where a set is just a list of characters; tr needs equal-length
+# sets with distinct source characters.
+- name: String#tr
+  receiver: native_ruby
+  method: tr
+  args: [from, to]
+  kind: reimplemented
+  rust: "s.chars().map(|c| match from.chars().position(|f| f == c) { Some(i) => to.chars().nth(i).unwrap(), None => c }).collect::<String>()"
+  examples:
+    - { in: { s: "", from: "a", to: "b" },            out: "" }
+    - { in: { s: "hello", from: "el", to: "ip" },     out: "hippo" }
+    - { in: { s: "abc", from: "abc", to: "xyz" },     out: "xyz" }
+    - { in: { s: "日本", from: "日", to: "月" },        out: "月本" }
+    - { in: { s: "aaa", from: "a", to: "b" },         out: "bbb" }
+    - { in: { s: "a-b", from: "-", to: "_" },         out: "a_b" }
+    - { in: { s: "a-b", from: "a-", to: "x_" },       out: "x_b" }
+
+- name: String#delete
+  receiver: native_ruby
+  method: delete
+  args: [set]
+  kind: reimplemented
+  rust: "s.chars().filter(|c| !set.contains(*c)).collect::<String>()"
+  examples:
+    - { in: { s: "", set: "a" },          out: "" }
+    - { in: { s: "hello", set: "l" },     out: "heo" }
+    - { in: { s: "hello", set: "lo" },    out: "he" }
+    - { in: { s: "日本語", set: "本" },     out: "日語" }
+    - { in: { s: "abc", set: "x" },       out: "abc" }
+    - { in: { s: "a-b", set: "-" },       out: "ab" }
+    - { in: { s: "a-b_c", set: "-_" },    out: "abc" }
+
+- name: String#squeeze
+  receiver: native_ruby
+  method: squeeze
+  kind: reimplemented
+  notes: "With no argument, every run of the same character becomes one."
+  rust: "{ let mut o = String::new(); let mut last: Option<char> = None; for c in s.chars() { if last != Some(c) { o.push(c); } last = Some(c); } o }"
+  examples:
+    - { in: { s: "" },          out: "" }
+    - { in: { s: "aaabbb" },    out: "ab" }
+    - { in: { s: "abc" },       out: "abc" }
+    - { in: { s: "aabbaa" },    out: "aba" }
+    - { in: { s: "ééa" },       out: "éa" }
+    - { in: { s: "  x  " },     out: " x " }
+
+# to_i: Ruby's parsing rules, with an i64 result. A value that does not fit is an error result in the
+# DSL (Ruby would return a bignum), so no example here overflows. `helper:` names the Emit constant
+# whose Rust text the test file defines.
+- name: String#to_i
+  receiver: native_ruby
+  method: to_i
+  kind: reimplemented
+  helper: str_to_i
+  notes: "Leading whitespace, optional sign, digits with single underscores between them; stops at anything else; no digits is 0. The result is an i64 and a value that does not fit is an error result."
+  rust: "str_to_i(s, \"t\").unwrap()"
+  examples:
+    - { in: { s: "" },                        out: 0 }
+    - { in: { s: "42" },                      out: 42 }
+    - { in: { s: "  -42xyz" },                out: -42 }
+    - { in: { s: "\n 7" },                    out: 7 }
+    - { in: { s: "1_000" },                   out: 1000 }
+    - { in: { s: "1__0" },                    out: 1 }
+    - { in: { s: "1_" },                      out: 1 }
+    - { in: { s: "_1" },                      out: 0 }
+    - { in: { s: "+5" },                      out: 5 }
+    - { in: { s: "+-5" },                     out: 0 }
+    - { in: { s: "- 4" },                     out: 0 }
+    - { in: { s: "0x1A" },                    out: 0 }
+    - { in: { s: "٣" },                       out: 0 }
+    - { in: { s: "007" },                     out: 7 }
+    - { in: { s: "12abc" },                   out: 12 }
+    - { in: { s: "9223372036854775807" },     out: 9223372036854775807 }
+    - { in: { s: "-9223372036854775808" },    out: -9223372036854775808 }
+
+# split with a limit (an integer literal in the DSL). A positive limit stops after that many pieces and
+# keeps trailing empties; a negative one splits fully and keeps them; the empty string gives no pieces.
+- name: String#split(string, int).length
+  receiver: native_ruby
+  method: [split, length]
+  args: [sep, limit]
+  kind: reimplemented
+  rust: "{ let v: Vec<String> = if s.is_empty() { vec![] } else if limit > 0 { s.splitn(limit as usize, sep).map(|p| p.to_string()).collect() } else { s.split(sep).map(|p| p.to_string()).collect() }; v.len() as i64 }"
+  examples:
+    - { in: { s: "", sep: ",", limit: 2 },        out: 0 }
+    - { in: { s: "", sep: ",", limit: -1 },       out: 0 }
+    - { in: { s: "a,b,c", sep: ",", limit: 2 },   out: 2 }
+    - { in: { s: "a,b,,", sep: ",", limit: 2 },   out: 2 }
+    - { in: { s: "a,b,,", sep: ",", limit: -1 },  out: 4 }
+    - { in: { s: ",a", sep: ",", limit: 2 },      out: 2 }
+    - { in: { s: "abc", sep: ",", limit: 2 },     out: 1 }
+    - { in: { s: "a,b", sep: ",", limit: 1 },     out: 1 }
+    - { in: { s: "a,,", sep: ",", limit: -1 },    out: 3 }
+
+- name: String#split(string, int).last
+  receiver: native_ruby
+  method: [split, last]
+  args: [sep, limit]
+  option: true
+  kind: reimplemented
+  rust: "{ let v: Vec<String> = if s.is_empty() { vec![] } else if limit > 0 { s.splitn(limit as usize, sep).map(|p| p.to_string()).collect() } else { s.split(sep).map(|p| p.to_string()).collect() }; v.last().cloned() }"
+  examples:
+    - { in: { s: "", sep: ",", limit: 2 },        out: null }
+    - { in: { s: "a,b,c", sep: ",", limit: 2 },   out: "b,c" }
+    - { in: { s: "a,b,,", sep: ",", limit: -1 },  out: "" }
+    - { in: { s: "abc", sep: ",", limit: 2 },     out: "abc" }
+    - { in: { s: "a://b", sep: "://", limit: 2 }, out: "b" }
+
+# partition: [before, separator, after]; the whole string and two empties when the separator is absent.
+- name: String#partition(string).first
+  receiver: native_ruby
+  method: [partition, first]
+  args: [sep]
+  kind: reimplemented
+  rust: "match s.find(sep) { Some(i) => s[..i].to_string(), None => s.to_string() }"
+  examples:
+    - { in: { s: "", sep: "/" },          out: "" }
+    - { in: { s: "a/b/c", sep: "/" },     out: "a" }
+    - { in: { s: "abc", sep: "/" },       out: "abc" }
+    - { in: { s: "a//b", sep: "//" },     out: "a" }
+    - { in: { s: "日/本", sep: "/" },      out: "日" }
+    - { in: { s: "abc", sep: "" },        out: "" }
+
+- name: String#partition(string).last
+  receiver: native_ruby
+  method: [partition, last]
+  args: [sep]
+  kind: reimplemented
+  rust: "match s.find(sep) { Some(i) => s[i + sep.len()..].to_string(), None => String::new() }"
+  examples:
+    - { in: { s: "", sep: "/" },          out: "" }
+    - { in: { s: "a/b/c", sep: "/" },     out: "b/c" }
+    - { in: { s: "abc", sep: "/" },       out: "" }
+    - { in: { s: "a//b", sep: "//" },     out: "b" }
+    - { in: { s: "日/本", sep: "/" },      out: "本" }
+    - { in: { s: "abc", sep: "" },        out: "abc" }
+
+# lines splits after every "\n" and keeps it; "" has no lines.
+- name: String#lines.length
+  receiver: native_ruby
+  method: [lines, length]
+  kind: reimplemented
+  rust: "s.split_inclusive('\\n').count() as i64"
+  examples:
+    - { in: { s: "" },          out: 0 }
+    - { in: { s: "a" },         out: 1 }
+    - { in: { s: "a\n" },       out: 1 }
+    - { in: { s: "a\nb" },      out: 2 }
+    - { in: { s: "a\n\n" },     out: 2 }
+    - { in: { s: "\n" },        out: 1 }
+    - { in: { s: "a\r\nb" },    out: 2 }
+
+# Slicing counts characters, accepts negative positions, and is nil when out of range.
+- name: String#[](int, int)
+  receiver: native_ruby
+  method: "[]"
+  args: [start, len]
+  option: true
+  kind: reimplemented
+  rust: "{ let cs: Vec<char> = s.chars().collect(); let n = cs.len() as i64; let mut st = start; if st < 0 { st += n; } if st < 0 || st > n || len < 0 { None } else { let en = st.saturating_add(len).min(n); Some(cs[st as usize..en as usize].iter().collect::<String>()) } }"
+  examples:
+    - { in: { s: "hello", start: 1, len: 3 },    out: "ell" }
+    - { in: { s: "hello", start: -3, len: 2 },   out: "ll" }
+    - { in: { s: "hello", start: 5, len: 1 },    out: "" }
+    - { in: { s: "hello", start: 6, len: 1 },    out: null }
+    - { in: { s: "héllo", start: 1, len: 2 },    out: "él" }
+    - { in: { s: "hello", start: 1, len: -1 },   out: null }
+    - { in: { s: "hello", start: 3, len: 100 },  out: "lo" }
+    - { in: { s: "", start: 0, len: 1 },         out: "" }
+    - { in: { s: "", start: 1, len: 1 },         out: null }
+    - { in: { s: "日本語", start: 1, len: 1 },     out: "本" }
+    - { in: { s: "hello", start: -6, len: 2 },   out: null }
+
+- name: String#[](int)
+  receiver: native_ruby
+  method: "[]"
+  args: [idx]
+  option: true
+  kind: reimplemented
+  rust: "{ let cs: Vec<char> = s.chars().collect(); let n = cs.len() as i64; let j = if idx < 0 { idx + n } else { idx }; if j >= 0 && j < n { Some(cs[j as usize].to_string()) } else { None } }"
+  examples:
+    - { in: { s: "abc", idx: 0 },     out: "a" }
+    - { in: { s: "abc", idx: -1 },    out: "c" }
+    - { in: { s: "abc", idx: 3 },     out: null }
+    - { in: { s: "abc", idx: -4 },    out: null }
+    - { in: { s: "héy", idx: 1 },     out: "é" }
+    - { in: { s: "", idx: 0 },        out: null }
+
+# String#*: Ruby raises ArgumentError for a negative count, which the DSL turns into an error result.
+- name: String#*
+  receiver: native_ruby
+  method: "*"
+  args: [count]
+  result: true
+  kind: reimplemented
+  rust: "if count < 0 { Err(()) } else { Ok(s.repeat(count as usize)) }"
+  examples:
+    - { in: { s: "ab", count: 3 },     out: "ababab" }
+    - { in: { s: "ab", count: 0 },     out: "" }
+    - { in: { s: "", count: 5 },       out: "" }
+    - { in: { s: "日", count: 2 },      out: "日日" }
+    - { in: { s: "ab", count: -1 },    raises: ArgumentError }
+
+# Integer(text, 10): strict decimal parsing with an i64 result. Kernel#Integer is called with the text
+# first; `raises:` examples are the invalid values.
+- name: Integer(string, 10)
+  receiver: kernel
+  method: Integer
+  args: [base]
+  result: true
+  helper: str_to_int
+  kind: reimplemented
+  rust: "{ assert_eq!(base, 10); str_to_int(s, \"t\") }"
+  examples:
+    - { in: { s: "42", base: 10 },                     out: 42 }
+    - { in: { s: "  42  ", base: 10 },                 out: 42 }
+    - { in: { s: "-7", base: 10 },                     out: -7 }
+    - { in: { s: "+5", base: 10 },                     out: 5 }
+    - { in: { s: "1_000", base: 10 },                  out: 1000 }
+    - { in: { s: "007", base: 10 },                    out: 7 }
+    - { in: { s: "9223372036854775807", base: 10 },    out: 9223372036854775807 }
+    - { in: { s: "", base: 10 },                       raises: ArgumentError }
+    - { in: { s: " ", base: 10 },                      raises: ArgumentError }
+    - { in: { s: "4 2", base: 10 },                    raises: ArgumentError }
+    - { in: { s: "1__0", base: 10 },                   raises: ArgumentError }
+    - { in: { s: "_1", base: 10 },                     raises: ArgumentError }
+    - { in: { s: "1_", base: 10 },                     raises: ArgumentError }
+    - { in: { s: "0x1A", base: 10 },                   raises: ArgumentError }
+    - { in: { s: "12abc", base: 10 },                  raises: ArgumentError }
+    - { in: { s: "- 5", base: 10 },                    raises: ArgumentError }
+    - { in: { s: "٣", base: 10 },                      raises: ArgumentError }
+    - { in: { s: "--5", base: 10 },                    raises: ArgumentError }
+
+# gsub/sub with a block: the block gets the matched text. `block:` names the block the Ruby test passes
+# (test/test_shims_string.rb BLOCKS); the Rust template does the same thing. Empty matches are replaced
+# once at every position, including the end, in both engines.
+- name: String#gsub(regex) { bracket }
+  receiver: native_ruby
+  method: gsub
+  args: [pat]
+  regex_args: [pat]
+  block: bracket
+  kind: reimplemented
+  rust: "regex::Regex::new(pat).unwrap().replace_all(s, |c: &regex::Captures| format!(\"[{}]\", &c[0])).into_owned()"
+  examples:
+    - { in: { s: "", pat: "x" },          out: "" }
+    - { in: { s: "", pat: "x*" },         out: "[]" }
+    - { in: { s: "abc", pat: "x*" },      out: "[]a[]b[]c[]" }
+    - { in: { s: "a1b22", pat: "\\d+" },  out: "a[1]b[22]" }
+    - { in: { s: "héllo", pat: "é" },     out: "h[é]llo" }
+    - { in: { s: "a\nb", pat: "^b" },     out: "a\n[b]" }
+
+- name: String#sub(regex) { bracket }
+  receiver: native_ruby
+  method: sub
+  args: [pat]
+  regex_args: [pat]
+  block: bracket
+  kind: reimplemented
+  rust: "regex::Regex::new(pat).unwrap().replace(s, |c: &regex::Captures| format!(\"[{}]\", &c[0])).into_owned()"
+  examples:
+    - { in: { s: "", pat: "x" },          out: "" }
+    - { in: { s: "abc", pat: "x*" },      out: "[]abc" }
+    - { in: { s: "a1b22", pat: "\\d+" },  out: "a[1]b22" }
+    - { in: { s: "héllo", pat: "l+" },    out: "hé[ll]o" }
+
+- name: String#gsub(regex) { upcase }
+  receiver: native_ruby
+  method: gsub
+  args: [pat]
+  regex_args: [pat]
+  block: upcase
+  kind: reimplemented
+  rust: "regex::Regex::new(pat).unwrap().replace_all(s, |c: &regex::Captures| c[0].to_uppercase()).into_owned()"
+  examples:
+    - { in: { s: "", pat: "a" },                  out: "" }
+    - { in: { s: "abcabc", pat: "b" },            out: "aBcaBc" }
+    - { in: { s: "hello world", pat: "[a-z]+" },  out: "HELLO WORLD" }
+    - { in: { s: "héllo", pat: "é" },             out: "hÉllo" }

@@ -1,0 +1,6 @@
+CREATE TABLE notes (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  body TEXT NOT NULL,
+  created_at TEXT NOT NULL,
+  tag TEXT
+);

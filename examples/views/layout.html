@@ -1,0 +1,17 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>{{ title }}</title>
+</head>
+<body>
+<main>
+{{ yield }}
+</main>
+{% raw %}
+  <script id="client-template" type="text/x-template">
+    <p>Hello {{ client_side }}, you have {{ count }} new notes.</p>
+  </script>
+{% endraw %}
+</body>
+</html>

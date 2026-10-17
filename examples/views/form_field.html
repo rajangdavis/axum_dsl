@@ -1,0 +1,5 @@
+{% args label:, field:, value:, error:, hint: "Required" %}
+  <p><label for="{{ field }}">{{ label }}</label>
+     <input id="{{ field }}" name="{{ field }}" value="{{ value }}"></p>
+  <small class="hint">{{ hint }}</small>
+  <p class="error">{{ error }}</p>

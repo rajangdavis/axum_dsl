@@ -1,0 +1,6 @@
+<h1>Sign up</h1>
+<form method="post" action="/signup">
+{{ partial :form_field, label: "Name", field: "name", value: name, error: error }}
+{{ partial :form_field, label: "Email", field: "email", value: email, error: "", hint: "Never shared" }}
+  <p><button type="submit">Sign up</button></p>
+</form>

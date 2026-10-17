@@ -1,0 +1,464 @@
+#!/usr/bin/env ruby
+# frozen_string_literal: true
+
+# Which Ruby can the DSL's body language compile today, and which of the Sinatra/axum declarations does the
+# reader accept? Each probe is one body expression or one whole file, run through `axum_dsl check --format json`.
+# Prints ok, or refused with the compiler's own message. It needs no cargo. Run it with `make probe`.
+#
+# Inside a body, `s` is a string and `n` an i32 (a body may use either or both). Controls must pass: if one is
+# refused, the harness itself is broken and the exit status is 1. Probes are informational.
+require "json"
+require "open3"
+require "rbconfig"
+require "tmpdir"
+
+EXE = File.expand_path("../exe/axum_dsl", __dir__)
+
+# A helper with a nil-able parameter: the route passes `params[:s].index("/")`, which may be nil.
+NILABLE_PARAM_PROBE = <<~'RB'
+  server "probe", version: "0.1.0"
+  set :port, 8080
+
+  params :P do
+    field :s, :string
+  end
+
+  helper :show, args: [:i64?], returns: :string do |n|
+    n.to_s
+  end
+
+  get "/probe", params: :P do
+    a = show(7)
+    b = show(params[:s].index("/"))
+    text(a + b)
+  end
+RB
+
+# A helper with a keyword parameter, called explicitly and left out for its default.
+KEYWORD_PROBE = <<~'RB'
+  server "probe", version: "0.1.0"
+  set :port, 8080
+
+  params :P do
+    field :s, :string
+  end
+
+  helper :joined, args: [:string], returns: :string, kw: { sep: [:string, false] } do |word, sep: "-"|
+    word + sep
+  end
+
+  get "/probe", params: :P do
+    a = joined(params[:s])
+    b = joined(params[:s], sep: "!")
+    text(a + b)
+  end
+RB
+
+# A list of floats: sum, min, sort and include?.
+FLOAT_LIST_PROBE = <<~'RB'
+  server "probe", version: "0.1.0"
+  set :port, 8080
+
+  params :P do
+    field :xs, :f64_list
+  end
+
+  helper :probe, args: [:f64_list], returns: :string do |xs|
+    "sum #{xs.sum}, min #{xs.min || 0.0}, sorted #{xs.sort.join(",")}, has #{xs.include?(2.5)}"
+  end
+
+  get "/probe", params: :P do
+    text(probe(params[:xs]))
+  end
+RB
+
+# An optional nested object read with Ruby safe navigation, straight from the route's params.
+SAFE_NAV_PROBE = <<~'RB'
+  server "probe", version: "0.1.0"
+  set :port, 8080
+
+  params :Address do
+    field :city, :string
+    field :zip, :string
+  end
+
+  params :P do
+    field :a, :Address, optional: true
+  end
+
+  get "/probe", params: :P do
+    text("#{params[:a]&.city || "none"} #{params[:a]&.zip || "00000"}")
+  end
+RB
+
+# A list of another params struct: iterate it, map it to strings, and read the first element with safe navigation.
+OBJECT_LIST_PROBE = <<~'RB'
+  server "probe", version: "0.1.0"
+  set :port, 8080
+
+  params :Address do
+    field :city, :string
+    field :zip, :string
+  end
+
+  params :P do
+    field :offices, list(:Address), min_items: 1, max_items: 3
+  end
+
+  get "/probe", params: :P do
+    joined = params[:offices].map { |o| "#{o.city}:#{o.zip}" }.join(",")
+    text("a #{params[:offices].length}, b #{params[:offices].first&.city || "none"}, c #{joined}")
+  end
+RB
+
+# A map of another params struct: index it, iterate the values and select by a field, reading fields with &..
+MAP_OF_OBJECTS_PROBE = <<~'RB'
+  server "probe", version: "0.1.0"
+  set :port, 8080
+
+  params :Address do
+    field :city, :string
+    field :zip, :string
+  end
+
+  params :P do
+    field :roster, map(:Address)
+  end
+
+  get "/probe", params: :P do
+    names = params[:roster].keys.join(",")
+    text("n #{params[:roster].length} #{names} #{params[:roster]["ann"]&.city || "none"} #{params[:roster].values.first&.zip || "-"} #{params[:roster].select { |k, v| !k.empty? && !v.city.empty? }.length}")
+  end
+RB
+
+# A map of maps: nested indexing, values as a list of maps, and select/merge preserving the value type.
+MAP_OF_MAPS_PROBE = <<~'RB'
+  server "probe", version: "0.1.0"
+  set :port, 8080
+
+  params :P do
+    field :grid, map(map(:i64)), min_items: 1, max_items: 3
+  end
+
+  get "/probe", params: :P do
+    inner = params[:grid]["a"]
+    text("n #{params[:grid].length} #{params[:grid]["a"]["b"] || -1} #{params[:grid].values.length} #{params[:grid].select { |k, v| !k.empty? && v.length > 0 }.size} #{inner.nil?} #{params[:grid].merge({}).length}")
+  end
+RB
+
+# The route surface: a `:name` path capture, a params block with the whole constraint set, `params[:x]` reads,
+# a typed helper, and the response helpers `status`, `text`, `json`, `redirect` and `halt`.
+SURFACE_ROUTE_PROBE = <<~'RB'
+  server "probe", version: "0.1.0"
+  set :port, 8080
+  set :bind, "127.0.0.1"
+
+  params :Item do
+    field :id, :i64, in: :path
+    field :q, :string, default: "all"
+    field :limit, :i32, min: 1, max: 100, default: 10
+  end
+
+  helper :label, args: [:i64, :string], returns: :string do |id, q|
+    "#{id}:#{q}"
+  end
+
+  get "/items/:id", params: :Item, description: "one item" do
+    status 201
+    text(label(params[:id], params[:q]))
+  end
+
+  get "/items/:id/json", params: :Item do
+    json(params[:id])
+  end
+
+  get "/moved" do
+    redirect "/items/1"
+  end
+
+  get "/nope" do
+    halt 404, "no such item"
+  end
+RB
+
+# The request filters: `content_type` in a `before`, and the `not_found` and `error` responses.
+SURFACE_FILTERS_PROBE = <<~'RB'
+  server "probe", version: "0.1.0"
+  set :port, 8080
+
+  before do
+    content_type :json
+    "ok"
+  end
+
+  not_found do
+    text("no route")
+  end
+
+  error do
+    text("boom")
+  end
+
+  get "/ping" do
+    text("pong")
+  end
+RB
+
+# Settings read from a route and from filter bodies: `setting :name, env: "..."` at the top level, then
+# setting(:name) inside a route, inside a `before` filter that continues, and in `not_found`.
+SETTINGS_PROBE = <<~'RB'
+  server "probe", version: "0.1.0"
+  set :port, 8080
+
+  setting :greeting, env: "PROBE_GREETING", default: "hello"
+
+  before do
+    "greeting #{setting(:greeting)}"
+  end
+
+  not_found do
+    text(setting(:greeting))
+  end
+
+  get "/probe" do
+    text(setting(:greeting))
+  end
+RB
+
+# A path capture whose field is a list: axum's Path<T> reads one string per segment, so the reader refuses it.
+LIST_PATH_PROBE = <<~'RB'
+  server "probe", version: "0.1.0"
+  set :port, 8080
+
+  params :P do
+    field :ids, list(:string), in: :path
+  end
+
+  get "/items/:ids", params: :P do
+    text("x")
+  end
+RB
+
+# Route paths axum's router cannot express: refused, with a message naming the feature.
+OPTIONAL_SEGMENT_PROBE = <<~'RB'
+  server "probe", version: "0.1.0"
+  set :port, 8080
+
+  get "/items/:id?" do
+    text("x")
+  end
+RB
+
+PAREN_PATH_PROBE = <<~'RB'
+  server "probe", version: "0.1.0"
+  set :port, 8080
+
+  get "/items/(\\d+)" do
+    text("x")
+  end
+RB
+
+REGEX_CHAR_PATH_PROBE = <<~'RB'
+  server "probe", version: "0.1.0"
+  set :port, 8080
+
+  get "/items/[0-9]+" do
+    text("x")
+  end
+RB
+
+# A field's `pattern:` goes through RegexTranslate like a body regex literal: the same spelling of a
+# regex means one thing, and what the translator refuses is refused at check time rather than emitted for
+# Regex::new(..).unwrap() to panic on at request time. Lookahead has no Rust equivalent.
+PATTERN_LOOKAHEAD_PROBE = <<~'RB'
+  server "probe", version: "0.1.0"
+  set :port, 8080
+
+  params :P do
+    field :x, :string, in: :query, pattern: "(?=x)"
+  end
+
+  get "/probe", params: :P do
+    text("x")
+  end
+RB
+
+# A string field's `default:` must be a value the emitted check() accepts. serde applies the default before
+# check() runs, so a default the field's `pattern:` rejects would answer 400 to every request that omitted it.
+BAD_PATTERN_DEFAULT_PROBE = <<~'RB'
+  server "probe", version: "0.1.0"
+  set :port, 8080
+
+  params :P do
+    field :x, :string, in: :query, default: "AB", pattern: "^[a-z]+$"
+  end
+
+  get "/probe", params: :P do
+    text("x")
+  end
+RB
+
+PROBES = [
+  [:control, "gsub with a regex",            's.gsub(/\d/, "#")'],
+  [:control, "split.map.join",               's.split.map { |w| w.capitalize }.join(" ")'],
+  [:control, "if expression",                'if n > 1 then "big" else "small" end'],
+  [:control, "string interpolation",         '"#{s}!"'],
+  [:control, "i32 arithmetic",               "(n * 2 + 1).to_s"],
+
+  # Idioms the examples rely on: a predicate or an extraction written with sub and a comparison.
+  [:idiom, "predicate: sub, then != the input", 'if s.sub(/\Ahttps?:\/\//, "") != s then "web url" else "not a web url" end'],
+  [:idiom, "extract between tags",           "t = s.sub(/\\A.*?<title[^>]*>/mi, \"\")\n          t.sub(/<\\/title>.*\\z/mi, \"\")"],
+  [:idiom, "nested ternary with a local",    "t = s.sub(/\\A.*?<b>/mi, \"\")\n          s.sub(/\\Aerror:/, \"\") != s ? s : (t == s ? \"none\" : t)"],
+
+  [:idiom, "raise as one ternary arm",       's.empty? ? raise("empty") : s'],
+
+  [:idiom, "nil-able default: first || raise", 's.split.first || raise("empty")'],
+  [:idiom, "nil-able .nil? test",            's.split.first.nil? ? "none" : "some"'],
+  [:idiom, "nil-able .to_s",                 "s.index(\"/\").to_s"],
+  [:idiom, "list include? on a literal",     '["a", "b"].include?(s) ? "yes" : "no"'],
+  [:idiom, "list empty?",                    's.split("/").empty? ? "none" : "some"'],
+  [:idiom, "negative list index",            's.split("/")[-1] || ""'],
+
+  [:idiom, "list any? / count with a block",  's.split.any? { |w| w.length > 3 } ? s.split.count { |w| w.length > 3 }.to_s : "none"'],
+  [:idiom, "to_i then arithmetic",           "(s.to_i + 1).to_s"],
+
+  [:idiom, "range sum",                      '(1..n).sum.to_s'],
+  [:idiom, "times.map with arithmetic",      'n.times.map { |i| i * i }.join(",")'],
+  [:idiom, "raise inside a list block",      '(1..n).map { |i| i > 3 ? raise("big") : i.to_s }.join(",")'],
+
+  [:probe, "start_with?",                    'if s.start_with?("http") then "y" else "n" end'],
+  [:probe, "end_with?",                      'if s.end_with?("/") then "y" else "n" end'],
+  [:probe, "include?",                       'if s.include?("://") then "y" else "n" end'],
+  [:probe, "empty?",                         'if s.empty? then "y" else "n" end'],
+  [:probe, "== comparison",                  'if s == "x" then "y" else "n" end'],
+  [:probe, "ternary",                        'n > 1 ? "a" : "b"'],
+  [:probe, "unless",                         'unless n > 1 then "a" else "b" end'],
+  [:probe, "case/when",                      'case n when 1 then "one" else "many" end'],
+  [:probe, "&& and ||",                      'if n > 1 && n < 9 then "y" else "n" end'],
+
+  [:probe, "index",                          's.index("/").to_s'],
+  [:probe, "slice s[0, 3]",                  's[0, 3] || ""'],
+  [:probe, "split(sep)[0]",                  's.split("/")[0] || ""'],
+  [:probe, "split(sep).first",               's.split("/").first || ""'],
+  [:probe, "split(sep, 2).length",           's.split("/", 2).length.to_s'],
+  [:probe, "partition",                      's.partition("/").first || ""'],
+  [:probe, "chars.length",                   "s.chars.length.to_s"],
+  [:probe, "lines.length",                   "s.lines.length.to_s"],
+  [:probe, "tr",                             's.tr("a", "b")'],
+  [:probe, "reverse",                        "s.reverse"],
+  [:probe, "squeeze",                        "s.squeeze"],
+  [:probe, "delete",                         's.delete("a")'],
+  [:probe, "string * int",                   "s * 2"],
+  [:probe, "to_i",                           "s.to_i.to_s"],
+  [:probe, "Integer(s)",                     "Integer(s, 10).to_s"],
+
+  [:probe, "regex match?",                   'if s.match?(/\Ahttps?:/) then "y" else "n" end'],
+  [:probe, "regex =~ character index",        "(s =~ /x/).to_s"],
+  [:probe, "regex =~ or default",             "((s =~ /x/) || -1).to_s"],
+
+  [:probe, "lazy quantifier",                's.sub(/<.*?>/, "")'],
+  [:probe, "dotall + ignore case",           's.gsub(/<script.*?<\/script>/mi, "")'],
+  [:probe, "gsub with a block",              "s.gsub(/\\d/) { |d| d }"],
+
+  [:probe, "array literal",                  '["a", "b"].join(",")'],
+  [:probe, "float array literal / join",     '[1.0, 2.5].join(",")'],
+  [:probe, "float list sum",                 '[1.5, 2.5, 0.5].sum.to_s'],
+  [:probe, "float list map with a float",    '[1.5, 2.5].map { |x| x * 0.5 }.join(",")'],
+  [:probe, "float list min / max",           '[1.5, 2.5].max.to_s'],
+  [:probe, "list each",                      's.split.each { |w| w }.length.to_s'],
+  [:probe, "list each with a guard",         's.split.each { |w| raise("empty") if w.empty? }.join(",")'],
+  [:probe, "map each with a block",          "m = { \"a\" => s.length, \"b\" => 2 }; m.each { |k, v| k + v.to_s }.length.to_s"],
+  [:probe, "each with return",               's.split.each { |w| return "none" if w.empty? }.join(",")'],
+  [:probe, "list select",                    's.split.select { |w| w.length > 2 }.length.to_s'],
+  [:probe, "list find",                      's.split.find { |w| w.length > 2 } || ""'],
+  [:probe, "list first / last",              's.split.last || ""'],
+  [:probe, "list [index]",                   's.split[1] || ""'],
+  [:probe, "n.times",                        '3.times.map { |i| i.to_s }.join'],
+  [:probe, "hash literal",                   '{ "a" => 1 }.length.to_s'],
+  [:probe, "map map with a block",           "m = { \"a\" => s.length, \"b\" => 2 }; m.map { |k, v| k + \"=\" + v.to_s }.join(\",\")"],
+  [:probe, "map select with a block",        "m = { \"a\" => s.length, \"b\" => 2 }; m.select { |k, v| k != \"\" && v > 1 }.length.to_s"],
+  [:probe, "map reject with a block",        "m = { \"a\" => s.length, \"b\" => 2 }; m.reject { |k, v| k == \"\" || v > 1 }.length.to_s"],
+
+  [:probe, "raise in a branch",              'if n > 1 then raise "boom" else "ok" end'],
+  [:probe, "return (guard clause)",                         "return \"none\" if s.empty?\n          s"],
+  [:probe, "def inside a body",              "def helper(x) = x\n          helper(s)"],
+
+  # The Sinatra/axum surface: routes, filters, a typed helper, the response helpers and the path syntax.
+  [:probe, "routes: :name capture + params + params[:x] + status/text/json/redirect/halt", { source: SURFACE_ROUTE_PROBE }],
+  [:probe, "filters: before + content_type, not_found, error", { source: SURFACE_FILTERS_PROBE }],
+  [:probe, "settings: read in a route, a before filter and not_found", { source: SETTINGS_PROBE }],
+  [:probe, "f64 list: sum/min/sort/join/include?", { source: FLOAT_LIST_PROBE }],
+  [:probe, "optional object &.field", { source: SAFE_NAV_PROBE }],
+  [:probe, "object list: each/map/first&.field", { source: OBJECT_LIST_PROBE }],
+  [:probe, "map of objects: index/values/select", { source: MAP_OF_OBJECTS_PROBE }],
+  [:probe, "map of maps: nested index/values/merge", { source: MAP_OF_MAPS_PROBE }],
+  [:probe, "helper with a nil-able parameter", { source: NILABLE_PARAM_PROBE }],
+  [:probe, "helper with a keyword argument", { source: KEYWORD_PROBE }],
+
+  # Route paths axum cannot express are refused (informational: the message names the feature and FILE:LINE:COL).
+  [:refuse, "path: list field, refused", { source: LIST_PATH_PROBE }],
+  [:refuse, "path: optional segment (?), refused", { source: OPTIONAL_SEGMENT_PROBE }],
+  [:refuse, "path: parenthesised group, refused", { source: PAREN_PATH_PROBE }],
+  [:refuse, "path: regex metacharacter, refused", { source: REGEX_CHAR_PATH_PROBE }],
+  [:refuse, "pattern: lookahead, refused", { source: PATTERN_LOOKAHEAD_PROBE }],
+  [:refuse, "default: does not match pattern, refused", { source: BAD_PATTERN_DEFAULT_PROBE }]
+].freeze
+
+# The probe body is a language-level expression over `s` (a string) and `n` (an i32). A route body takes no
+# parameters, so the body is a typed helper and the route calls it; the compiler refuses a parameter the body
+# never reads, so declare only the ones it uses.
+def server_for(body)
+  # Text inside a string literal is not a use of s or n, but an interpolation inside one is.
+  code = body.gsub(/"((?:[^"\\]|\\.)*)"/) { Regexp.last_match(1).scan(/#\{[^}]*\}/).join }
+  used = %w[s n].select { |v| code.match?(/\b#{v}\b/) }
+  types = { "s" => ":string", "n" => ":i32" }
+  block = used.empty? ? "" : " |#{used.join(', ')}|"
+  args = used.map { |v| types.fetch(v) }.join(", ")
+  call = used.map { |v| "params[:#{v}]" }.join(", ")
+  <<~RB
+    server "probe", version: "0.1.0"
+    set :port, 8080
+
+    params :P do
+      field :s, :string
+      field :n, :i32
+    end
+
+    helper :probe, args: [#{args}], returns: :string do#{block}
+      #{body}
+    end
+
+    get "/probe", params: :P do
+      text(probe(#{call}))
+    end
+  RB
+end
+def verdict(dir, idx, probe)
+  file = File.join(dir, "probe_#{idx}.rb")
+  File.write(file, probe.is_a?(String) ? server_for(probe) : probe.fetch(:source))
+  out, err, = Open3.capture3(RbConfig.ruby, EXE, "check", file, "--format", "json")
+  doc = JSON.parse(out)
+  doc["ok"] ? "ok" : doc.dig("error", "message").to_s
+rescue JSON::ParserError
+  "harness error: #{err.lines.first&.strip || 'no output'}"
+end
+
+results = Dir.mktmpdir("probe") do |dir|
+  PROBES.each_with_index.map { |(kind, name, probe), i| [kind, name, verdict(dir, i, probe)] }
+end
+
+width = results.map { |_, name, _| name.length }.max
+results.each do |kind, name, v|
+  tag = v == "ok" ? "ok     " : "refused"
+  puts "#{tag}  #{name.ljust(width)}#{v == 'ok' ? '' : "  #{v}"}#{{ control: '  (control)', idiom: '  (idiom)' }.fetch(kind, '')}"
+end
+
+probes = results.select { |kind, _, _| kind == :probe }
+puts "\n#{probes.count { |_, _, v| v == 'ok' }} of #{probes.size} probes compile; the rest are refused above."
+refusals = results.select { |kind, _, _| kind == :refuse }
+puts "#{refusals.count { |_, _, v| v != 'ok' }} of #{refusals.size} refusal probes are refused (the message names the feature)."
+broken = results.select { |kind, _, v| kind == :control && v != "ok" }
+unless broken.empty?
+  warn "bin/probe: #{broken.size} control(s) refused, so the harness or the compiler is broken"
+  exit 1
+end

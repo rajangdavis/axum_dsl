@@ -1,0 +1,11 @@
+<!doctype html>
+<html lang="en">
+<head><title>Notes</title></head>
+<body>
+<ul>
+{% for note in notes %}
+  <li id="note-{{ note.id }}">{{ note.body }} <small>{{ note.created_at }}</small></li>
+{% endfor %}
+</ul>
+</body>
+</html>

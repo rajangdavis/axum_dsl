@@ -1,0 +1,14 @@
+[package]
+name = "shimcheck"
+version = "0.1.0"
+edition = "2021"
+
+# This crate holds only the generated tests in tests/shims.rs, written by bin/gen_shim_tests
+# (SPEC.md layer L3). `regex` is here because the catalog's regex entries are checked against the
+# real crate: the generated templates call regex::Regex directly.
+#
+# rmcp_dsl's shimcheck also carried heck, scraper and url, for the example bindings its generator
+# emits. axum_dsl has no examples/bindings, so nothing here needs them yet; add a dependency when
+# the first binding that uses one arrives.
+[dependencies]
+regex = "1"

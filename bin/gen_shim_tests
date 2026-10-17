@@ -1,0 +1,129 @@
+#!/usr/bin/env ruby
+# frozen_string_literal: true
+
+# Generates shimcheck/tests/shims.rs from spec/shims/*.yml (SPEC.md layer L3).
+# Each example becomes one #[test]; the entry's `rust:` template is pasted in as
+# text (repo-owned, never evaluated here). Expected values are the literals from
+# the catalog.
+#
+#   ruby bin/gen_shim_tests && (cd shimcheck && cargo test)
+require "yaml"
+require "fileutils"
+require_relative "../lib/axum_dsl"
+
+ROOT = File.expand_path("..", __dir__)
+
+# Rust string literal: printable ASCII as is, everything else as \u{..}.
+def rs_lit(str)
+  body = str.each_char.map do |ch|
+    case ch
+    when '"' then '\\"'
+    when "\\" then "\\\\"
+    else
+      o = ch.ord
+      o.between?(0x20, 0x7e) ? ch : format("\\u{%x}", o)
+    end
+  end.join
+  "\"#{body}\""
+end
+
+# `option: true` entries return Option<T> in Rust, which is nil-or-value in Ruby.
+def rs_out(val, option: false)
+  return "None" if val.nil? && option
+
+  text =
+    case val
+    when String then option ? "#{rs_lit(val)}.to_string()" : rs_lit(val)
+    when Integer then val.to_s
+    when true, false then val.to_s
+    else abort "unsupported expected value #{val.inspect}"
+    end
+  option ? "Some(#{text})" : text
+end
+
+# An argument of a binding example, as the Rust the wrapper takes: &str, &[String] or &[i64] or a scalar.
+def rs_arg(type, value)
+  case type
+  when :string then rs_lit(value)
+  when :strs then "&[#{value.map { |v| "#{rs_lit(v)}.to_string()" }.join(", ")}]"
+  when :i64s then "&[#{value.join(", ")}]"
+  else value.to_s
+  end
+end
+
+# The expected result of a binding example, in the Rust type the wrapper returns (Some/None when nil-able).
+def rs_expect(type, value)
+  return "None" if value.nil?
+
+  inner =
+    case type
+    when :string then rs_lit(value)
+    when :ostr then "#{rs_lit(value)}.to_string()"
+    when :strs, :ostrs then "vec![#{value.map { |v| "#{rs_lit(v)}.to_string()" }.join(", ")}]"
+    when :i64s, :oi64s then "vec![#{value.join(", ")}]"
+    else value.to_s
+    end
+  %i[ostr oi64 oi32 of64 obool ostrs oi64s].include?(type) ? "Some(#{inner})" : inner
+end
+
+tests = []
+helpers = [] # Rust helper functions (AxumDsl::Emit constants) that catalog templates call
+Dir.glob(File.join(ROOT, "spec/shims/*.yml")).sort.each do |path|
+  YAML.safe_load_file(path).each do |entry|
+    tmpl = entry["rust"] or abort "#{path}: #{entry['name']} has no rust: template"
+    if entry["helper"]
+      const = entry["helper"].upcase
+      unless AxumDsl::Emit.const_defined?(const, false)
+        abort "#{path}: #{entry['name']} names helper `#{entry['helper']}`, but AxumDsl::Emit has no #{const} constant"
+      end
+      helpers << AxumDsl::Emit.const_get(const, false)
+    end
+    entry.fetch("examples").each_with_index do |ex, i|
+      name = "#{entry['name']}_#{i}".gsub(/\W+/, "_").gsub(/_+/, "_").downcase
+      regex_args = entry.fetch("regex_args", [])
+      binds = ex.fetch("in").map do |key, val|
+        # Regex arguments go through the compiler's own translator, so this test also
+        # checks that the translated pattern behaves like the Ruby one.
+        text = regex_args.include?(key) ? AxumDsl::RegexTranslate.translate(val) : val
+        val.is_a?(Integer) ? "    let #{key}: i64 = #{val};" : "    let #{key}: &str = #{rs_lit(text)};"
+      end
+      # `raises:` examples are the ones where Ruby raises; the template then returns a Result (`result: true`).
+      check =
+        if ex["raises"]
+          "    assert!(#{tmpl}.is_err());"
+        else
+          call = entry["result"] ? "#{tmpl}.unwrap()" : tmpl
+          "    assert_eq!(#{call}, #{rs_out(ex.fetch('out'), option: entry['option'])});"
+        end
+      tests << ["#[test]", "fn #{name}() {", *binds, check, "}", ""].join("\n")
+    end
+  end
+end
+
+# Bindings backed by a Rust crate: emit each wrapper exactly as the compiler would, and run the
+# binding's examples against it. The expected values are the ones the Ruby reference passes
+# (test/test_bindings.rb), so a disagreement between the crate and the Ruby shows up here.
+wrappers = []
+BINDINGS_DIR = File.join(ROOT, "examples/bindings")
+Dir.glob(File.join(BINDINGS_DIR, "*.rb")).sort.each do |path|
+  file = AxumDsl::Bindings.load(File.basename(path, ".rb"), root: BINDINGS_DIR)
+  file.fns.each_value do |fn|
+    next unless fn.rust
+
+    examples = file.examples.select { |e| e[:method] == fn.name }
+    next if examples.empty?
+
+    wrappers << AxumDsl::Emit.binding_fn(file.descriptor(fn)).join("\n")
+    examples.each_with_index do |ex, i|
+      call_args = fn.params.zip(ex[:args]).map { |(_, type), value| rs_arg(type, value) }
+      tests << ["#[test]", "fn binding_#{file.wrapper(fn)}_#{i}() {",
+                "    assert_eq!(#{file.wrapper(fn)}(#{call_args.join(', ')}), #{rs_expect(fn.returns, ex[:expect])});", "}", ""].join("\n")
+    end
+  end
+end
+
+out = File.join(ROOT, "shimcheck/tests/shims.rs")
+FileUtils.mkdir_p(File.dirname(out))
+File.write(out, "// GENERATED by bin/gen_shim_tests from spec/shims/*.yml and bindings/*.rb. Do not edit.\n\n" \
+                  "#{[*helpers.uniq, *wrappers].join("\n\n")}\n\n#{tests.join("\n")}")
+puts "wrote #{out} (#{tests.size} tests)"

@@ -1,0 +1,318 @@
+#!/usr/bin/env ruby
+# frozen_string_literal: true
+
+# Generates rbi/dsl.rbi (the Sorbet description of the DSL) from the compiler's
+# SIG table and the body surface below (BODY_SURFACE), so Sorbet and the compiler
+# cannot drift apart.
+#
+#   ruby bin/gen_rbi          write rbi/dsl.rbi
+#   ruby bin/gen_rbi --check  exit 1 if rbi/dsl.rbi differs from what SIG produces
+#
+# Sorbet cannot constrain symbol VALUES (:i32 vs :bogus); the compiler's --check
+# does that. This file only expresses nesting, keywords and argument types.
+require "fileutils"
+
+require_relative "../lib/axum_dsl/schema"
+
+OUT = File.expand_path("../rbi/dsl.rbi", __dir__)
+
+def scope(name) = "#{name.to_s.capitalize}Scope"
+
+def sorbet_type(kind)
+  return "String" if kind == :str
+  return "T::Boolean" if kind == :bool
+  return "T.any(Integer, Float)" if kind == :num
+  return "Integer" if kind == :uint
+  return "T.any(String, Integer, Float, T::Boolean)" if kind == :lit
+  # a setting's value: a literal, or a symbol naming what the setting points at (`set :layout, :app`)
+  return "T.any(String, Symbol, Integer, Float, T::Boolean)" if kind == :setting
+  return "T.any(String, Integer, Float, T::Boolean, T::Array[T.any(String, Integer, Float)])" if kind == :default
+  return "T::Hash[String, T.untyped]" if kind == :json || kind == :schema
+  return "T::Hash[Symbol, T.untyped]" if kind == :helper_kw
+  return "T::Array[Symbol]" if %i[types htypes snakes file_checks].include?(kind)
+  return "T::Hash[Symbol, Symbol]" if kind == :sqlargs
+  return "T.untyped" if kind == :qreturns # list(:Note), :Note? or :i64: the compiler reads it with Prism
+  return "T::Array[String]" if kind == :strs
+  return "T.any(Symbol, T.class_of(AxumDsl::Opaque))" if kind == :fieldtype # :i64, map(:i64), or a type a binding owns
+
+  "Symbol"
+end
+
+# Returns ["sig { ... }", "def name(...); end"] for one SIG entry.
+def method_src(name, sig)
+  names = sig.fetch(:names)
+  raise "#{name}: names and pos differ in length" unless names.size == sig.fetch(:pos).size
+
+  sparams = names.zip(sig[:pos]).map { |n, kind| "#{n}: #{sorbet_type(kind)}" }
+  defs = names.map(&:to_s)
+  # Sorbet wants required keywords before optional ones; keep the table's order within each group.
+  sig[:kw].partition { |_, (_, required)| required }.flatten(1).each do |key, (kind, required)|
+    if required
+      sparams << "#{key}: #{sorbet_type(kind)}"
+      defs << "#{key}:"
+    else
+      sparams << "#{key}: T.nilable(#{sorbet_type(kind)})"
+      defs << "#{key}: nil"
+    end
+  end
+  case sig[:block]
+  when :decls
+    # A fragment holds what a file holds, and the file level IS this rbi's top level, which has no
+    # scope class of its own: its block is untyped. Every other decl block names the class it binds.
+    sparams << (name == :fragment ? "blk: T.untyped" : "blk: T.proc.bind(#{scope(name)}).void")
+    defs << "&blk"
+  when :body
+    sparams << "blk: T.untyped"
+    defs << "&blk"
+  end
+  sigline = sparams.empty? ? "sig { void }" : "sig { params(#{sparams.join(', ')}).void }"
+  [sigline, "def #{name}(#{defs.join(', ')}); end"]
+end
+
+# The body surface: the calls a body makes by name, and the rbi each one gets. A body is typed as the top
+# level of the DSL file (a route, a filter and a helper block is an untyped proc), so these are declared at
+# the top level, after the SIG table. AxumDsl::Body::BODY_CALLS is the compiler's half of the same list,
+# and test/test_body_surface.rb holds the two equal. The methods a body calls on a value
+# (Body::ALLOWED_METHODS) are the other half of the surface: Sorbet's own String, Array and Hash RBIs
+# declare those, so they are not named here.
+#
+# `params`, `setting` and `current` are each both a declaration and a read, and each is special-cased below: `params`
+# gets a reader overload over the SIG table's declaration sig, and the SIG sigs of `setting` and `current` are
+# replaced by one relaxed sig each, because Sorbet cannot pick an overload on a missing keyword argument.
+BODY_SURFACE = {
+  # params[:name] reads a route's input; the declaration sig follows this one, from the SIG table.
+  params: ["sig { returns(T::Hash[T.any(Symbol, String), T.untyped]) }"],
+  # errors[:name] reads the generated check()'s message for that field, and "" when the request passed it
+  # (or that field had no violation): a String, never nil, so a body interpolates it with no conditional.
+  # The value type is T.untyped rather than String because Sorbet types Hash#[] as T.nilable(V) whatever V
+  # is: a String value type would make every errors[:name] nilable and force a T.must at each use.
+  errors: ["sig { returns(T::Hash[T.any(Symbol, String), T.untyped]) }",
+           "def errors; end"],
+  # setting(:name) reads a declared setting; its declaration form's keywords are all optional here, because
+  # one sig has to carry both call shapes (the compiler requires `env:` in the declaration form).
+  setting: ["sig { params(name: Symbol, env: T.nilable(String), description: T.nilable(String), " \
+                        "default: T.nilable(T.any(String, Integer, Float, T::Boolean)), optional: T.nilable(T::Boolean), " \
+                        "secret: T.nilable(T::Boolean), type: T.nilable(Symbol)).returns(T.untyped) }",
+            "def setting(name, env: nil, description: nil, default: nil, optional: nil, secret: nil, type: nil); end"],
+  # The response helpers: values the emitter turns into ::axum::response::Response.
+  text: ["sig { params(value: T.any(String, Integer, Float, T::Boolean), status: T.nilable(Integer), content_type: T.nilable(String)).returns(T.untyped) }",
+         "def text(value, status: nil, content_type: nil); end"],
+  html: ["sig { params(value: T.any(String, Integer, Float, T::Boolean), status: T.nilable(Integer), content_type: T.nilable(String)).returns(T.untyped) }",
+         "def html(value, status: nil, content_type: nil); end"],
+  json: ["sig { params(value: T.untyped, status: T.nilable(Integer), content_type: T.nilable(String)).returns(T.untyped) }",
+         "def json(value, status: nil, content_type: nil); end"],
+  redirect: ["sig { params(path: String, status: T.nilable(Integer)).returns(T.untyped) }",
+             "def redirect(path, status: nil); end"],
+  halt: ["sig { params(status: T.any(Integer, Symbol), body: T.untyped).returns(T.untyped) }",
+         "def halt(status, body = nil); end"],
+  # render(name, locals:, layout:) answers with a view: a `.html` file beside the DSL file, read at compile
+  # time and compiled into the emitted Rust, so the crate carries no template. `locals:` is untyped because
+  # Sorbet cannot check that a hash's keys are exactly the names the view's markers read -- the compiler does
+  # (the eight marker forms, `{% raw %}` among them, are in docs/views.md), and `layout: nil` opts a render
+  # out of the `set :layout` default.
+  render: ["sig { params(name: T.any(Symbol, String), locals: T.untyped, layout: T.nilable(T.any(Symbol, String)), status: T.nilable(Integer), content_type: T.nilable(String)).returns(T.untyped) }",
+           "def render(name, locals: nil, layout: nil, status: nil, content_type: nil); end"],
+  # h(value) escapes a value for HTML; raw(value) gives the same value with no escaping (the XSS door).
+  h: ["sig { params(value: T.any(String, Integer, Float, T::Boolean)).returns(String) }",
+      "def h(value); end"],
+  raw: ["sig { params(value: T.any(String, Integer, Float, T::Boolean)).returns(String) }",
+        "def raw(value); end"],
+  # The two statements that say how the response is written; the compiler requires each on its own line.
+  status: ["sig { params(code: T.any(Integer, Symbol)).returns(T.untyped) }",
+           "def status(code); end"],
+  content_type: ["sig { params(name: T.any(Symbol, String)).returns(T.untyped) }",
+                 "def content_type(name); end"],
+  # headers(...) is the third statement a response body may make: header lines on the response.
+  headers: ["sig { params(headers: T::Hash[String, String]).returns(T.untyped) }",
+            "def headers(headers); end"],
+  # etag(value) is a route statement: the response's ETag, a computed string; a request whose
+  # If-None-Match lists it is answered 304 with no body.
+  etag: ["sig { params(value: String).returns(T.untyped) }",
+         "def etag(value); end"],
+  # `transaction do ... end` runs query/execute calls on one connection, commits on success and rolls
+  # back on a database error (docs/database.md); its value is the block's final expression.
+  transaction: ["sig { params(blk: T.untyped).returns(T.untyped) }",
+                "def transaction(&blk); end"],
+  # The server's own declarations a body may read.
+  file_text: ["sig { params(name: Symbol).returns(String) }",
+              "def file_text(name); end"],
+  file_path: ["sig { params(name: Symbol).returns(String) }",
+              "def file_path(name); end"],
+  entry: ["sig { params(file: Symbol, name: Symbol).returns(String) }",
+          "def entry(file, name); end"],
+  entry_args: ["sig { params(file: Symbol, name: Symbol, args: T.untyped).returns(String) }",
+               "def entry_args(file, name, **args); end"],
+  # rust(:fn, args...) calls a function declared with rust_fn; the compiler checks it.
+  rust: ["sig { params(name: Symbol, args: T.untyped).returns(T.untyped) }",
+         "def rust(name, *args); end"],
+  # Sessions (docs/sessions.md). cookie(:name) is the signed cookie's value, or nil when it is absent or does not
+  # verify; `signed: false` reads a plain one and `format:` picks the signature's format. set_cookie and
+  # delete_cookie are statements of a route body, like headers.
+  cookie: ["sig { params(name: Symbol, signed: T.nilable(T::Boolean), format: T.nilable(Symbol)).returns(T.nilable(String)) }",
+           "def cookie(name, signed: nil, format: nil); end"],
+  set_cookie: ["sig { params(name: Symbol, value: String, http_only: T.nilable(T::Boolean), same_site: T.nilable(Symbol), " \
+               "secure: T.nilable(T::Boolean), permanent: T.nilable(T::Boolean), max_age: T.nilable(Integer), " \
+               "signed: T.nilable(T::Boolean), format: T.nilable(Symbol)).returns(T.untyped) }",
+               "def set_cookie(name, value, http_only: nil, same_site: nil, secure: nil, permanent: nil, max_age: nil, signed: nil, format: nil); end"],
+  delete_cookie: ["sig { params(name: Symbol).returns(T.untyped) }",
+                  "def delete_cookie(name); end"],
+  random_token: ["sig { returns(String) }",
+                 "def random_token; end"],
+  request_ip: ["sig { returns(String) }",
+               "def request_ip; end"],
+  user_agent: ["sig { returns(String) }",
+               "def user_agent; end"],
+  # current(:name) reads a per-request value; its declaration form (a name, `returns:` and a block) shares this
+  # one relaxed sig, as `setting` does, because Sorbet cannot pick an overload on a missing keyword argument.
+  current: ["sig { params(name: Symbol, returns: T.untyped, blk: T.untyped).returns(T.untyped) }",
+            "def current(name, returns: nil, &blk); end"]
+}.freeze
+
+by_ctx = Hash.new { |h, k| h[k] = [] }
+AxumDsl::SIG.each { |name, sig| Array(sig.fetch(:in)).each { |ctx| by_ctx[ctx] << [name, sig] } }
+
+lines = [
+  "# typed: strict",
+  "# GENERATED by bin/gen_rbi from SIG in schema.rb and the body surface (BODY_SURFACE). Do not edit.",
+  ""
+]
+(by_ctx.keys - [:top]).each do |ctx|
+  lines << "class #{scope(ctx)}"
+  by_ctx[ctx].each_with_index do |(name, sig), i|
+    lines << "" if i.positive?
+    method_src(name, sig).each { |l| lines << "  #{l}" }
+  end
+  if %i[params output].include?(ctx)
+    # map(:i64) and list(:string) name a field's type; the compiler reads them with Prism and checks the argument.
+    lines << "" << "  sig { params(type: Symbol).returns(Symbol) }"
+    lines << "  def map(type); end"
+    lines << "" << "  sig { params(type: Symbol).returns(Symbol) }"
+    lines << "  def list(type); end"
+  end
+  lines << "end" << ""
+end
+BODY_SURFACE.each do |name, src|
+  next if name == :params # its def is the SIG table's, with this entry as the reader overload (see below)
+
+  src.each { |l| lines << l }
+  lines << ""
+end
+by_ctx[:top].each do |name, sig|
+  # `params` is one def with two sigs: Sorbet picks an overload by arity, so the reader sig (no arguments)
+  # comes first and the SIG table's declaration sig (a name, a block) follows it.
+  lines.concat(BODY_SURFACE.fetch(:params)) if name == :params
+  next if %i[setting current].include?(name) # BODY_SURFACE replaces it, so that the read and the declaration share one sig
+
+  lines.concat(method_src(name, sig)) << ""
+end
+# Rust::Int32(x) / Rust::Int64(x) mark an integer as "treat this like Rust" (Sorbet just sees Integer).
+lines.concat([
+  "module Rust",
+  "  sig { params(value: Integer).returns(Integer) }",
+  "  def self.Int32(value); end",
+  "",
+  "  sig { params(value: Integer).returns(Integer) }",
+  "  def self.Int64(value); end",
+  "",
+  "  sig { params(value: String).returns(Rust::Str) }",
+  "  def self.Str(value); end",
+  "",
+  "  # A string with Rust `str` behaviour; to_s leaves it.",
+  "  class Str",
+  "    sig { returns(Rust::Str) }",
+  "    def trim; end",
+  "",
+  "    sig { returns(Rust::Str) }",
+  "    def strip; end",
+  "",
+  "    sig { returns(Rust::Str) }",
+  "    def to_lowercase; end",
+  "",
+  "    sig { returns(Rust::Str) }",
+  "    def to_uppercase; end",
+  "",
+  "    sig { returns(String) }",
+  "    def to_s; end",
+  "",
+  "    sig { returns(Integer) }",
+  "    def len; end",
+  "",
+  "    sig { returns(T::Array[String]) }",
+  "    def lines; end",
+  "",
+  "    sig { params(pat: String).returns(T::Array[String]) }",
+  "    def split(pat); end",
+  "",
+  "    sig { params(pat: String).returns(T::Boolean) }",
+  "    def contains(pat); end",
+  "",
+  "    sig { params(pat: String).returns(T::Boolean) }",
+  "    def starts_with?(pat); end",
+  "",
+  "    sig { params(from: String, to: String).returns(Rust::Str) }",
+  "    def replace(from, to); end",
+  "  end",
+  "end",
+  "",
+  "# Bcrypt is a compiler built-in, not a binding: bodies call it as Bcrypt.verify / Bcrypt.hash.",
+  "module Bcrypt",
+  "  sig { params(plain: String, digest: String).returns(T::Boolean) }",
+  "  def self.verify(plain, digest); end",
+  "",
+  "  sig { params(plain: String).returns(String) }",
+  "  def self.hash(plain); end",
+  "end",
+  "",
+  "# The macros a binding file (bindings/*.rb) uses; the compiler reads them with Prism.",
+  "module AxumDsl",
+  "  # A type a binding owns; the compiler reads `type_rust` and a record's `field` lines with Prism.",
+  "  class Opaque",
+  "    sig { params(rust: String, wire: T::Boolean).void }",
+  "    def self.type_rust(rust, wire: false); end",
+  "",
+  "    sig { params(name: Symbol, type: T.untyped).void }",
+  "    def self.field(name, type); end",
+  "  end",
+  "",
+  "  module BindingDsl",
+  "    sig { params(name: String, version: String).void }",
+  "    def crate(name, version); end",
+  "",
+  "    sig { params(template: String).void }",
+  "    def rust(template); end",
+  "",
+  "    sig { params(reason: String).void }",
+  "    def no_reference(reason); end",
+  "",
+  "    sig { params(method: Symbol, args: T.untyped, expect: T.untyped).void }",
+  "    def example(method, *args, expect:); end",
+  "  end",
+  "end",
+  "",
+  "# Sorbet only knows Integer; the compiler reads the names to learn the width.",
+  "I32 = T.type_alias { Integer }",
+  "I64 = T.type_alias { Integer }",
+  ""
+])
+# The generated text, as a constant so test/test_body_surface.rb can compare it with the file on disk
+# without this file writing anything when it is merely loaded.
+RBI_TEXT = lines.join("\n")
+
+# Everything above is definitions: the CLI runs only when this file is the program, so loading it (from
+# the test) can never write rbi/dsl.rbi.
+if __FILE__ == $PROGRAM_NAME
+  if ARGV.include?("--print")
+    print RBI_TEXT
+  elsif ARGV.include?("--check")
+    if File.exist?(OUT) && File.read(OUT) == RBI_TEXT
+      puts "rbi/dsl.rbi is up to date"
+    else
+      warn "rbi/dsl.rbi is stale or missing: run `ruby bin/gen_rbi`"
+      exit 1
+    end
+  else
+    FileUtils.mkdir_p(File.dirname(OUT))
+    File.write(OUT, RBI_TEXT)
+    puts "wrote #{OUT}"
+  end
+end

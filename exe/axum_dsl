@@ -1,0 +1,240 @@
+#!/usr/bin/env ruby
+# frozen_string_literal: true
+
+$LOAD_PATH.unshift File.expand_path("../lib", __dir__)
+require "optparse"
+require "fileutils"
+require "axum_dsl"
+
+# axum_dsl check FILE.rb [--format json]       validate only; write nothing
+# axum_dsl build FILE.rb [-o DIR] [--release] [--emit-only]
+#                                              write the crate, then cargo build it
+# axum_dsl run FILE.rb [-o DIR] [--release]    build, then run the service (it listens on its port)
+# axum_dsl dev FILE.rb [-o DIR] [--release]    build and run the service, watch the inputs; on a change re-emit, rebuild, restart
+# axum_dsl FILE.rb -o DIR | --dump-ir | --check   the original form, kept as is
+# axum_dsl rbi FILE... [-o DIR]               write DIR/dsl_helpers.rbi (default sorbet/rbi/axum_dsl): Sorbet signatures for the helpers
+# axum_dsl init NAME [-o DIR] [--force] [--no-bindings]
+#                                              write NAME.axum.rb and a bindings/ folder
+# axum_dsl lsp                                 run a language server on stdin/stdout (diagnostics, hover and completion from the compiler)
+SUBCOMMANDS = %w[check build run dev init skill rbi lsp].freeze
+
+cmd = SUBCOMMANDS.include?(ARGV.first) ? ARGV.shift : nil
+out = nil
+dump = false
+check = false
+release = false
+emit_only = false
+format = "text"
+types = false
+force = false
+no_bindings = false
+print_inputs = false
+parser = OptionParser.new do |o|
+  o.banner = "usage: axum_dsl check FILE.rb [--format json]\n" \
+             "       axum_dsl build FILE.rb [-o DIR] [--release] [--emit-only]\n" \
+             "       axum_dsl run FILE.rb [-o DIR] [--release]\n" \
+             "       axum_dsl dev FILE.rb [-o DIR] [--release]\n" \
+             "       axum_dsl init NAME [-o DIR] [--force] [--no-bindings]\n" \
+             "       axum_dsl skill [-o DIR]\n" \
+             "       axum_dsl rbi FILE... [-o DIR]\n" \
+             "       axum_dsl lsp\n" \
+             "       axum_dsl FILE.rb -o DIR   |   axum_dsl FILE.rb --dump-ir   |   axum_dsl FILE.rb --check"
+  o.on("-o", "--out DIR", "write DIR/Cargo.toml and DIR/src/main.rs (build, run, dev: default build/NAME; skill: parent of the axum-dsl/ skill folder, default .; rbi: the folder for dsl_helpers.rbi, default sorbet/rbi/axum_dsl)") { |v| out = v }
+  o.on("--version", "print the axum_dsl version and the axum version it generates services for") { puts "axum_dsl #{AxumDsl::VERSION} (generates services for axum #{AxumDsl::AXUM_VERSION})"; exit }
+  o.on("--dump-ir", "print the IR as JSON, write nothing") { dump = true }
+  o.on("--check", "validate only: parse, type-check, report notifications; write nothing") { check = true }
+  o.on("--release", "build, run, dev: pass --release to cargo") { release = true }
+  o.on("--emit-only", "build: write the crate and stop before cargo") { emit_only = true }
+  o.on("--force", "init: overwrite NAME.axum.rb if it already exists") { force = true }
+  o.on("--no-bindings", "init: do not create a bindings/ folder") { no_bindings = true }
+  o.on("--format FMT", %w[text json], "check: text (default) or json, one document on stdout") { |v| format = v }
+  o.on("--types", "check --format json: add `types`, the inferred type of every parameter, local and expression") { types = true }
+  o.on("--print-inputs", "print the file paths the compiler read (the DSL file and its use_bindings, rust_file, file, view and asset inputs), one per line, and exit") { print_inputs = true }
+  o.on("--warn SPEC", "all|none|CODE,CODE: which warnings to print (sets AXUM_DSL_WARN)") { |v| ENV["AXUM_DSL_WARN"] = v }
+  o.on("--notice SPEC", "all|none|CODE,CODE: which notices to print (sets AXUM_DSL_NOTICE)") { |v| ENV["AXUM_DSL_NOTICE"] = v }
+end
+parser.parse!
+if cmd != "init" && (force || no_bindings)
+  abort parser.to_s
+end
+if cmd == "lsp" # the language server: LSP on stdin/stdout, nothing else on stdout
+  abort parser.to_s unless ARGV.empty?
+  AxumDsl::Lsp::Server.new($stdin, $stdout).run
+  exit
+end
+files = ARGV.slice!(0..) if cmd == "rbi"
+file = files ? files.first : ARGV.shift
+abort parser.to_s if (cmd == "skill" ? !file.nil? : file.nil?) || !ARGV.empty?
+
+json = format == "json"
+abort parser.to_s if types && !(cmd == "check" && json)
+case cmd
+when "check"
+  abort parser.to_s if out || dump || check || release || emit_only
+  check = true
+when "build"
+  abort parser.to_s if dump || check || json
+  out ||= File.join("build", File.basename(file, ".rb"))
+when "rbi"
+  abort parser.to_s if dump || check || release || emit_only || json
+when "skill"
+  abort parser.to_s if dump || check || release || emit_only || json
+when "init"
+  abort parser.to_s if dump || check || release || emit_only || json
+  out ||= "."
+when "run", "dev"
+  abort parser.to_s if dump || check || emit_only || json
+  out ||= File.join("build", File.basename(file, ".rb"))
+else
+  abort parser.to_s if ([out, dump, check].count { |m| m } != 1 && !print_inputs) || release || emit_only || json
+end
+abort parser.to_s if print_inputs && (json || %w[init skill rbi lsp dev].include?(cmd))
+
+# The starter file `init` writes: the smallest server the compiler accepts, named for the project.
+def init_source(name)
+  <<~RUBY
+    # typed: true
+    server #{name.inspect}, version: "0.1.0"
+    set :port, 8080
+
+    params :EchoParams do
+      field :message, :string, in: :query, description: "Text to echo back"
+    end
+
+    get "/echo", params: :EchoParams, description: "Echo the message back" do
+      text(params[:message])
+    end
+  RUBY
+end
+
+# `workspace:` appends the empty [workspace] table to Cargo.toml: a build dir inside another cargo workspace would
+# be claimed as a member, and the table keeps the crate standalone. It is part of the text compared, so an
+# unchanged Cargo.toml is not rewritten. Only build, run and dev pass it, so -o output stays exactly what
+# the e2e scripts build.
+def write_crate(ir, file, out, workspace: false)
+  AxumDsl::Emit.files(ir, file).each do |rel, text|
+    text += "\n[workspace]\n" if workspace && rel == "Cargo.toml"
+    path = File.join(out, rel)
+    # A file whose bytes are already there is left alone, so an unchanged Cargo.toml keeps its mtime and
+    # a build with the same dependencies does not make cargo look at it again.
+    next if File.file?(path) && File.binread(path) == text.b
+
+    FileUtils.mkdir_p(File.dirname(path))
+    File.write(path, text)
+  end
+end
+
+# "FILE:LINE:COL: message" -> fields, for editors; anything else keeps just the message.
+def diagnostic(text, suggestions = [])
+  m = text.match(/\A(.+?):(\d+):(\d+): (.*)\z/m)
+  d = m ? { file: m[1], line: m[2].to_i, col: m[3].to_i, message: m[4] } : { message: text }
+  d[:suggestions] = suggestions unless suggestions.empty?
+  d
+end
+
+if cmd == "skill"
+  begin
+    AxumDsl::Skill.files.each do |rel, text|
+      path = File.join(out || ".", rel)
+      FileUtils.mkdir_p(File.dirname(path))
+      File.write(path, text)
+      puts path
+    end
+  rescue SystemCallError => e
+    warn "axum_dsl: #{e.message}"
+    exit 1
+  end
+  exit
+end
+
+if cmd == "rbi"
+  begin
+    path = File.join(out || File.join("sorbet", "rbi", "axum_dsl"), "dsl_helpers.rbi")
+    text = AxumDsl::Rbi.generate(files)
+    FileUtils.mkdir_p(File.dirname(path))
+    File.write(path, text)
+    puts path
+  rescue AxumDsl::CompileError, SystemCallError => e
+    warn "axum_dsl: #{e.message}"
+    exit 1
+  end
+  exit
+end
+
+if cmd == "init"
+  name = file
+  unless name.match?(/\A[A-Za-z0-9][A-Za-z0-9._-]*\z/)
+    warn "axum_dsl: invalid name #{name.inspect}; use letters, digits, a dot, underscore or hyphen, starting with a letter or digit"
+    exit 1
+  end
+
+  begin
+    path = File.join(out, "#{name}.axum.rb")
+    if File.exist?(path) && !force
+      warn "axum_dsl: #{path} already exists; pass --force to overwrite"
+      exit 1
+    end
+
+    FileUtils.mkdir_p(out)
+    File.write(path, init_source(name))
+    puts path
+
+    unless no_bindings
+      bindings = File.join(out, "bindings")
+      FileUtils.mkdir_p(bindings)
+      gitkeep = File.join(bindings, ".gitkeep")
+      File.write(gitkeep, "") unless File.exist?(gitkeep)
+      puts bindings
+    end
+  rescue SystemCallError => e
+    warn "axum_dsl: #{e.message}"
+    exit 1
+  end
+  exit
+end
+
+if cmd == "dev"
+  exit AxumDsl::Dev.run(file, out: out, release: release, emit: ->(ir) { write_crate(ir, file, out, workspace: true) })
+end
+
+begin
+  collector = AxumDsl::TypeNames::Collector.new(file) if types
+  ir = AxumDsl.read(file, types: collector)
+  if print_inputs
+    puts ir["inputs"].uniq
+    exit 0
+  end
+  if dump
+    puts JSON.pretty_generate(ir)
+  elsif check
+    if json
+      shown = AxumDsl::Notify.visible
+      notes = shown.map { |n| n.to_h.merge(file: n.path).except(:path) }
+      doc = { ok: true, file: file, inputs: ir["inputs"].uniq, notes: notes, hidden: AxumDsl::Notify.notes.size - shown.size }
+      doc[:types] = collector.entries if collector
+      puts JSON.generate(doc)
+    else
+      puts "#{file}: ok"
+    end
+  else
+    write_crate(ir, file, out, workspace: !cmd.nil?)
+  end
+  AxumDsl::Notify.report unless json
+  if (cmd == "build" && !emit_only) || cmd == "run"
+    # Errors in generated code are reported at the DSL line that produced them.
+    exit 1 unless AxumDsl::CargoBuild.run(out, release: release)
+    # run replaces this process so the server owns stdin and stdout; the build above makes
+    # this a no-op rebuild.
+    exec("cargo", "run", "--quiet", *("--release" if release), chdir: out) if cmd == "run"
+  end
+rescue AxumDsl::CompileError => e
+  if json
+    puts JSON.generate(ok: false, file: file, error: diagnostic(e.message, e.suggestions))
+  else
+    warn e.message
+  end
+  exit 1
+rescue SystemCallError => e
+  warn "axum_dsl: #{e.message}"
+  exit 1
+end

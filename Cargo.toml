@@ -1,0 +1,5 @@
+# Workspace root so rust-analyzer finds shimcheck. Generated services (build/NAME) are
+# standalone crates with their own empty [workspace] table, so they are not members.
+[workspace]
+members = ["shimcheck"]
+resolver = "2"

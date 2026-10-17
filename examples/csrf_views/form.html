@@ -1,0 +1,10 @@
+<!doctype html>
+<html lang="en">
+<body>
+<form method="post" action="/notes">
+  <input type="hidden" name="authenticity_token" value="{{ csrf_token }}">
+  <input name="body" value="hello">
+  <button>Add note</button>
+</form>
+</body>
+</html>

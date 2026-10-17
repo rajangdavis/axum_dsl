@@ -1,0 +1,1 @@
+This file only gives asset_static_over_src.rb a real directory to refuse.

@@ -108,7 +108,7 @@ module AxumDsl
     # (Unicode whitespace, no NUL), so the set is spelled out. See spec/shims/string.yml.
     STRIP_FN = %q(|c: char| matches!(c, '\u{0}' | '\t' | '\n' | '\u{b}' | '\u{c}' | '\r' | ' '))
 
-    def initialize(path, params, regexes = [], externs = {}, flags = {}, tool = nil, bindings = {}, helpers = {}, structs = [], outputs = [], mime_type: nil, kind: nil)
+    def initialize(path, params, regexes = [], externs = {}, flags = {}, tool = nil, bindings = {}, helpers = {}, structs = [], outputs = [], mime_type: nil, kind: nil, skip: [])
       @path = path
       @outputs = outputs # structured results a tool may build with Name.new(...)
       @structs = structs # every params struct, so a nested object's fields can be read
@@ -127,6 +127,8 @@ module AxumDsl
       @uses_async = false   # a tool body (or a helper it calls) awaits, so its fn is async
       @async_reason = nil   # the first construct that made the body async, for diagnostics and hover
       @kind = kind          # the enclosing call, when the reader knows it (:route, :before, :not_found, :error)
+      @skips = skip         # a route's `skip:` names: a required current read on one of them is refused
+      @currents_read = []   # the `current`s this body read, so the filter a `required:` names can be checked
       @route = RESPONSE_BODY_KINDS.include?(kind) # a body that answers an HTTP request, not an MCP call
       @status = nil         # a `status(...)` statement's StatusCode, applied by `lower` to what the body ends in
       @status_site = nil    # that statement's node, named when a helper's `status:` is also in the body
@@ -201,6 +203,7 @@ module AxumDsl
       # What the body reads of the request (cookie, request_ip, user_agent, current), and whether it writes cookies:
       # the emitter adds the extractors and the Set-Cookie list a route needs for them (emit.rb: route_fn).
       body["request"] = @needs.keys.map(&:to_s).sort unless @needs.empty?
+      body["currents"] = @currents_read.uniq unless @currents_read.empty?
       body["cookies"] = true if @cookies_written
       body
     end
@@ -3616,12 +3619,15 @@ module AxumDsl
       end
     end
 
-    # The format a cookie call names: a literal `:hmac` or `:rails`; the declaration's format when it says nothing.
+    # The format a cookie call names: a literal `:hmac`, `:rails` or `:rails7`; the declaration's format
+    # when it says nothing. Cookies::FORMATS is the runtime registry; schema.rb's COOKIE_FORMATS is the
+    # declaration-level list and has to name every format this seam emits.
     def default_cookie_format = @flags["cookie_format"] || "hmac"
 
     def cookie_format_value(value, what)
-      unless value.is_a?(Prism::SymbolNode) && AxumDsl::COOKIE_FORMATS.include?(value.unescaped.to_sym)
-        bad(value, "#{what} `format:` is :hmac or :rails, written out")
+      formats = AxumDsl::Cookies::FORMATS.keys
+      unless value.is_a?(Prism::SymbolNode) && formats.include?(value.unescaped)
+        bad(value, "#{what} `format:` is #{formats.map { |format| ":#{format}" }.join(', ')}, written out")
       end
       value.unescaped
     end
@@ -3778,11 +3784,21 @@ module AxumDsl
         bad(args[0], "no current `#{name}` is declared above this body#{table.empty? ? '; declare one with `current :name, returns: :Record? do ... end`' : " (declared: #{table.keys.join(', ')})"}",
             word: name, from: table.keys)
       (@flags["used_currents"] ||= {})[name] = true
+      @currents_read << name
       need(:headers, :peer, :currents)
       @fallible = true
       @uses_async = true
       @async_reason ||= "reads current `#{name}` (line #{node.location.start_line})"
-      ["__currents.#{name}.get_or_try_init(|| axum_dsl_current_#{name}(&__headers, __peer, &__currents)).await?.clone()", cur["rtype"].to_sym, true]
+      read = "__currents.#{name}.get_or_try_init(|| axum_dsl_current_#{name}(&__headers, __peer, &__currents)).await?"
+      if cur["required"] && @kind == :route
+        if @skips.include?(cur["required"])
+          bad(node, "`current(:#{name})` is non-nil only after `before :#{cur['required']}`, but this route skips `:#{cur['required']}`; " \
+                    "drop `:#{cur['required']}` from the route's `skip:`, or handle the nil-able current with `||`/`.nil?`")
+        end
+        @flags["required_current"] = true
+        return ["axum_dsl_require_current(#{read}.clone(), #{AxumDsl.rstr(name)})?", cur["rtype_required"].to_sym, true]
+      end
+      ["#{read}.clone()", cur["rtype"].to_sym, true]
     end
 
     # The body of a `current`, lowered like a helper that takes nothing: it ends in a value of the declared type,

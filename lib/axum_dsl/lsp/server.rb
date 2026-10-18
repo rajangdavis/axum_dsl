@@ -60,6 +60,8 @@ module AxumDsl
         end
         log("==", @exit ? "stop: exit received" : "stop: input closed")
         exit(0) if @shutdown
+      rescue SystemExit
+        raise # a clean `exit` after shutdown is not a crash; the stop line above is the record
       rescue Exception => e # rubocop:disable Lint/RescueException -- logged, then re-raised
         log("!!", "crash #{e.class}: #{e.message}\n#{e.backtrace.to_a.first(15).join("\n")}")
         raise

@@ -43,8 +43,12 @@ def method_src(name, sig)
   names = sig.fetch(:names)
   raise "#{name}: names and pos differ in length" unless names.size == sig.fetch(:pos).size
 
-  sparams = names.zip(sig[:pos]).map { |n, kind| "#{n}: #{sorbet_type(kind)}" }
-  defs = names.map(&:to_s)
+  optional = sig[:optional_pos] || 0
+  sparams = names.each_with_index.map do |n, i|
+    type = sorbet_type(sig[:pos][i])
+    i >= names.size - optional ? "#{n}: T.nilable(#{type})" : "#{n}: #{type}"
+  end
+  defs = names.each_with_index.map { |n, i| i >= names.size - optional ? "#{n} = nil" : n.to_s }
   # Sorbet wants required keywords before optional ones; keep the table's order within each group.
   sig[:kw].partition { |_, (_, required)| required }.flatten(1).each do |key, (kind, required)|
     if required
@@ -164,8 +168,8 @@ BODY_SURFACE = {
                "def user_agent; end"],
   # current(:name) reads a per-request value; its declaration form (a name, `returns:` and a block) shares this
   # one relaxed sig, as `setting` does, because Sorbet cannot pick an overload on a missing keyword argument.
-  current: ["sig { params(name: Symbol, returns: T.untyped, blk: T.untyped).returns(T.untyped) }",
-            "def current(name, returns: nil, &blk); end"]
+  current: ["sig { params(name: Symbol, returns: T.untyped, required: T.nilable(Symbol), blk: T.untyped).returns(T.untyped) }",
+            "def current(name, returns: nil, required: nil, &blk); end"]
 }.freeze
 
 by_ctx = Hash.new { |h, k| h[k] = [] }

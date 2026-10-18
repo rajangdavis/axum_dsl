@@ -23,6 +23,12 @@ instead. `axum_dsl skill` writes the complete, generated reference; the outline:
   itself. A route that never reads it is answered 400 before its body runs, exactly as before. `errors`
   in a route with no `params:`, or in one whose group declares no constraint for the check() to report,
   is refused.
+- **Params are the typed allowlist.** A `params` group is this language's strong parameters: the
+  declared fields are the inputs the route accepts, and any other key in the query, form or JSON body is
+  ignored (serde's default), the way Rails' `permit` drops unpermitted keys after filtering. There is no
+  `require(:name)` envelope: a Rails bracket name is declared on the field with `name: "message[body]"`.
+  A missing or mistyped declared field is axum's 422 before the body runs; a constraint violation is the
+  generated `check()`'s 400. There is no dynamic `permit` call and no `deny_unknown_fields` switch.
 - **Syntax:** literals, locals (`name = expr`, no reassignment; a name must be snake_case and not a Rust
   keyword), arithmetic and comparisons, `&& || !`, `if`/`elsif`/`else`, `unless`, ternary,
   `case`/`when` (with string, integer and regex subjects), string interpolation, guard clauses
@@ -30,6 +36,10 @@ instead. `axum_dsl skill` writes the complete, generated reference; the outline:
 - **Statements before the last expression:** only `name = expr`, a guard clause, `status(...)`,
   `content_type(...)`, `headers(...)`, `etag(...)`, a bare `execute`/`query` call (its value dropped) or `.each { ... }`.
   The last expression is the response.
+- **Required currents.** `current(:user)` has the nil-able type its `current` declares, except in a route that
+  does not skip the filter named by `required: :authenticate`: there it reads as the non-nil type, so no
+  `nil?`/`||` is needed. A route that skips that filter and reads the current is refused (see
+  [Sessions](sessions.md)).
 - **Transactions.** With a `database`, `transaction do ... end` runs declared statement calls on one
   connection and is the block's value: `name = query/execute call` locals, bare calls, and a final call or
   local. A database error rolls the block back. A nested `transaction`, `return`, `raise`, guard clause or

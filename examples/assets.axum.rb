@@ -19,6 +19,12 @@ static "/files", dir: "public"
 # Cache-Control on it is safe. `{{ asset_path "campfire.css" }}` writes that URL into a page.
 static "/assets", dir: "fingerprints", digest: true
 
+# The fingerprinted files are public: they carry no session or CSRF token, so a shared cache may store them.
+# `except:` leaves the private headers off that mount only; every other response (the /files mount,
+# /api/ping and a 404) keeps `Cache-Control: private, no-cache` and `Vary: Cookie`, which is the default.
+# Only a path a `static` mount serves may be named: a route or a page must never be exempted by accident.
+use_layer :private_cache, except: ["/assets"]
+
 # One route answered by one file: GET /report.txt is public/report.txt, served by ServeFile.
 serve_file "/report.txt", from: "public/report.txt"
 

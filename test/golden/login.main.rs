@@ -316,7 +316,7 @@ fn axum_dsl_apply_cookies(response: &mut ::axum::response::Response, cookies: &[
     }
 }
 
-// sessions runtime (random_token, request_ip, user_agent, Bcrypt, use_layer :fetch_metadata): written by the compiler
+// sessions runtime (random_token, request_ip, user_agent, Bcrypt, the current and filter helpers): written by the compiler
 fn axum_dsl_random_token() -> String {
     use ::rand::Rng;
     const ALPHABET: &[u8] = b"123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz";

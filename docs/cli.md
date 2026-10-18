@@ -21,7 +21,10 @@ _See also: [README](../README.md)._
 The original form still works: `axum_dsl FILE -o DIR`, `--check`, `--dump-ir`.
 
 `build`, `run`, `dev` and `--emit-only` write only the crate files whose bytes changed, so a rebuild with the same
-dependencies leaves `Cargo.toml` (and its mtime) alone.
+dependencies leaves `Cargo.toml` (and its mtime) alone. A build also records what it emitted in `DIR/.axum_dsl-files`
+and removes the files a previous build into the same `DIR` wrote and this one does not — an asset whose `static`
+digest changed, a `static` or `serve_file` that was deleted — so nothing stale is left to be served; it never
+removes a file it did not write.
 
 ## Deploying the emitted crate
 

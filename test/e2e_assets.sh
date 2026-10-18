@@ -3,7 +3,9 @@
 # built binary WITH THE CRATE DIRECTORY AS ITS WORKING DIRECTORY, then assert over HTTP that a `static`
 # mount serves each file type with the right content type, that a missing file and a path-traversal
 # attempt answer an empty 404, that `serve_file` answers its route, that a route's `headers(...)` reach
-# the response, and that `static ... digest: true` serves the fingerprinted name and not the undigested one.
+# the response, that `static ... digest: true` serves the fingerprinted name and not the undigested one, and
+# that `use_layer :private_cache, except: ["/assets"]` leaves its headers off the public fingerprint mount
+# while every other response (the /files mount, the route, a 404) keeps them.
 # Exit zero only when every check passed. Needs curl, and ruby for the digest the fingerprint is derived from.
 #
 # The working directory is the point of the run: a declared asset (the `static` directory, the
@@ -270,6 +272,9 @@ want_file "assets: index.html's own bytes" "/files/index.html" 200 "$fixture"
 want_ctype "assets: an html file is text/html" "/files/index.html" "text/html"
 want_line "assets: a stylesheet" "/files/style.css" 200 'body { color: #333; }'
 want_ctype "assets: a css file is text/css" "/files/style.css" "text/css"
+# /files is not in the layer's `except:` list, so the private-cache layer appends both headers to it.
+want_header "assets: the /files mount keeps private, no-cache" "/files/style.css" "cache-control:.*private, no-cache"
+want_header "assets: the /files mount keeps Vary: Cookie" "/files/style.css" "vary:[[:space:]]*cookie"
 want_line "assets: a json file" "/files/data.json" 200 '{"ok":true,"items":[1,2,3]}'
 want_ctype "assets: a json file is application/json" "/files/data.json" "application/json"
 want_line "assets: the file serve_file also serves" "/files/report.txt" 200 'served by serve_file from public/report.txt'
@@ -292,6 +297,10 @@ digest=$(ruby -rdigest -e 'print Digest::SHA256.hexdigest(File.binread(ARGV[0]))
 [ -n "$digest" ] || fail "empty digest for $fixture_css"
 want_file "fingerprint: the digested stylesheet" "/assets/campfire-$digest.css" 200 "$fixture_css"
 want_ctype "fingerprint: a css file is text/css" "/assets/campfire-$digest.css" "text/css"
+# /assets is the one exempt mount: these are public bytes, so the layer must leave them uncached-for-sharing:
+# neither private, no-cache nor Vary: Cookie belongs on them (and the mount adds no Cache-Control of its own).
+want_no_header "fingerprint: the exempt mount has no private, no-cache" "/assets/campfire-$digest.css" "cache-control:.*private, no-cache"
+want_no_header "fingerprint: the exempt mount has no Vary: Cookie" "/assets/campfire-$digest.css" "vary:[[:space:]]*cookie"
 want_status "fingerprint: the undigested path is not served" "/assets/campfire.css" 404
 # The view helper and the mount name one URL: the page's asset_path is the path fetched above.
 get "/fingerprints"
@@ -312,11 +321,17 @@ want_ctype "serve_file: a text file is text/plain" "/report.txt" "text/plain"
 want_body "ping: the route body" "/api/ping" 200 "pong"
 want_header "ping: Cache-Control" "/api/ping" "cache-control:[[:space:]]*no-store"
 want_header "ping: X-Content-Type-Options" "/api/ping" "x-content-type-options:[[:space:]]*nosniff"
-# The headers belong to that route only: the file services answer without them.
-want_no_header "the served file has no Cache-Control" "/files/index.html" "cache-control:"
+# The layer is on for the route too; append keeps the route's own no-store beside the layer's value.
+want_header "ping: the layer's Cache-Control" "/api/ping" "cache-control:.*private, no-cache"
+want_header "ping: the layer's Vary: Cookie" "/api/ping" "vary:[[:space:]]*cookie"
+# The route's no-store belongs to that route: the file services do not answer with it.
+want_no_header "the served file has no route cache-control" "/files/style.css" "cache-control:[[:space:]]*no-store"
 
 # --- the mount is a mount, not the whole service -------------------------------------------------
 want_status "an unrouted path is a 404" "/nope" 404
+# A 404 is a response too, and the layer wraps the fallback: both headers are there.
+want_header "a 404 keeps private, no-cache" "/nope" "cache-control:.*private, no-cache"
+want_header "a 404 keeps Vary: Cookie" "/nope" "vary:[[:space:]]*cookie"
 
 # --- the copy rule, after the fact ---------------------------------------------------------------
 # The crate copy is the bytes the service was serving; the fixture in the tree is what it must be a copy
@@ -348,4 +363,4 @@ fi
 if [ "$failed" -ne 0 ]; then
 	fail "$failed of $((passed + failed)) checks failed"
 fi
-echo "OK: $passed checks passed: the /files mount serves html, css, json and txt with the right content type, a missing file and a traversal attempt are an empty 404, serve_file answers /report.txt, /api/ping carries its own headers, and /assets serves the fingerprinted file whose name /fingerprints writes"
+echo "OK: $passed checks passed: the /files mount serves html, css, json and txt with the right content type, a missing file and a traversal attempt are an empty 404, serve_file answers /report.txt, /api/ping carries its own headers beside the private-cache layer's, /assets serves the fingerprinted file whose name /fingerprints writes, and private_cache's except: leaves its headers off that mount only"

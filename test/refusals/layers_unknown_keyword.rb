@@ -1,4 +1,4 @@
-# expect: unknown keyword `gzip:` for `use_layer` (allowed: origins, secs, forwarded, per, burst, path)
+# expect: unknown keyword `gzip:` for `use_layer` (allowed: origins, secs, forwarded, per, burst, path, except)
 server "refuse", version: "0.1.0"
 set :port, 8080
 

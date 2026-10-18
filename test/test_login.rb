@@ -9,6 +9,8 @@
 require "minitest/autorun"
 require "tmpdir"
 require "openssl"
+require "json"
+require "time"
 require "axum_dsl"
 
 class TestLogin < Minitest::Test
@@ -278,7 +280,7 @@ class TestLogin < Minitest::Test
   end
 
   def test_hmac_is_the_default_and_rails_is_the_other_format
-    assert_equal %w[hmac rails], AxumDsl::Cookies::FORMATS.keys
+    assert_equal %w[hmac rails rails7], AxumDsl::Cookies::FORMATS.keys
     hmac = AxumDsl::Cookies.backend("hmac")
     assert_equal ["hmac = \"0.12\"", "sha2 = \"0.10\"", "base64 = \"0.22\""], hmac.deps
     text = hmac.items(read: true, set: true).join("\n")
@@ -287,6 +289,9 @@ class TestLogin < Minitest::Test
     rails = AxumDsl::Cookies.backend("rails")
     assert_equal ["hmac = \"0.12\"", "sha1 = \"0.10\"", "pbkdf2 = \"0.12\"", "base64 = \"0.22\""], rails.deps
     assert_includes rails.items(read: true, set: true).join("\n"), "b\"signed cookie\""
+    rails7 = AxumDsl::Cookies.backend("rails7")
+    assert_equal ["hmac = \"0.12\"", "sha1 = \"0.10\"", "sha2 = \"0.10\"", "pbkdf2 = \"0.12\"", "base64 = \"0.22\""], rails7.deps
+    assert_includes rails7.items(read: true, set: true).join("\n"), "Hmac<::sha2::Sha256>"
   end
 
   def test_the_rails_vector_is_the_message_verifier_value_rails_writes
@@ -373,11 +378,242 @@ class TestLogin < Minitest::Test
     assert_includes message, "`format:` applies to a signed cookie"
   end
 
-  def test_a_cookie_format_must_be_hmac_or_rails
+  def test_a_cookie_format_must_be_one_of_the_formats
     message = refusal("setting :secret_key, env: \"SECRET_KEY_BASE\"\ncookies secret: :secret_key, format: :json\n\nget \"/x\" do\n  cookie(:a).to_s\nend\n")
-    assert_includes message, "`:json` is not one of :hmac :rails"
+    assert_includes message, "`:json` is not one of"
     message = refusal(COOKIES + "get \"/x\" do\n  cookie(:a, format: :json).to_s\nend\n")
-    assert_includes message, "cookie `format:` is :hmac or :rails"
+    assert_includes message, "cookie `format:` is :hmac, :rails, :rails7"
+  end
+
+  # --- format: :rails7, the default Rails 7/8 signed cookie ------------------------------------------------
+
+  # format: :rails7 is the signed cookie a default Rails 7/8 application writes. The expected values are
+  # computed here from Ruby's JSON, OpenSSL and pack("m0") -- activesupport/messages/metadata.rb,
+  # message_verifier.rb, key_generator.rb, actionpack/middleware/cookies.rb and the load_defaults "7.0"
+  # values in railties/application/configuration.rb -- not from the compiler's Rust:
+  #   key      = PBKDF2-HMAC-SHA256(SECRET_KEY_BASE, "signed cookie", 1000, 64)
+  #   message  = Base64.strict_encode64(ActiveSupport::JSON.encode(value)) # the jar's :json serializer
+  #   exp      = nil, or the UTC ISO8601 string a permanent/max_age cookie writes (`iso8601(3)`)
+  #   envelope = {"_rails":{"message":message,"exp":exp,"pur":"cookie.NAME"}}
+  #   data     = Base64.strict_encode64(envelope)
+  #   signed   = data + "--" + OpenSSL::HMAC.hexdigest(SHA1, key, data)
+  RAILS7_VECTOR_NAME = "rails7_token"
+  RAILS7_VECTOR = "eyJfcmFpbHMiOnsibWVzc2FnZSI6IkluUnZheUk9IiwiZXhwIjpudWxsLCJwdXIiOiJjb29raWUucmFpbHM3X3Rva2VuIn19--927d95959802b52062338321816e15e36c2c9e09"
+  # A pinned non-null exp, "2100-01-01T00:00:00.000Z": Rails' `Messages::Metadata.pick_expiry` writes
+  # `expires_at.utc.iso8601(3)`, so a permanent or max_age cookie carries a string, not Unix seconds.
+  # This vector stays unexpired, so verification accepts it.
+  RAILS7_PERMANENT_EXP = "2100-01-01T00:00:00.000Z"
+  RAILS7_PERMANENT_VECTOR = "eyJfcmFpbHMiOnsibWVzc2FnZSI6IkluUnZheUk9IiwiZXhwIjoiMjEwMC0wMS0wMVQwMDowMDowMC4wMDBaIiwicHVyIjoiY29va2llLnJhaWxzN190b2tlbiJ9fQ==--599afd628ed52407c633e1ae6e92d73296848b9c"
+
+  def rails7_key(secret)
+    OpenSSL::PKCS5.pbkdf2_hmac(secret, "signed cookie", 1_000, 64, OpenSSL::Digest::SHA256.new)
+  end
+
+  def rails7_signed(secret, data)
+    "#{data}--#{OpenSSL::HMAC.hexdigest(OpenSSL::Digest::SHA1.new, rails7_key(secret), data)}"
+  end
+
+  # ActiveSupport::JSON.encode, for a String or the envelope hash: JSON.generate plus Rails' extra escaping
+  # of <, > and & (encoding.rb, escape_html_entities_in_json).
+  def rails7_encode(value)
+    JSON.generate(value).gsub(">", "\\u003e").gsub("<", "\\u003c").gsub("&", "\\u0026")
+      .gsub("\u2028", "\\u2028").gsub("\u2029", "\\u2029")
+  end
+
+  def rails7_cookie(secret, name, value, exp = nil)
+    message = [rails7_encode(value)].pack("m0")
+    envelope = rails7_encode("_rails" => { "message" => message, "exp" => exp, "pur" => "cookie.#{name}" })
+    rails7_signed(secret, [envelope].pack("m0"))
+  end
+
+  def rails7_now_ms = (Time.now.to_r * 1_000).to_i
+
+  # Messages::Metadata.parse_expiry + Time.iso8601: only a String is parsed; a non-String has no ms.
+  # Time.iso8601 normalizes an impossible date (Feb 30 -> Mar 2), so the calendar fields are checked first.
+  def rails7_exp_ms(text)
+    return nil unless text.is_a?(String)
+    return nil unless text.match?(/\A\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{1,9})?Z\z/)
+
+    year, month, day = text[0, 4].to_i, text[5, 2].to_i, text[8, 2].to_i
+    hour, minute, second = text[11, 2].to_i, text[14, 2].to_i, text[17, 2].to_i
+    return nil unless (1..12).cover?(month) && hour <= 23 && minute <= 59 && second <= 59
+
+    leap = (year % 4 == 0 && year % 100 != 0) || year % 400 == 0
+    days = [31, leap ? 29 : 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31][month - 1]
+    return nil unless day.between?(1, days)
+
+    (Time.iso8601(text).to_r * 1_000).to_i
+  rescue ArgumentError
+    nil
+  end
+
+  # MessageVerifier#verified with the cookie jar's purpose, written out again: check the HMAC-SHA1 hex over
+  # the Base64 data, decode it, unwrap _rails (purpose, then a null exp or an ISO8601 string strictly later
+  # than now; as Messages::Metadata#verify has it), decode the inner message, then parse its JSON String.
+  # Anything the service reads as absent is nil here too.
+  def rails7_verify(secret, name, cookie)
+    data, separator, digest = cookie.rpartition("--")
+    return nil if separator.empty? || digest.length != 40
+    return nil unless OpenSSL::HMAC.hexdigest(OpenSSL::Digest::SHA1.new, rails7_key(secret), data) == digest
+    text = data.unpack1("m0")
+    envelope = JSON.parse(text)
+    payload = if (rails = envelope["_rails"])
+                return nil unless rails["pur"] == "cookie.#{name}"
+                exp = rails["exp"]
+                if exp
+                  return nil unless exp.is_a?(String)
+
+                  exp_ms = rails7_exp_ms(exp)
+                  return nil unless exp_ms && exp_ms > rails7_now_ms
+                end
+                rails["message"].unpack1("m0")
+              else
+                text
+              end
+    value = JSON.parse(payload)
+    value.is_a?(String) ? value : nil
+  rescue JSON::ParserError, TypeError, NoMethodError, ArgumentError
+    nil
+  end
+
+  def test_the_rails7_vector_is_the_json_metadata_cookie_rails_writes
+    assert_equal RAILS7_VECTOR, rails7_cookie(RAILS_SECRET, RAILS7_VECTOR_NAME, "tok")
+    assert_equal "tok", rails7_verify(RAILS_SECRET, RAILS7_VECTOR_NAME, RAILS7_VECTOR)
+    tampered = RAILS7_VECTOR.dup
+    tampered[-1] = tampered[-1] == "0" ? "1" : "0"
+    assert_nil rails7_verify(RAILS_SECRET, RAILS7_VECTOR_NAME, tampered), "a changed digest does not verify"
+    assert_nil rails7_verify(RAILS_SECRET + "x", RAILS7_VECTOR_NAME, RAILS7_VECTOR), "another key does not verify"
+    assert_nil rails7_verify(RAILS_SECRET, "other_token", RAILS7_VECTOR), "another name does not match the purpose"
+  end
+
+  def test_the_rails7_permanent_vector_carries_an_iso8601_string_exp
+    assert_equal RAILS7_PERMANENT_VECTOR, rails7_cookie(RAILS_SECRET, RAILS7_VECTOR_NAME, "tok", RAILS7_PERMANENT_EXP)
+    assert_equal "tok", rails7_verify(RAILS_SECRET, RAILS7_VECTOR_NAME, RAILS7_PERMANENT_VECTOR),
+                 "an exp later than now verifies"
+    envelope = JSON.parse(RAILS7_PERMANENT_VECTOR.split("--", 2).first.unpack1("m0"))
+    assert_equal RAILS7_PERMANENT_EXP, envelope["_rails"]["exp"],
+                 "the signed metadata carries expires_at.utc.iso8601(3), as Rails' pick_expiry writes it"
+    assert_match(/\A\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z\z/, envelope["_rails"]["exp"],
+                 "the exp is a UTC ISO8601 string with three fractional digits")
+    expired = rails7_cookie(RAILS_SECRET, RAILS7_VECTOR_NAME, "tok", "2020-01-01T00:00:00.000Z")
+    assert_nil rails7_verify(RAILS_SECRET, RAILS7_VECTOR_NAME, expired), "an exp at or before now reads as absent"
+  end
+
+  def test_rails7_accepts_a_fresh_string_exp_and_refuses_expired_integer_and_malformed_ones
+    message = [JSON.generate("tok")].pack("m0")
+    purpose = "cookie.#{RAILS7_VECTOR_NAME}"
+
+    wrong_purpose = [JSON.generate("_rails" => { "message" => message, "exp" => nil, "pur" => "cookie.other" })].pack("m0")
+    assert_nil rails7_verify(RAILS_SECRET, RAILS7_VECTOR_NAME, rails7_signed(RAILS_SECRET, wrong_purpose)),
+               "the purpose inside the signed envelope must name this cookie"
+
+    fresh = (Time.now.utc + 60).iso8601(3)
+    fresh_cookie = [JSON.generate("_rails" => { "message" => message, "exp" => fresh, "pur" => purpose })].pack("m0")
+    assert_equal "tok", rails7_verify(RAILS_SECRET, RAILS7_VECTOR_NAME, rails7_signed(RAILS_SECRET, fresh_cookie)),
+                 "a signed ISO8601 exp later than now is accepted"
+
+    no_fraction = (Time.now.utc + 60).iso8601
+    no_fraction_cookie = [JSON.generate("_rails" => { "message" => message, "exp" => no_fraction, "pur" => purpose })].pack("m0")
+    assert_equal "tok", rails7_verify(RAILS_SECRET, RAILS7_VECTOR_NAME, rails7_signed(RAILS_SECRET, no_fraction_cookie)),
+                 "YYYY-MM-DDTHH:MM:SSZ is accepted too"
+
+    short_fraction = [JSON.generate("_rails" => { "message" => message, "exp" => "2100-01-01T00:00:00.5Z", "pur" => purpose })].pack("m0")
+    assert_equal "tok", rails7_verify(RAILS_SECRET, RAILS7_VECTOR_NAME, rails7_signed(RAILS_SECRET, short_fraction)),
+                 "1-3 fractional digits are right-padded to milliseconds"
+
+    expired = [JSON.generate("_rails" => { "message" => message, "exp" => "2020-01-01T00:00:00.000Z", "pur" => purpose })].pack("m0")
+    assert_nil rails7_verify(RAILS_SECRET, RAILS7_VECTOR_NAME, rails7_signed(RAILS_SECRET, expired)),
+               "an expired ISO8601 string is refused"
+
+    integer = [JSON.generate("_rails" => { "message" => message, "exp" => 4_102_444_800, "pur" => purpose })].pack("m0")
+    assert_nil rails7_verify(RAILS_SECRET, RAILS7_VECTOR_NAME, rails7_signed(RAILS_SECRET, integer)),
+               "an integer exp is refused; Rails' Time.iso8601 would raise"
+
+    float = [JSON.generate("_rails" => { "message" => message, "exp" => 4_102_444_800.0, "pur" => purpose })].pack("m0")
+    assert_nil rails7_verify(RAILS_SECRET, RAILS7_VECTOR_NAME, rails7_signed(RAILS_SECRET, float)),
+               "a float exp is not the string Rails writes"
+
+    ["2100-13-01T00:00:00.000Z", "2100-02-30T00:00:00.000Z", "2100-01-01T00:00:00.Z"].each do |bad|
+      cookie = [JSON.generate("_rails" => { "message" => message, "exp" => bad, "pur" => purpose })].pack("m0")
+      assert_nil rails7_verify(RAILS_SECRET, RAILS7_VECTOR_NAME, rails7_signed(RAILS_SECRET, cookie)),
+                 "malformed ISO8601 [#{bad}] is refused"
+    end
+
+    malformed = [JSON.generate("_rails" => { "message" => "not base64!", "exp" => nil, "pur" => purpose })].pack("m0")
+    assert_nil rails7_verify(RAILS_SECRET, RAILS7_VECTOR_NAME, rails7_signed(RAILS_SECRET, malformed))
+    assert_nil rails7_verify(RAILS_SECRET, RAILS7_VECTOR_NAME, rails7_signed(RAILS_SECRET, [JSON.generate(7)].pack("m0"))),
+               "a JSON number is not a String value"
+  end
+
+  def test_rails7_reads_the_no_metadata_form
+    data = [JSON.generate("tok")].pack("m0")
+    cookie = "#{data}--#{OpenSSL::HMAC.hexdigest(OpenSSL::Digest::SHA1.new, rails7_key(RAILS_SECRET), data)}"
+    assert_equal "tok", rails7_verify(RAILS_SECRET, "whatever", cookie), "use_cookies_with_metadata = false sends no envelope"
+  end
+
+  def test_format_rails7_emits_the_json_envelope_and_the_sha256_key
+    files = compile(COOKIES + <<~RB)
+      get "/x" do
+        set_cookie :rails7_token, "tok", format: :rails7
+        cookie(:rails7_token, format: :rails7).to_s
+      end
+    RB
+    rust = files["src/main.rs"]
+    assert_includes rust, "fn axum_dsl_cookie_sign_rails7(name: &str, value: &str, max_age: Option<i64>) -> String {"
+    assert_includes rust, "fn axum_dsl_cookie_verify_rails7("
+    assert_includes rust, "axum_dsl_set_cookie_rails7(\"rails7_token\", \"tok\""
+    assert_includes rust, "axum_dsl_cookie_rails7(&__headers, \"rails7_token\")"
+    assert_includes rust, "::pbkdf2::pbkdf2::<::hmac::Hmac<::sha2::Sha256>>(axum_dsl_cookie_key(), b\"signed cookie\", 1_000, &mut key)",
+                    "Rails 7.0+ derives the signed cookie key with PBKDF2-HMAC-SHA256"
+    assert_includes rust, "axum_dsl_cookie_rails7_digest(&data)", "the envelope text is what HMAC-SHA1 signs"
+    assert_includes rust, "_rails", "the metadata envelope"
+    assert_includes rust, "fn axum_dsl_cookie_rails7_now() -> i64 {", "the exp is measured against the system clock"
+    assert_includes rust, "fn axum_dsl_cookie_rails7_iso8601(seconds: i64) -> String {",
+                    "the signer formats a UTC ISO8601 timestamp"
+    assert_includes rust, '"{:04}-{:02}-{:02}T{:02}:{:02}:{:02}.000Z",'
+    assert_includes rust, 'format!("\"{}\"", axum_dsl_cookie_rails7_iso8601(expires))',
+                    "a positive lifetime becomes the quoted metadata exp, now + max_age"
+    assert_includes rust, "let expires = axum_dsl_cookie_rails7_now().saturating_add(seconds);"
+    assert_includes rust, "_ => String::from(\"null\")", "a cookie with no lifetime keeps Rails' exp: null"
+    assert_includes rust, "fn axum_dsl_cookie_rails7_exp_ms(text: &str) -> Option<i64> {",
+                    "the verifier parses the ISO8601 string Rails writes"
+    assert_includes rust, "let exp = exp.as_str()?", "a non-string exp is refused, not coerced"
+    assert_includes rust, "if axum_dsl_cookie_rails7_exp_ms(exp)? <= axum_dsl_cookie_rails7_now_ms() {",
+                    "an expired exp is refused with millisecond precision"
+    assert_includes rust, "if !(1..=12).contains(&month)", "invalid month/day/hour/min/sec are refused"
+    assert_includes rust, "::serde_json::from_str::<String>", "the payload must be a JSON String"
+    assert_includes rust, "r#\"\\u003c\"#", "Rails escapes < in JSON"
+    assert_includes rust, "axum_dsl_cookie_quote(&axum_dsl_cookie_sign_rails7(name, value, max_age))",
+                    "the setter passes the lifetime into the signer"
+    refute_includes rust, "axum_dsl_cookie_mac", "the hmac format is not emitted"
+    assert_includes files["Cargo.toml"], "\nsha2 = \"0.10\""
+    assert_includes files["Cargo.toml"], "\npbkdf2 = \"0.12\""
+  end
+
+  def test_rails7_permanent_and_max_age_reach_the_signer
+    rust = main(COOKIES + <<~RB)
+      get "/permanent" do
+        set_cookie :rails7_token, "tok", permanent: true, format: :rails7
+        "tok"
+      end
+
+      get "/max_age" do
+        set_cookie :rails7_token, "tok", max_age: 60, format: :rails7
+        "tok"
+      end
+    RB
+    assert_includes rust, 'axum_dsl_set_cookie_rails7("rails7_token", "tok", true, "Lax", false, Some(631139040))',
+                    "permanent: true is Rails' twenty years"
+    assert_includes rust, 'axum_dsl_set_cookie_rails7("rails7_token", "tok", true, "Lax", false, Some(60))'
+    assert_equal 1, rust.scan("axum_dsl_cookie_sign_rails7(name, value, max_age)").size,
+                 "the one emitted setter hands its lifetime to the signer; both call sites above pass Some"
+  end
+
+  def test_format_rails7_can_be_the_declaration_default
+    head = HEAD + "setting :secret_key, env: \"SECRET_KEY_BASE\"\ncookies secret: :secret_key, format: :rails7\n"
+    rust = main("get \"/x\" do\n  set_cookie :rails7_token, \"tok\"\n  cookie(:rails7_token).to_s\nend\n", head: head)
+    assert_includes rust, "axum_dsl_set_cookie_rails7(\"rails7_token\", \"tok\""
+    assert_includes rust, "axum_dsl_cookie_rails7(&__headers, \"rails7_token\")"
   end
 
   # --- set :rust, :none ------------------------------------------------------------------------------------

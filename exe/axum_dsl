@@ -110,9 +110,15 @@ end
 # `workspace:` appends the empty [workspace] table to Cargo.toml: a build dir inside another cargo workspace would
 # be claimed as a member, and the table keeps the crate standalone. It is part of the text compared, so an
 # unchanged Cargo.toml is not rewritten. Only build, run and dev pass it, so -o output stays exactly what
-# the e2e scripts build.
+# the e2e scripts build. A build first removes the files the previous build into DIR emitted and this
+# one does not, then records its own file set in DIR/.axum_dsl-files; files the compiler did not write are
+# left alone (AxumDsl::Manifest).
 def write_crate(ir, file, out, workspace: false)
-  AxumDsl::Emit.files(ir, file).each do |rel, text|
+  files = AxumDsl::Emit.files(ir, file)
+  # Prune before writing, so a path that changes from an emitted file into a directory (or back) is not
+  # blocked by the old file; the new manifest is recorded only after every file is written.
+  AxumDsl::Manifest.prune(out, files.keys)
+  files.each do |rel, text|
     text += "\n[workspace]\n" if workspace && rel == "Cargo.toml"
     path = File.join(out, rel)
     # A file whose bytes are already there is left alone, so an unchanged Cargo.toml keeps its mtime and
@@ -122,6 +128,7 @@ def write_crate(ir, file, out, workspace: false)
     FileUtils.mkdir_p(File.dirname(path))
     File.write(path, text)
   end
+  AxumDsl::Manifest.record(out, files.keys)
 end
 
 # "FILE:LINE:COL: message" -> fields, for editors; anything else keeps just the message.

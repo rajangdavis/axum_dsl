@@ -459,12 +459,15 @@ module AxumDsl
     # tower-http feature each one needs. The order is fixed rather than the declaration order, so where a
     # `use_layer` sits in the file does not change the emitted router. In axum the first `.layer(..)` is
     # the innermost, so the last one listed (trace) sees every request first.
-    # :fetch_metadata (Sessions::FETCH_METADATA), :rate_limit (rate_limit_runtime) and :csrf (Csrf::RUNTIME)
-    # are the compiler's own middleware, so none needs a feature. :fetch_metadata sits outside :csrf: the
-    # cheap cross-site refusal runs first, and the token check is the guard behind it.
-    LAYER_ORDER = %w[compression cors timeout csrf fetch_metadata rate_limit trace].freeze
+    # :fetch_metadata (Sessions::FETCH_METADATA), :rate_limit (rate_limit_runtime), :csrf (Csrf::RUNTIME)
+    # and :private_cache (private_cache_runtime) are the compiler's own middleware, so none needs a
+    # feature. :fetch_metadata sits outside :csrf: the cheap cross-site refusal runs first, and the token
+    # check is the guard behind it. :private_cache is outside both (and :rate_limit), so a refusal any of
+    # them answers still carries the cache headers, and inside :trace, which only observes.
+    LAYER_ORDER = %w[compression cors timeout csrf fetch_metadata rate_limit private_cache trace].freeze
     LAYER_FEATURES = { "compression" => "compression-gzip", "cors" => "cors", "timeout" => "timeout",
-                       "fetch_metadata" => nil, "csrf" => nil, "rate_limit" => nil, "trace" => "trace" }.freeze
+                       "fetch_metadata" => nil, "csrf" => nil, "rate_limit" => nil, "private_cache" => nil,
+                       "trace" => "trace" }.freeze
 
     def layer?(ir, name) = ir["layers"].to_a.any? { |l| l["name"] == name }
 
@@ -488,8 +491,51 @@ module AxumDsl
       when "fetch_metadata" then "::axum::middleware::from_fn(axum_dsl_fetch_metadata)"
       when "csrf" then "::axum::middleware::from_fn(axum_dsl_csrf)"
       when "rate_limit" then "::axum::middleware::from_fn(axum_dsl_rate_limit)"
+      when "private_cache" then "::axum::middleware::from_fn(axum_dsl_private_cache)"
       when "trace" then forwarded?(ir) ? FORWARDED_TRACE : PLAIN_TRACE
       end
+    end
+
+    # use_layer :private_cache: a page behind a cookie must not be stored by a shared cache. Both headers
+    # are appended, never inserted, so a route's own `Cache-Control` is kept beside `private, no-cache`
+    # and an existing `Vary` gains `Cookie` rather than losing what it named. `except:` leaves the headers
+    # off the public files under the named static mounts: each prefix matches the path exactly or at a `/`
+    # boundary (`/assets` covers `/assets/x.css`, not `/assets2`), with no allocation. Without `except:`
+    # the emitted runtime is byte for byte what it always was.
+    def private_cache_runtime(ir)
+      except = layer_entry(ir, "private_cache")&.[]("except").to_a
+      head = ["// use_layer :private_cache: a shared cache must not store an authenticated page: written by the compiler"]
+      if except.empty?
+        return head + [
+          "async fn axum_dsl_private_cache(request: ::axum::extract::Request, next: ::axum::middleware::Next) -> ::axum::response::Response {",
+          "    let mut response = next.run(request).await;",
+          "    let headers = response.headers_mut();",
+          "    headers.append(::axum::http::header::CACHE_CONTROL, ::axum::http::HeaderValue::from_static(\"private, no-cache\"));",
+          "    headers.append(::axum::http::header::VARY, ::axum::http::HeaderValue::from_static(\"Cookie\"));",
+          "    response",
+          "}"
+        ]
+      end
+
+      prefixes = except.map { |prefix| AxumDsl.rstr(prefix) }.join(", ")
+      head + [
+        "const AXUM_DSL_PRIVATE_CACHE_EXCEPT: &[&str] = &[#{prefixes}];",
+        "",
+        "fn axum_dsl_private_cache_exempt(path: &str) -> bool {",
+        "    AXUM_DSL_PRIVATE_CACHE_EXCEPT.iter().any(|prefix| path == *prefix || path.strip_prefix(*prefix).map_or(false, |rest| rest.starts_with('/')))",
+        "}",
+        "",
+        "async fn axum_dsl_private_cache(request: ::axum::extract::Request, next: ::axum::middleware::Next) -> ::axum::response::Response {",
+        "    let exempt = axum_dsl_private_cache_exempt(request.uri().path());",
+        "    let mut response = next.run(request).await;",
+        "    if !exempt {",
+        "        let headers = response.headers_mut();",
+        "        headers.append(::axum::http::header::CACHE_CONTROL, ::axum::http::HeaderValue::from_static(\"private, no-cache\"));",
+        "        headers.append(::axum::http::header::VARY, ::axum::http::HeaderValue::from_static(\"Cookie\"));",
+        "    }",
+        "    response",
+        "}"
+      ]
     end
 
     # use_layer :rate_limit: the compiler's own fixed-window limiter, in std only. One process-wide map
@@ -1441,6 +1487,7 @@ module AxumDsl
       o.concat([*Cookies.runtime_lines(ir), ""]) if ir["cookies"]
       o.concat(Sessions.items(ir))
       o.concat(Csrf.items(ir))
+      o.concat([*private_cache_runtime(ir), ""]) if layer?(ir, "private_cache")
       o.concat([*rate_limit_runtime(ir), ""]) if layer?(ir, "rate_limit")
       if Sessions.currents?(ir)
         o.concat(Sessions.currents_lines(ir))
@@ -1471,7 +1518,7 @@ module AxumDsl
         o << ""
       end
       ir["before"].to_a.each_with_index do |b, i|
-        mapped(o, ranges, b, "before filter") { o.concat(before_fn(b, "before_#{i + 1}")) }
+        mapped(o, ranges, b, "before filter") { o.concat(before_fn(ir, b, "before_#{i + 1}")) }
         o << ""
       end
       if ir["not_found"]
@@ -1703,8 +1750,23 @@ module AxumDsl
     # (a guard that halts); one that ends in a plain value does not stop the request, and the filter
     # passes it on. The body language has no "continue" value, so the shape of the last expression is
     # what decides, and `next.run` is the only thing a filter that continues does.
-    def before_fn(b, name)
-      lines = ["async fn #{name}(request: ::axum::extract::Request, next: ::axum::middleware::Next) -> ::axum::response::Response {"]
+    def before_fn(ir, b, name)
+      lines = []
+      # A named filter's `skip:` list is matched here, at run time, before the body runs: the request's method
+      # and URI path against the routes that name this filter. The filter itself stays a router layer.
+      skips = b["name"] ? skip_entries(ir, b["name"]) : []
+      unless skips.empty?
+        lines << "fn #{name}_skip(method: &::axum::http::Method, path: &str) -> bool {"
+        lines << "    #{skip_conditions(skips).join("\n        || ")}"
+        lines << "}"
+        lines << ""
+      end
+      lines << "async fn #{name}(request: ::axum::extract::Request, next: ::axum::middleware::Next) -> ::axum::response::Response {"
+      unless skips.empty?
+        lines << "    if #{name}_skip(request.method(), request.uri().path()) {"
+        lines << "        return next.run(request).await;"
+        lines << "    }"
+      end
       # What the body read of the request, taken before the request goes on to `next.run` (body.rb: need). The
       # headers are copied, so the request can still be moved into the next handler.
       want = b["request"].to_a
@@ -1716,23 +1778,26 @@ module AxumDsl
         # The body answers the request itself; a content type below still has to change the response.
         lines.concat(assign_response(b, "response", mutable: !b["content_type"].nil?).map { |l| "    #{l}" })
       else
+        # The filter passes the request on: `mut` only when the content type, the status or the headers below set it.
+        changes = b["content_type"] || b["status"] || !b["headers"].to_a.empty?
         if b["fallible"]
-          open, call = closure_wrap(b)
-          lines << "    match #{open}Result<(), String> {"
+          # A guard (`return Ok(redirect(...))`) answers the request itself; the tail runs the next handler.
+          # Both are a Response, so the closure yields one and a plain final value is still dropped.
+          # The tail awaits `next.run`, so the closure is async even when the body itself does not await.
+          open, call = ["(async || -> ", "})().await"]
+          lines << "    let #{changes ? 'mut ' : ''}response = match #{open}Result<::axum::response::Response, String> {"
           lines.concat(b["locals"].map { |l| "        #{l}" })
           lines << "        let _ = #{b['expr']};"
-          lines << "        Ok(())"
+          lines << "        Ok(next.run(request).await)"
           lines << "    #{call} {"
-          lines << "        Ok(()) => {}"
+          lines << "        Ok(response) => response,"
           lines << "        Err(message) => return error_response(&message),"
-          lines << "    }"
+          lines << "    };"
         else
           lines.concat(b["locals"].map { |l| "    #{l}" })
           lines << "    let _ = #{b['expr']};"
+          lines << "    let #{changes ? 'mut ' : ''}response = next.run(request).await;"
         end
-        # The filter passes the request on: `mut` only when the content type, the status or the headers below set it.
-        changes = b["content_type"] || b["status"] || !b["headers"].to_a.empty?
-        lines << "    let #{changes ? 'mut ' : ''}response = next.run(request).await;"
       end
       if b["content_type"]
         lines << "    response.headers_mut().insert("
@@ -1751,6 +1816,25 @@ module AxumDsl
       lines << "    response"
       lines << "}"
       lines
+    end
+
+    # The routes and static mounts that name this filter in `skip:`, as [method, axum path] pairs. The run-time
+    # check compares the request's method and URI path against them; Reader#check_filter_skips refused a route
+    # pair that could also match a route which does not skip the filter. A static mount is a GET service at its
+    # prefix and everything under it, so it contributes the prefix and its `{*path}` subtree.
+    def skip_entries(ir, name)
+      routes = ir["routes"].to_a.select { |r| r["skip"].to_a.include?(name) }.map { |r| [r["method"], r["path"]] }
+      statics = ir["statics"].to_a.select { |s| s["skip"].to_a.include?(name) }.flat_map do |s|
+        subtree = s["prefix"] == "/" ? "/{*path}" : "#{s['prefix']}/{*path}"
+        [["get", s["prefix"]], ["get", subtree]]
+      end
+      (routes + statics).uniq
+    end
+
+    def skip_conditions(entries)
+      entries.map do |method, path|
+        "(*method == ::axum::http::Method::#{method.upcase} && axum_dsl_skip_match(#{AxumDsl.rstr(path)}, path))"
+      end
     end
 
     # What a request that matched no route answers with.

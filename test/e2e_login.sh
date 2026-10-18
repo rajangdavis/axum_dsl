@@ -234,21 +234,22 @@ want "a fresh login works" 200 "Hello, Ada"
 
 # --- rate limiting: POST /session is capped per client, per 60 s window -----------------------------
 # use_layer :rate_limit, per: 60, burst: 25, path: "/session". The requests above have used about a dozen
-# of the 25 (POSTs and the DELETEs, since the limit is per path); a burst of 30 more must see 429 before all
-# reach the route, and a GET on another path must stay unlimited.
+# of the 25 (POSTs and the DELETEs, since the limit is per path); a burst of 51 more (more than twice the
+# burst) must see 429 whichever side of a 60 s window boundary it falls on, and a GET on another path must
+# stay unlimited.
 # This is the end of the first run, so the count cannot disturb the assertions above; the next server start
 # is a fresh process and starts from zero.
 limited=0
 i=0
-while [ "$i" -lt 30 ]; do
+while [ "$i" -lt 51 ]; do
 	i=$((i + 1))
 	req POST /session --data-urlencode "email=nobody@example.com" --data-urlencode "password=wrong"
 	if [ "$status" = "429" ]; then limited=$((limited + 1)); fi
 done
 if [ "$limited" -gt 0 ]; then
-	ok "a burst of 30 POSTs to /session is rate limited ($limited answered 429)"
+	ok "a burst of 51 POSTs to /session is rate limited ($limited answered 429)"
 else
-	bad "a burst of 30 POSTs to /session answered no 429"
+	bad "a burst of 51 POSTs to /session answered no 429"
 fi
 req GET /session/new
 want "GET /session/new is outside the rate limit path" 200 "<form"

@@ -9,7 +9,8 @@
 # instead (emit.rb: route_fn, check_impl), so a rejected POST runs the body with the check()'s message and
 # keeps the 400 unless the body sets status(...). It also drives the form routes (whose answers are HTML
 # built with h(params[:name]), so a name that looks like a tag comes back escaped) and the named layers
-# the example declares: compression, cors, timeout and trace. Exit zero only when every check passed.
+# the example declares: compression, cors, timeout, trace and private_cache. Exit zero only when every
+# check passed.
 # Needs curl.
 # usage: sh test/e2e_validate.sh [CRATE_DIR]      (default /tmp/axum_dsl_validate-out)
 # Build the crate first:  ruby exe/axum_dsl build examples/validate.axum.rb -o /tmp/axum_dsl_validate-out
@@ -278,6 +279,21 @@ else
 	failed=$((failed + 1))
 fi
 
+# use_layer :private_cache appends its two headers to the response a route built, and /signup sets a
+# Cache-Control of its own, so both values must be there: append, not replace.
+cache=$(grep -i '^cache-control:' "$headers" | tr -d '\r')
+vary=$(grep -i '^vary:' "$headers" | tr -d '\r')
+if printf '%s\n' "$cache" | grep -q 'max-age=60' &&
+	printf '%s\n' "$cache" | grep -q 'private, no-cache' &&
+	printf '%s\n' "$vary" | grep -qi 'cookie'; then
+	passed=$((passed + 1))
+	echo "ok: GET /signup -> Cache-Control keeps the route's max-age=60 beside private, no-cache, and Vary: Cookie"
+else
+	echo "FAIL: GET /signup did not carry both Cache-Control values and Vary: Cookie; headers were:"
+	sed 's/^/      /' "$headers" 2>/dev/null || true
+	failed=$((failed + 1))
+fi
+
 # One request per constraint, each violating exactly one field and leaving the other three valid, so
 # the body can only be the message that field's check produces. The formats are emit.rb's field_checks:
 #   min_length  "error: invalid value for {}: it has {} characters, fewer than the minimum of {}"
@@ -315,6 +331,17 @@ if [ "$status" = "404" ]; then
 else
 	echo "FAIL: GET /nope -> HTTP $status, wanted 404"
 	echo "      body: [$(cat "$body")]"
+	failed=$((failed + 1))
+fi
+
+# The layer is outside axum's fallback too, so even the 404 carries it.
+if grep -qi '^cache-control:.*private, no-cache' "$headers" &&
+	grep -qi '^vary:.*cookie' "$headers"; then
+	passed=$((passed + 1))
+	echo "ok: GET /nope -> 404 still carries Cache-Control: private, no-cache and Vary: Cookie"
+else
+	echo "FAIL: the 404 from GET /nope did not carry the private-cache headers; headers were:"
+	sed 's/^/      /' "$headers" 2>/dev/null || true
 	failed=$((failed + 1))
 fi
 
@@ -597,4 +624,4 @@ echo "note: :timeout and :trace are declared but not asserted over HTTP (see the
 if [ "$failed" -ne 0 ]; then
 	fail "$failed of $((passed + failed)) checks failed"
 fi
-echo "OK: $passed checks passed: /signup echoes the values it accepted, each violated constraint answers 400 with the message the generated check() builds, the form route parses, escapes the name with h(...) and, reading errors[:name], re-renders that message while keeping the 400, /signup/soft answers the status its body sets, the compression and cors layers answer, and /openapi.json serves an OpenAPI 3.1 document of the routes and their constraints"
+echo "OK: $passed checks passed: /signup echoes the values it accepted, each violated constraint answers 400 with the message the generated check() builds, the form route parses, escapes the name with h(...) and, reading errors[:name], re-renders that message while keeping the 400, /signup/soft answers the status its body sets, the compression and cors layers answer, and /openapi.json serves an OpenAPI 3.1 document of the routes and their constraints; /signup keeps its own Cache-Control beside the private-cache one, and a 404 carries both headers too"

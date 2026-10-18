@@ -34,6 +34,12 @@ class TestCompiledPaths < Minitest::Test
   # The emitted src/main.rs, which is what most of these tests read.
   def compile(body, views: {}, head: HEAD) = compile_files(body, views: views, head: head)["src/main.rs"]
 
+  # The refusal message, for the rules a compiled-path test also pins.
+  def refusal(body, head: HEAD, extra: {})
+    error = assert_raises(AxumDsl::CompileError) { compile_files(body, head: head, extra: extra) }
+    error.message
+  end
+
   # `set :views` is a server setting: a render in a use_dsl fragment reads the server file's views/ folder,
   # not a views/ folder beside the fragment.
   def test_a_fragment_renders_a_view_from_the_server_folder
@@ -782,6 +788,34 @@ class TestCompiledPaths < Minitest::Test
     assert_includes all, %(const AXUM_DSL_RATE_LIMIT_PATH: &str = "";), "without path: every route is counted"
   end
 
+  # A page behind a cookie must not be stored by a shared cache. `use_layer :private_cache` appends
+  # Cache-Control: private, no-cache and Vary: Cookie to every response; it is emitted outside the
+  # middleware that can answer a request itself (csrf, fetch_metadata, rate_limit) and inside trace.
+  def test_private_cache_appends_its_headers_to_every_response
+    files = compile_files(<<~RB)
+      use_layer :private_cache
+      use_layer :fetch_metadata
+      use_layer :rate_limit, per: 60, burst: 3
+
+      get "/" do
+        text("ok")
+      end
+    RB
+    main = files["src/main.rs"]
+    layer = main.index(".layer(::axum::middleware::from_fn(axum_dsl_private_cache))")
+    fetch = main.index(".layer(::axum::middleware::from_fn(axum_dsl_fetch_metadata))")
+    rate = main.index(".layer(::axum::middleware::from_fn(axum_dsl_rate_limit))")
+    refute_nil layer
+    assert_operator fetch, :<, layer, "the cache layer wraps the guard, so its refusals carry the headers"
+    assert_operator rate, :<, layer, "the cache layer wraps the limiter, so a 429 carries the headers"
+    assert_includes main,
+                    'headers.append(::axum::http::header::CACHE_CONTROL, ' \
+                    '::axum::http::HeaderValue::from_static("private, no-cache"));'
+    assert_includes main,
+                    'headers.append(::axum::http::header::VARY, ::axum::http::HeaderValue::from_static("Cookie"));'
+    refute_includes files["Cargo.toml"], "tower-http", "the cache layer needs no tower-http feature"
+  end
+
   # GAPS 13: a form field may carry a Rails wire name (`message[body]`), a serde rename on the struct
   # field. The DSL name is unchanged for params[:body], check() and errors.
   def test_a_form_field_name_renames_the_wire_key_only
@@ -814,5 +848,241 @@ class TestCompiledPaths < Minitest::Test
     assert_includes main, "::axum::http::StatusCode::NOT_MODIFIED"
     assert_includes main, "::axum::http::header::ETAG"
     assert_includes main, "__headers: ::axum::http::HeaderMap", "the route takes the headers it compares"
+  end
+
+  # AX14: named filters stay router layers, and routes opt out with `skip:`. The emitted layer compares the
+  # request's method and URI path with the skipping routes (a capture is matched by segment).
+  def test_a_named_before_filter_is_one_layer_and_skips_by_method_and_path
+    main = compile(<<~RB)
+      setting :secret_key, env: "SECRET_KEY_BASE"
+      cookies secret: :secret_key
+
+      params :Room do
+        field :id, :string, in: :path
+      end
+
+      before :authenticate do
+        return redirect("/login") if cookie(:who).nil?
+        "continue"
+      end
+
+      before do
+        content_type(:json)
+        "ok"
+      end
+
+      get "/session/new", skip: [:authenticate] do
+        text("sign in")
+      end
+
+      get "/rooms/:id", params: :Room, skip: [:authenticate] do
+        text("room")
+      end
+    RB
+    assert_includes main, "fn before_1_skip(method: &::axum::http::Method, path: &str) -> bool {"
+    assert_includes main,
+                    %q{(*method == ::axum::http::Method::GET && axum_dsl_skip_match("/session/new", path))}
+    assert_includes main, %q{axum_dsl_skip_match("/rooms/{id}", path))}, "a capture keeps the axum path shape"
+    assert_includes main, "if before_1_skip(request.method(), request.uri().path()) {"
+    assert_includes main, "        return next.run(request).await;"
+    refute_includes main, "before_2_skip", "an anonymous filter has no skip list"
+    assert_includes main, ".layer(axum::middleware::from_fn(before_1))"
+    assert_includes main, ".layer(axum::middleware::from_fn(before_2))", "a named filter is still a router layer"
+    assert_includes main, "fn axum_dsl_skip_match(pattern: &str, path: &str) -> bool {"
+    assert_includes main, %q(if segment.starts_with("{*")), "the matcher understands an axum wildcard"
+  end
+
+  # The required form: after the named filter, the current reads at its non-nil type with no `nil?`/`||` in
+  # the route; the filter itself still reads the nil-able type so its guard can work.
+  def test_a_required_current_reads_non_nil_after_its_filter
+    main = compile(<<~RB)
+      current :who, returns: :string?, required: :authenticate do
+        request_ip
+      end
+
+      before :authenticate do
+        return redirect("/login") if current(:who).nil?
+        "continue"
+      end
+
+      get "/me" do
+        text(current(:who))
+      end
+    RB
+    assert_includes main, %q{axum_dsl_require_current(__currents.who.get_or_try_init(}
+    assert_includes main, %q{).await?.clone(), "who")?}, "the route gets the value, not an Option"
+    assert_includes main, "fn axum_dsl_require_current<T>(value: Option<T>, name: &str) -> Result<T, String> {"
+    assert_includes main, %q{get_or_try_init(|| axum_dsl_current_who(&__headers, __peer, &__currents)).await?.clone()},
+                    "the filter still reads the nil-able value"
+    refute_match(/match __currents\.who[^\n]*None =>/, main, "the route does not unwrap or match the Option")
+  end
+
+  # The refusal half of the required form: a route that skips the establishing filter may not read the
+  # current at the non-nil type, because nothing proves the filter ran.
+  def test_a_route_that_skips_the_required_filter_cannot_read_it
+    message = refusal(<<~RB)
+      current :who, returns: :string?, required: :authenticate do
+        request_ip
+      end
+
+      before :authenticate do
+        return redirect("/login") if current(:who).nil?
+        "continue"
+      end
+
+      get "/me", skip: [:authenticate] do
+        text(current(:who))
+      end
+    RB
+    assert_includes message, "but this route skips `:authenticate`"
+    assert_includes message, "drop `:authenticate` from the route's `skip:`"
+  end
+
+  # The skip is matched at run time, so it may not overlap a route that does not skip the filter.
+  def test_a_skip_that_could_match_a_non_skipping_route_is_refused
+    message = refusal(<<~RB)
+      params :Room do
+        field :id, :string, in: :path
+      end
+
+      before :authenticate do
+        "continue"
+      end
+
+      get "/rooms/:id", params: :Room, skip: [:authenticate] do
+        text("room")
+      end
+
+      get "/rooms/me" do
+        text("me")
+      end
+    RB
+    assert_includes message, "also matches `get /rooms/me`, which does not skip it"
+  end
+
+  # A guard in a filter makes its body fallible. The closure must yield a Response: `return Ok(redirect)`
+  # answers the request, and a plain final value is dropped before `next.run` supplies the response.
+  def test_a_fallible_before_filter_that_continues_yields_a_response
+    main = compile(<<~RB)
+      current :who, returns: :string? do
+        request_ip
+      end
+
+      before :authenticate do
+        return redirect("/session/new") if current(:who).nil?
+        "continue"
+      end
+
+      get "/me" do
+        text("ok")
+      end
+    RB
+    assert_includes main, "let response = match (async || -> Result<::axum::response::Response, String> {"
+    assert_includes main, "return Ok({ let mut __redirect = "
+    assert_includes main, "Ok(next.run(request).await)"
+    assert_includes main, "Ok(response) => response,"
+    assert_includes main, "Err(message) => return error_response(&message),", "an error answers immediately, before the filter's own status/headers"
+    refute_includes main, "Result<(), String> {", "a continuing filter yields the response it passes on"
+  end
+
+  # AX14 follow-up: a static mount is covered by a named filter's layer too, so the mount takes `skip:`.
+  # The emitted skip covers GET of the prefix and of its subtree, which keeps /assets public.
+  def test_a_static_mount_skips_a_named_filter_for_the_prefix_and_its_subtree
+    files = compile_files(<<~RB, extra: { "public/app.css" => "body { color: red }" })
+      before :authenticate do
+        "continue"
+      end
+
+      static "/assets", dir: "public", skip: [:authenticate]
+
+      get "/" do
+        text("ok")
+      end
+    RB
+    main = files["src/main.rs"]
+    assert_includes main, %q{(*method == ::axum::http::Method::GET && axum_dsl_skip_match("/assets", path))}
+    assert_includes main, %q{(*method == ::axum::http::Method::GET && axum_dsl_skip_match("/assets/{*path}", path))}
+    assert_includes main, "if before_1_skip(request.method(), request.uri().path()) {"
+    assert_includes main, %q{.nest_service("/assets", ::tower_http::services::ServeDir::new("public")},
+                    "the mount is still emitted"
+  end
+
+  # A mount at "/" is axum's fallback, so its skip would cover every GET path and step a named filter
+  # aside for every GET route. That cannot be scoped, so it is refused; without skip the mount is fine.
+  def test_a_root_static_mount_cannot_take_a_skip
+    message = refusal(<<~RB, extra: { "public/app.css" => "body { color: red }" })
+      before :authenticate do
+        "continue"
+      end
+
+      static "/", dir: "public", skip: [:authenticate]
+
+      get "/" do
+        text("ok")
+      end
+    RB
+    assert_includes message, "`static \"/\"` is axum's fallback for every GET path"
+    assert_includes message, "cannot be scoped"
+
+    files = compile_files(<<~RB, extra: { "public/app.css" => "body { color: red }" })
+      static "/", dir: "public"
+
+      get "/" do
+        text("ok")
+      end
+    RB
+    assert_includes files["src/main.rs"], '.fallback_service(::tower_http::services::ServeDir::new("public")'
+
+    # An empty skip is not a skip: the refusal is for a non-empty `skip:` only.
+    files = compile_files(<<~RB, extra: { "public/app.css" => "body { color: red }" })
+      before :authenticate do
+        "continue"
+      end
+
+      static "/", dir: "public", skip: []
+
+      get "/" do
+        text("ok")
+      end
+    RB
+    assert_includes files["src/main.rs"], '.fallback_service(::tower_http::services::ServeDir::new("public")'
+    refute_includes files["src/main.rs"], "before_1_skip", "an empty skip is no skip"
+  end
+
+  # use_layer :private_cache, except: ["/assets"] leaves the two headers off the files of a declared
+  # static mount (the safe default is on everywhere else). It emits a prefix list matched exactly or at a
+  # `/` boundary, computes the path before next.run, and needs no tower-http feature of its own.
+  def test_private_cache_except_names_a_mount_and_emits_the_prefix_matcher
+    files = compile_files(<<~RB, extra: { "public/x.css" => "x" })
+      static "/assets", dir: "public"
+      use_layer :private_cache, except: ["/assets"]
+
+      get "/" do
+        text("ok")
+      end
+    RB
+    main = files["src/main.rs"]
+    assert_includes main, 'const AXUM_DSL_PRIVATE_CACHE_EXCEPT: &[&str] = &["/assets"];'
+    assert_includes main, "fn axum_dsl_private_cache_exempt(path: &str) -> bool {"
+    assert_includes main, "path.strip_prefix(*prefix).map_or(false, |rest| rest.starts_with('/'))"
+    assert_includes main, "let exempt = axum_dsl_private_cache_exempt(request.uri().path());"
+    assert_includes main, "if !exempt {"
+    assert_includes main, ".layer(::axum::middleware::from_fn(axum_dsl_private_cache))"
+    assert_includes main,
+                    'headers.append(::axum::http::header::CACHE_CONTROL, ' \
+                    '::axum::http::HeaderValue::from_static("private, no-cache"));'
+    assert_includes main,
+                    'headers.append(::axum::http::header::VARY, ::axum::http::HeaderValue::from_static("Cookie"));'
+    assert_includes files["Cargo.toml"], 'tower-http = { version = "0.6", features = ["fs"] }',
+                    "the static mount still needs fs, and the layer adds no feature"
+    refute_includes files["Cargo.toml"], "compression-gzip"
+
+    plain = compile("use_layer :private_cache\n\nget \"/\" do\n  text(\"ok\")\nend\n")
+    refute_includes plain, "AXUM_DSL_PRIVATE_CACHE_EXCEPT", "without except: the emitted runtime is unchanged"
+
+    # A path inside a mount is a declared public path too, at a segment boundary.
+    nested = compile_files(%(static "/assets", dir: "public"\nuse_layer :private_cache, except: ["/assets/css"]\n\nget "/" do\n  text("ok")\nend\n),
+                           extra: { "public/css/app.css" => "x" })["src/main.rs"]
+    assert_includes nested, 'const AXUM_DSL_PRIVATE_CACHE_EXCEPT: &[&str] = &["/assets/css"];'
   end
 end

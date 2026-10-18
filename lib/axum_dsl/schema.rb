@@ -11,12 +11,12 @@ module AxumDsl
   # client, as the JSON Schema standard treats `format`, not something the server checks.
   FORMATS = %i[uri email date_time date uuid hostname ipv4 ipv6].freeze
   # The wire formats a signed cookie may use (`cookies format:`, and `format:` on a cookie call): :hmac is the
-  # compiler's own, :rails is Rails' MessageVerifier value. Cookies::FORMATS names the module for each.
-  COOKIE_FORMATS = %i[hmac rails].freeze
-  # The middleware a top-level `use_layer` names. Each is a tower-http layer the emitter puts on the
-  # router, and each needs its own Cargo feature (see Emit::LAYER_FEATURES); `:fetch_metadata` is the
-  # compiler's own middleware and needs none (docs/sessions.md).
-  LAYERS = %i[compression cors timeout trace fetch_metadata rate_limit csrf].freeze
+  # compiler's own, :rails is Rails' classic MessageVerifier value, and :rails7 is the JSON/metadata format a Rails 7/8 app writes. Cookies::FORMATS names the module for each.
+  COOKIE_FORMATS = %i[hmac rails rails7].freeze
+  # The middleware a top-level `use_layer` names. Each tower-http layer needs its own Cargo feature (see
+  # Emit::LAYER_FEATURES); `:fetch_metadata`, `:rate_limit`, `:csrf` and `:private_cache` are the
+  # compiler's own middleware and need none (docs/sessions.md, docs/dsl.md).
+  LAYERS = %i[compression cors timeout trace fetch_metadata rate_limit csrf private_cache].freeze
 
   # Types a helper declares for its arguments and result. Lists are spelled out, and a trailing ? means
   # nil-able: string? is "a string or nil".
@@ -54,10 +54,12 @@ module AxumDsl
   # `{name}`; a route REQUIRES its block, which is the body language. `params:` names a `params` block whose
   # fields the body reads as `params[:field]`, and `in:` on each field says whether it arrives in the path,
   # the query string, the body or a form (the reader defaults it from the verb: :body for post/put/patch,
-  # :query for get/delete/head/options; :form is always explicit).
+  # :query for get/delete/head/options; :form is always explicit). `skip:` names the named `before` filters
+  # this route does not run, as a list of symbols (`skip: [:authenticate]`); the filter matches the route's
+  # method and path at run time, and a name no `before` declares is refused (docs/sessions.md).
   ROUTE_DECL = {
     in: :top, names: [:path], pos: [:str],
-    kw: { params: [:camel, false], description: [:str, false] },
+    kw: { params: [:camel, false], description: [:str, false], skip: [:snakes, false] },
     block: :body
   }.freeze
 
@@ -67,6 +69,7 @@ module AxumDsl
   #   in:    name of the enclosing call (:top for the file level, where top-level routes and filters live)
   #   names: positional argument names, in order (used by bin/gen_rbi)
   #   pos:   positional argument kinds, in order
+  #   optional_pos: how many trailing `pos` arguments may be left out (1 for `before :name`)
   #   kw:    keyword => [kind, required]
   #   block: nil (no block), :decls (only DSL calls inside) or :body (Ruby subset)
   # Kinds: :lit (a string, number or true/false literal), :default (a :lit, or a flat array of them),
@@ -116,8 +119,9 @@ module AxumDsl
     # copied into the emitted crate at the same relative path, so the running service finds it beside its
     # own Cargo.toml; `set :public_folder, "public"` is the same mount at "/". With `digest: true` every file
     # is copied under `<stem>-<sha256 prefix><ext>` and only that name is served, and a view writes the URL
-    # with `{{ asset_path "campfire.css" }}` (see docs/views.md).
-    static: { in: :top, names: [:prefix], pos: [:str], kw: { dir: [:str, true], digest: [:bool, false] }, block: nil },
+    # with `{{ asset_path "campfire.css" }}` (see docs/views.md). A named `before` filter covers a mount like a
+    # route; `skip:` lists the filters the mount does not run, which keeps an asset directory public.
+    static: { in: :top, names: [:prefix], pos: [:str], kw: { dir: [:str, true], digest: [:bool, false], skip: [:snakes, false] }, block: nil },
     # serve_file "/report.txt", from: "public/report.txt" answers one route with one file (tower-http
     # ServeFile), copied into the emitted crate the same way.
     serve_file: { in: :top, names: [:path], pos: [:str], kw: { from: [:str, true] }, block: nil },
@@ -148,10 +152,12 @@ module AxumDsl
     # the order of the declarations. `:cors` takes `origins:` (a list of origins; without it the layer is
     # permissive), `:timeout` takes `secs:` (a positive whole number of seconds) and `:trace` takes
     # `forwarded:` (true names the visitor's X-Forwarded-For address in its log lines); `:rate_limit`
-    # takes `per:`, `burst:` and an optional `path:` (the compiler's own limiter, see docs/dsl.md).
+    # takes `per:`, `burst:` and an optional `path:` (the compiler's own limiter, see docs/dsl.md), and
+    # `:private_cache` appends `Cache-Control: private, no-cache` and `Vary: Cookie`; its `except:` lists
+    # path prefixes served by a `static` mount that leave the layer off (only public files may be named).
     use_layer: { in: :top, names: [:name], pos: [LAYERS],
                  kw: { origins: [:strs, false], secs: [:uint, false], forwarded: [:bool, false],
-                       per: [:uint, false], burst: [:uint, false], path: [:str, false] }, block: nil },
+                       per: [:uint, false], burst: [:uint, false], path: [:str, false], except: [:strs, false] }, block: nil },
     get: ROUTE_DECL,
     post: ROUTE_DECL,
     put: ROUTE_DECL,
@@ -159,9 +165,11 @@ module AxumDsl
     delete: ROUTE_DECL,
     options: ROUTE_DECL,
     head: ROUTE_DECL,
-    # An HTTP request filter: it runs before every route that follows it, for what they all share (a
-    # content type, a guard). `after` is refused: see the header.
-    before: { in: :top, names: [], pos: [], kw: {}, block: :body },
+    # An HTTP request filter: it runs for every route, in the emitter's layer order, for what they all
+    # share (a content type, a guard). `before :authenticate do ... end` names it, so a route can say
+    # `skip: [:authenticate]`; the name is optional (`before do ... end` is the anonymous filter), and a
+    # duplicate name is refused. `after` is refused: see the header.
+    before: { in: :top, names: [:name], pos: [:snake], optional_pos: 1, kw: {}, block: :body },
     # What a request that matched no route answers with.
     not_found: { in: :top, names: [], pos: [], kw: {}, block: :body },
     # What a body that raised answers with.
@@ -190,7 +198,9 @@ module AxumDsl
     # A per-request value, computed at most once on its first use: `current :user, returns: :User? do ... end`.
     # The block is a body that may call queries, cookie(:name), request_ip, helpers and the currents above it;
     # a route or a filter reads it with current(:user). `returns:` is what a query's `returns:` is.
-    current: { in: :top, names: [:name], pos: [:snake], kw: { returns: [:qreturns, true] }, block: :body },
+    # `required: :authenticate` says the named `before` filter stops the request unless this nil-able value
+    # is there, so a route that does not skip that filter reads it at its non-nil type (docs/sessions.md).
+    current: { in: :top, names: [:name], pos: [:snake], kw: { returns: [:qreturns, true], required: [:filter_name, false] }, block: :body },
     # SQL state (docs/database.md). `database :sqlite, path: "notes.sqlite3", env: "DATABASE_PATH"` names the one
     # database (the adapter is the first argument, only :sqlite is built; `env:` overrides `path:` at startup),
     # `migrations "db/migrate"` names the folder of *.sql files applied at startup, `record` declares the row a

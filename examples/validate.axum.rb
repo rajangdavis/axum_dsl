@@ -16,11 +16,14 @@ openapi "/openapi.json"
 
 # A layer answers every route, so where these sit in the file does not change the service; the emitter
 # puts them on the router in its own fixed order (lib/axum_dsl/emit.rb: LAYER_ORDER) and adds each
-# tower-http feature to the one Cargo.toml line.
+# tower-http feature to the one Cargo.toml line. :private_cache is the compiler's own header layer: it
+# appends Cache-Control: private, no-cache and Vary: Cookie to every response, so a shared cache does
+# not store a page behind a cookie.
 use_layer :compression                         # gzip/deflate response compression
 use_layer :cors, origins: ["https://example.com"]
 use_layer :timeout, secs: 5
 use_layer :trace
+use_layer :private_cache
 
 params :Signup do
   field :name, :string, in: :query, min_length: 3, max_length: 8
@@ -48,6 +51,9 @@ params :MessageForm do
 end
 
 get "/signup", params: :Signup, description: "One signup, echoing the values it accepted" do
+  # :private_cache appends its own Cache-Control, so this route's value must still be on the response:
+  # test/e2e_validate.sh asserts both halves, which is what "append, not replace" means.
+  headers "Cache-Control" => "max-age=60"
   text("ok: #{params[:name]} #{params[:handle]} #{params[:colour]} #{params[:age]}")
 end
 

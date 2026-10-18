@@ -1,4 +1,4 @@
-# expect: `:json` is not one of :hmac :rails
+# expect: `:json` is not one of :hmac :rails :rails7
 server "refuse", version: "0.1.0"
 set :port, 8080
 

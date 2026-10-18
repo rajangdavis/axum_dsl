@@ -57,8 +57,10 @@ module AxumDsl
       # The declaration's call shape, spelled the way the reader spells it (reader.rb#shape): an optional
       # keyword is bracketed.
       def shape(name, sig)
+        optional = sig[:optional_pos] || 0
+        pos = sig[:names].each_with_index.map { |arg, i| i >= sig[:names].size - optional ? "[#{arg}]" : arg.to_s }
         kws = sig[:kw].map { |k, (_, req)| req ? "#{k}:" : "[#{k}:]" }
-        "#{name}(#{(sig[:names] + kws).join(', ')})"
+        "#{name}(#{(pos + kws).join(', ')})"
       end
 
       # The calls the reader allows directly inside `ctx`.

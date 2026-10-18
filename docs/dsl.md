@@ -46,7 +46,11 @@ end
   field may add `name: "message[body]"` for a Rails-style bracketed wire key: the generated struct field
   and `params[:body]` keep the DSL name, so the `Form` extractor reads the bracketed key while `check()`
   and `errors` stay keyed by the DSL name. `name:` is refused on anything but `in: :form`, and two fields
-  of a group may not share a wire key.
+  of a group may not share a wire key. **A params group is the typed allowlist** — this language's strong
+  parameters: the declared fields are the accepted inputs, and every other key in the query, form or JSON
+  body is ignored (serde's default), like Rails' `permit` dropping unpermitted keys. There is no
+  `require(:name)` envelope and no dynamic `permit`; a missing or mistyped declared field is axum's 422,
+  and a constraint violation is the generated `check()`'s 400.
 - **`in:`** says which part of the request a field arrives in: `:path`, `:query`, `:body` or `:form`. It
   is optional except for `:form`, and the verb decides the default (`:body` for post/put/patch, `:query`
   for get/delete/head/options). A group whose fields arrive in more than one part needs `in:` on each. A
@@ -102,16 +106,23 @@ end
   `{{ }}` belongs to a client framework (Vue, Handlebars, a `<template>` an SPA clones) is not a view but
   a static asset, because the browser evaluates the data inside the live template and HTML escaping cannot
   prevent it. See [Views](views.md).
-- **Filters.** `before do ... end` runs before every route that follows it (a content type, a guard; there is no path scoping yet); a
-  filter whose body ends in a response helper answers the request itself, and one that ends in a plain
-  value passes it on. `not_found do ... end` answers a request that matched no route (axum's fallback).
-  `error do ... end` answers a route body that raised; without one, the raised message becomes a plain
-  500.
+- **Filters.** `before do ... end` runs for every route (a content type, a guard); a filter whose body ends in a
+  response helper answers the request itself, and one that ends in a plain value passes it on. `before
+  :authenticate do ... end` names the filter, and a route opts out with `skip: [:authenticate]`: the filter
+  still layers the router, and the emitted layer compares the request's method and path with the skipping
+  routes. A duplicate name, and a skip of a name no `before` declares, are refused. A skip that could also
+  match a route, a `serve_file` or the OpenAPI document is refused. `current :user, returns:
+  :User?, required: :authenticate` reads `current(:user)` at its non-nil type in routes that do not skip the
+  filter, and refuses a route that skips it and still reads the current. `not_found do ... end` answers a
+  request that matched no route (axum's fallback). `error do ... end` answers a route body that raised;
+  without one, the raised message becomes a plain 500.
 - **Middleware.** `use_layer :compression`, `use_layer :cors, origins: ["https://example.com"]`,
-  `use_layer :timeout, secs: 5`, `use_layer :trace` and `use_layer :rate_limit, per: 60, burst: 20,
-  path: "/session"` wrap the whole router: gzip/deflate response compression, CORS, a request timeout,
+  `use_layer :timeout, secs: 5`, `use_layer :trace`, `use_layer :private_cache` (with its optional `except:` list) and
+  `use_layer :rate_limit, per: 60, burst: 20, path: "/session"` wrap the whole router: gzip/deflate
+  response compression, CORS, a request timeout,
   `tracing`-based request logging (`:trace` installs the log subscriber, so it prints at the default `info`
-  level; `RUST_LOG` overrides), and the compiler's own fixed-window rate limiter. A
+  level; `RUST_LOG` overrides), the compiler's own fixed-window rate limiter, and `:private_cache`'s
+  header append. A
   layer answers every route, so where the declaration sits in the file does not change the service; the
   compiler puts them on the router in its own fixed order and adds each tower-http feature
   (`compression-gzip`, `cors`, `timeout`, `trace`) to the one `tower-http` line, alongside `fs` when a
@@ -126,6 +137,16 @@ end
   there is no `Retry-After` header, the map never evicts (a client can add a key per address), and with
   `forwarded: true` the key is the caller's `X-Forwarded-For` entry, so trust it only behind a proxy that
   overwrites that header.
+  `use_layer :private_cache` appends `Cache-Control: private, no-cache` and `Vary: Cookie` to every
+  response by default, never inserted, so a route's own `Cache-Control` is kept beside them; that is what
+  stops a shared cache from storing an authenticated page. Its one keyword is `except:`, an explicit list
+  of literal path prefixes served by a declared `static` mount — `use_layer :private_cache, except:
+  ["/assets"]` — which leave the layer off. `except:` may not name `/`, a route, or a path no mount
+  serves, so a page with a session or a CSRF token cannot be exempted by accident. Exempting a mount
+  removes the private headers but adds no public `Cache-Control`, and ServeFile still answers
+  Last-Modified/If-Modified-Since 304s. It is the compiler's own middleware with no tower-http feature,
+  and it sits outside `:csrf`, `:fetch_metadata` and `:rate_limit`, so a refusal or a 429 from any of
+  them carries the headers too.
   `:csrf` takes no keywords: it needs `cookies secret:`, and it refuses a write (anything but GET, HEAD
   and OPTIONS) whose `authenticity_token` field or `X-CSRF-Token` header does not match the signed
   `_axum_dsl_csrf` cookie, with 403; `use_layer :fetch_metadata` stays the first-line guard outside it
@@ -146,7 +167,8 @@ end
   `name(arg: value)` and may group those calls in `transaction do ... end`. The SQL runs as written. See
   [Database](database.md).
 - **Sessions** are the compiler's own, with no app Rust: `cookies secret: :secret_key, format: :hmac` signs
-  cookies (`format: :rails` writes Rails' MessageVerifier value), bodies read one with `cookie(:name)` (or
+  cookies (`format: :rails` writes Rails' classic MessageVerifier value and `:rails7` the JSON/`_rails`
+  value a default Rails 7/8 app reads), bodies read one with `cookie(:name)` (or
   `signed: false` for a plain one) and a route writes one with `set_cookie` / `delete_cookie`;
   `random_token`, `request_ip`, `user_agent`; `current :user, returns: :User? do ... end`, a per-request value
   read with `current(:user)`; the built-in `Bcrypt.verify` / `Bcrypt.hash`; `use_layer :fetch_metadata`, which
@@ -169,10 +191,15 @@ end
   `cmd_fn`/`script_fn` run a subprocess; `file "python/x.py", as: :x` names a file bodies read with
   `file_text(:x)`; it is copied into the crate at that path and read from the working directory (or from
   `env:`), so editing the source needs a rebuild. See [Bindings](bindings.md).
-- **Serving files.** `static "/assets", dir: "public"` mounts a directory at a path prefix: every request
+- **Serving files.** `static "/assets", dir: "public"` mounts a directory at a path prefix; a named `before`
+  filter covers it like a route, so `static "/assets", dir: "public", skip: [:authenticate]` keeps the
+  directory public (GET of the prefix and its subtree): every request
   under the prefix is answered by tower-http's `ServeDir`, which guesses each file's content type from its
   extension, answers a request for a directory as its `index.html`, and answers an empty 404 for a missing
-  file and for a path segment holding `..` or a backslash. `serve_file "/report.txt", from:
+  file and for a path segment holding `..` or a backslash. A mount at `/` is axum's fallback rather than a
+  prefix, so it cannot take `skip:`: that skip would cover every GET path, and the compiler refuses it;
+  mount at a prefix instead. `serve_file` and `set :public_folder` take no `skip:` today.
+  `serve_file "/report.txt", from:
   "public/report.txt"` answers one route with one file. `set :public_folder, "public"` is the same mount
   at `/`, which is Sinatra's meaning for the setting; a `not_found` filter cannot go with it, because both
   claim axum's one fallback. A body-level `send_file` is refused: it would have to await a file service,
@@ -204,8 +231,9 @@ environment), and a path with `?` or an inline regex (axum's router has only one
 `helper` form gives the same thing with checkable signatures.
 
 A second `use_layer` of the same name is refused, as is a `use_layer` whose keyword does not belong to
-that layer, an origin that is not a plain origin, a `:timeout` with no positive `secs:`, and a
-`:rate_limit` with no positive `per:` or `burst:`. A group
+that layer, an origin that is not a plain origin, a `:timeout` with no positive `secs:`, a `:rate_limit`
+with no positive `per:` or `burst:`, and a `:private_cache` `except:` that is empty, malformed, lists a
+prefix twice, is `/`, or names a path no `static` mount serves. A group
 that mixes `in: :body` and `in: :form` is refused, because axum lets one extractor consume the body, and
 `in: :form` on a route whose verb is not post/put/patch is refused, because a browser sends a form body
 on no other verb.

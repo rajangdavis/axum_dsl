@@ -89,6 +89,43 @@ module AxumDsl
       }
     RS
 
+    # The safe read a route makes of a `current` that a named `before` filter establishes (`required:`). The
+    # filter should have stopped a request whose value is nil, so None here is a broken contract: answered as a
+    # 500 through the body's error path, never an `unwrap` that could panic.
+    REQUIRED_CURRENT = <<~'RS'
+      fn axum_dsl_require_current<T>(value: Option<T>, name: &str) -> Result<T, String> {
+          value.ok_or_else(|| format!("error: required current `{name}` is nil; the `before` filter that establishes it did not stop the request"))
+      }
+    RS
+
+    # A route pattern (`/rooms/{id}`) against the concrete path of a request, for a named filter's `skip:` list:
+    # a `{name}` segment matches a non-empty segment, a `{*name}` tail matches the rest, a literal is equal. The
+    # compiler refuses a skip that could also match a route which does not skip it (Reader#check_filter_skips).
+    SKIP_MATCH = <<~'RS'
+      fn axum_dsl_skip_match(pattern: &str, path: &str) -> bool {
+          let mut expected = pattern.split('/');
+          let mut actual = path.split('/');
+          loop {
+              match (expected.next(), actual.next()) {
+                  (None, None) => return true,
+                  (Some(segment), Some(part)) => {
+                      if segment.starts_with("{*") {
+                          return true;
+                      }
+                      if segment.starts_with('{') && segment.ends_with('}') {
+                          if part.is_empty() {
+                              return false;
+                          }
+                      } else if segment != part {
+                          return false;
+                      }
+                  }
+                  _ => return false,
+              }
+          }
+      }
+    RS
+
     # The layer that gives each request its own set of `current` cells. It is the outermost of the filters, so a
     # filter and the route that follows it read the same cells.
     CURRENT_SCOPE = <<~'RS'
@@ -132,7 +169,9 @@ module AxumDsl
       add.call(BCRYPT_VERIFY) if builtin?(ir, "bcrypt_verify")
       add.call(BCRYPT_HASH) if builtin?(ir, "bcrypt_hash")
       add.call(FETCH_METADATA) if ir["layers"].to_a.any? { |l| l["name"] == "fetch_metadata" }
-      out.empty? ? out : ["// sessions runtime (random_token, request_ip, user_agent, Bcrypt, use_layer :fetch_metadata): written by the compiler", *out]
+      add.call(REQUIRED_CURRENT) if ir["required_current"]
+      add.call(SKIP_MATCH) if ir["filter_skips"]
+      out.empty? ? out : ["// sessions runtime (random_token, request_ip, user_agent, Bcrypt, the current and filter helpers): written by the compiler", *out]
     end
 
     def current_rust(c)

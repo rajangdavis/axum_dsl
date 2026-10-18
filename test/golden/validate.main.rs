@@ -126,6 +126,15 @@ fn axum_dsl_html_escape(input: &str) -> std::borrow::Cow<'_, str> {
     }
 }
 
+// use_layer :private_cache: a shared cache must not store an authenticated page: written by the compiler
+async fn axum_dsl_private_cache(request: ::axum::extract::Request, next: ::axum::middleware::Next) -> ::axum::response::Response {
+    let mut response = next.run(request).await;
+    let headers = response.headers_mut();
+    headers.append(::axum::http::header::CACHE_CONTROL, ::axum::http::HeaderValue::from_static("private, no-cache"));
+    headers.append(::axum::http::header::VARY, ::axum::http::HeaderValue::from_static("Cookie"));
+    response
+}
+
 // The OpenAPI document of this service (openapi): written by the compiler from the routes and params
 const OPENAPI_JSON: &str = "{\"openapi\":\"3.1.0\",\"info\":{\"title\":\"validator\",\"version\":\"0.1.0\"},\"paths\":{\"/signup\":{\"get\":{\"operationId\":\"get_signup\",\"summary\":\"One signup, echoing the values it accepted\",\"description\":\"One signup, echoing the values it accepted\",\"parameters\":[{\"name\":\"name\",\"in\":\"query\",\"required\":true,\"schema\":{\"type\":\"string\",\"minLength\":3,\"maxLength\":8}},{\"name\":\"age\",\"in\":\"query\",\"required\":true,\"schema\":{\"type\":\"integer\",\"format\":\"int32\",\"minimum\":18,\"maximum\":120}},{\"name\":\"colour\",\"in\":\"query\",\"required\":true,\"schema\":{\"type\":\"string\",\"enum\":[\"red\",\"green\",\"blue\"]}},{\"name\":\"handle\",\"in\":\"query\",\"required\":true,\"schema\":{\"type\":\"string\",\"pattern\":\"^[a-z][a-z0-9_]{2,7}$\"}}],\"responses\":{\"200\":{\"description\":\"Success\"},\"400\":{\"description\":\"The request could not be read, or a field broke a constraint; the body says which\"}}}},\"/signup/form\":{\"post\":{\"operationId\":\"post_signup_form\",\"summary\":\"One signup sent as an HTML form\",\"description\":\"One signup sent as an HTML form\",\"requestBody\":{\"content\":{\"application/x-www-form-urlencoded\":{\"schema\":{\"type\":\"object\",\"properties\":{\"name\":{\"type\":\"string\",\"minLength\":3,\"maxLength\":8},\"age\":{\"type\":\"integer\",\"format\":\"int32\",\"minimum\":18,\"maximum\":120}},\"required\":[\"name\",\"age\"]}}},\"required\":true},\"responses\":{\"200\":{\"description\":\"Success\"},\"400\":{\"description\":\"The request could not be read, or a field broke a constraint; the body says which\"},\"422\":{\"description\":\"The body does not have the declared fields\"}}}},\"/messages\":{\"post\":{\"operationId\":\"post_messages\",\"summary\":\"A message form with Rails' bracketed wire names\",\"description\":\"A message form with Rails' bracketed wire names\",\"requestBody\":{\"content\":{\"application/x-www-form-urlencoded\":{\"schema\":{\"type\":\"object\",\"properties\":{\"body\":{\"type\":\"string\",\"minLength\":1},\"client_message_id\":{\"type\":\"string\"}},\"required\":[\"body\"]}}},\"required\":true},\"responses\":{\"200\":{\"description\":\"Success\"},\"400\":{\"description\":\"The request could not be read, or a field broke a constraint; the body says which\"},\"422\":{\"description\":\"The body does not have the declared fields\"}}}},\"/etag\":{\"get\":{\"operationId\":\"get_etag\",\"summary\":\"A conditional GET: 304 when If-None-Match matches the ETag\",\"description\":\"A conditional GET: 304 when If-None-Match matches the ETag\",\"responses\":{\"200\":{\"description\":\"Success\"}}}},\"/signup/soft\":{\"post\":{\"operationId\":\"post_signup_soft\",\"summary\":\"One signup answered with a status of its own\",\"description\":\"One signup answered with a status of its own\",\"requestBody\":{\"content\":{\"application/x-www-form-urlencoded\":{\"schema\":{\"type\":\"object\",\"properties\":{\"name\":{\"type\":\"string\",\"minLength\":3,\"maxLength\":8},\"age\":{\"type\":\"integer\",\"format\":\"int32\",\"minimum\":18,\"maximum\":120}},\"required\":[\"name\",\"age\"]}}},\"required\":true},\"responses\":{\"200\":{\"description\":\"Success\"},\"400\":{\"description\":\"The request could not be read, or a field broke a constraint; the body says which\"},\"422\":{\"description\":\"The body does not have the declared fields\"}}}}}}";
 
@@ -139,7 +148,9 @@ async fn route_1(axum::extract::Query(__query): axum::extract::Query<Signup>) ->
         return ::axum::response::IntoResponse::into_response((::axum::http::StatusCode::BAD_REQUEST, message));
     }
     let Signup { name, age, colour, handle } = __query;
-    let response = ::axum::response::IntoResponse::into_response(format!("ok: {} {} {} {}", name, handle, colour, age).to_string());
+    let response = { let mut __stated = ::axum::response::IntoResponse::into_response(format!("ok: {} {} {} {}", name, handle, colour, age).to_string());
+    __stated.headers_mut().insert(::axum::http::HeaderName::from_static("cache-control"), ::axum::http::HeaderValue::from_static("max-age=60"));
+    __stated };
     response
 }
 
@@ -236,6 +247,7 @@ async fn main() -> anyhow::Result<()> {
         .layer(::tower_http::compression::CompressionLayer::new())
         .layer(::tower_http::cors::CorsLayer::new().allow_origin([::axum::http::HeaderValue::from_static("https://example.com")]))
         .layer(::tower_http::timeout::TimeoutLayer::with_status_code(::axum::http::StatusCode::REQUEST_TIMEOUT, ::std::time::Duration::from_secs(5)))
+        .layer(::axum::middleware::from_fn(axum_dsl_private_cache))
         .layer(::tower_http::trace::TraceLayer::new_for_http().make_span_with(::tower_http::trace::DefaultMakeSpan::new().level(::tracing::Level::INFO)).on_request(::tower_http::trace::DefaultOnRequest::new().level(::tracing::Level::INFO)).on_response(::tower_http::trace::DefaultOnResponse::new().level(::tracing::Level::INFO)));
     let port = match std::env::var("PORT") {
         Ok(value) => match value.parse::<u16>() {

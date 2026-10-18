@@ -120,8 +120,12 @@ module AxumDsl
       the declarations: `set` settings, `params` groups, routes, the request filters `before`, `not_found`
       and `error`, typed `helper`s, `use_layer` middleware, and the `use_bindings`/`rust_*`/`file` escape
       hatches. `use_layer :compression` (or `:trace`, `:cors` with `origins:`, `:timeout` with `secs:`)
-      wraps the whole router in a tower-http layer; a layer answers every route, so where the declaration
-      sits does not matter. The shape is
+      wraps the whole router in a tower-http layer; `:rate_limit` (`per:`, `burst:`, optional `path:`) and
+      `:private_cache` (which appends `Cache-Control: private, no-cache` and `Vary: Cookie` to every
+      response) are the compiler's own. `except: ["/assets"]` on `:private_cache` leaves its headers off
+      the public files under a declared `static` mount (only a mount may be named); a route still adds
+      `private, no-store` when it wants it. A layer answers every route, so where the declaration sits
+      does not matter. The shape is
       Sinatra's: there is no enclosing block, so `server` carries only the crate's name and version and the
       routes sit at the top level. Paths use Sinatra's `:name` capture syntax, translated to axum 0.8's
       `{name}`.
@@ -169,13 +173,15 @@ module AxumDsl
       `secret:`, `type:`); a body reads it with `setting(:name)`.
 
       Sessions are the compiler's, with no Rust of the app's own: `cookies secret: :secret_key` signs cookies with a
-      `setting`, and `format: :rails` writes Rails' MessageVerifier value instead of the default `:hmac` (a
-      cookie call may pick either; `signed: false` is a plain cookie with no MAC). A body reads one with
+      `setting`; `format: :rails` writes the classic Marshal MessageVerifier value and `format: :rails7` the
+      JSON/`_rails` value a default Rails 7/8 app reads, instead of the default `:hmac` (a cookie call may pick
+      either; `signed: false` is a plain cookie with no MAC). A body reads one with
       `cookie(:name)` (nil when absent or not signed by this key) and a route writes one with
       `set_cookie :name, value, http_only: true, same_site: :lax, permanent: true` and
       `delete_cookie :name`. `random_token`, `request_ip` and `user_agent` are values, `Bcrypt.verify(plain,
       digest)` and `Bcrypt.hash(plain)` are built in, and `current :user, returns: :User? do ... end` declares a
-      per-request value that a route or filter reads with `current(:user)`. `use_layer :fetch_metadata` refuses
+      per-request value that a route or filter reads with `current(:user)`; `required: :authenticate` makes it
+      non-nil in routes that do not skip that named filter. `use_layer :fetch_metadata` refuses
       a cross-site write, `use_layer :csrf` (with `cookies secret:`) checks a signed token on every write and
       `{{ csrf_token }}` writes that token into a form, and `set :rust, :none` refuses every declaration that
       injects Rust.
@@ -204,6 +210,9 @@ module AxumDsl
       `redirect(...)` and `halt(...)` say otherwise. `return` ends the request with that string, even from
       inside a block. `raise "message"` ends it as an error: the `error` filter answers, or the generated
       service answers a plain 500 when there is none.
+
+      A `current(:user)` whose declaration says `required: :authenticate` reads at its non-nil type in a route
+      that does not skip that named filter: no `nil?`/`||` is needed, and a route that skips it is refused.
 
       A value placed in a page goes through `h(value)`, which escapes `&`, `<`, `>`, `"` and `'` and is
       what a page interpolates, or `raw(value)`, which leaves the value alone: `raw` is the XSS door, named
@@ -440,7 +449,11 @@ module AxumDsl
     end
 
     def call_lines(name, sig)
-      pos = sig[:names].zip(sig[:pos]).map { |n, k| "`#{n}` (#{kind(k)})" }
+      optional = sig[:optional_pos] || 0
+      pos = sig[:names].each_with_index.map do |n, i|
+        mark = i >= sig[:names].size - optional ? ", optional" : ""
+        "`#{n}` (#{kind(sig[:pos][i])}#{mark})"
+      end
       kws = sig[:kw].map { |n, (k, req)| "`#{n}:` (#{kind(k)}, #{req ? 'required' : 'optional'})" }
       block = { nil => "no block", decls: "a block of DSL declarations", body: "a block of restricted Ruby" }.fetch(sig[:block])
       about = Docs.call(name)

@@ -95,8 +95,8 @@ def request_ip; end
 sig { returns(String) }
 def user_agent; end
 
-sig { params(name: Symbol, returns: T.untyped, blk: T.untyped).returns(T.untyped) }
-def current(name, returns: nil, &blk); end
+sig { params(name: Symbol, returns: T.untyped, required: T.nilable(Symbol), blk: T.untyped).returns(T.untyped) }
+def current(name, returns: nil, required: nil, &blk); end
 
 sig { params(name: String, version: String).void }
 def server(name, version:); end
@@ -104,8 +104,8 @@ def server(name, version:); end
 sig { params(name: Symbol, value: T.any(String, Symbol, Integer, Float, T::Boolean)).void }
 def set(name, value); end
 
-sig { params(prefix: String, dir: String, digest: T.nilable(T::Boolean)).void }
-def static(prefix, dir:, digest: nil); end
+sig { params(prefix: String, dir: String, digest: T.nilable(T::Boolean), skip: T.nilable(T::Array[Symbol])).void }
+def static(prefix, dir:, digest: nil, skip: nil); end
 
 sig { params(path: String, from: String).void }
 def serve_file(path, from:); end
@@ -117,32 +117,32 @@ sig { returns(T::Hash[T.any(Symbol, String), T.untyped]) }
 sig { params(name: Symbol, blk: T.proc.bind(ParamsScope).void).void }
 def params(name, &blk); end
 
-sig { params(name: Symbol, origins: T.nilable(T::Array[String]), secs: T.nilable(Integer), forwarded: T.nilable(T::Boolean), per: T.nilable(Integer), burst: T.nilable(Integer), path: T.nilable(String)).void }
-def use_layer(name, origins: nil, secs: nil, forwarded: nil, per: nil, burst: nil, path: nil); end
+sig { params(name: Symbol, origins: T.nilable(T::Array[String]), secs: T.nilable(Integer), forwarded: T.nilable(T::Boolean), per: T.nilable(Integer), burst: T.nilable(Integer), path: T.nilable(String), except: T.nilable(T::Array[String])).void }
+def use_layer(name, origins: nil, secs: nil, forwarded: nil, per: nil, burst: nil, path: nil, except: nil); end
 
-sig { params(path: String, params: T.nilable(Symbol), description: T.nilable(String), blk: T.untyped).void }
-def get(path, params: nil, description: nil, &blk); end
+sig { params(path: String, params: T.nilable(Symbol), description: T.nilable(String), skip: T.nilable(T::Array[Symbol]), blk: T.untyped).void }
+def get(path, params: nil, description: nil, skip: nil, &blk); end
 
-sig { params(path: String, params: T.nilable(Symbol), description: T.nilable(String), blk: T.untyped).void }
-def post(path, params: nil, description: nil, &blk); end
+sig { params(path: String, params: T.nilable(Symbol), description: T.nilable(String), skip: T.nilable(T::Array[Symbol]), blk: T.untyped).void }
+def post(path, params: nil, description: nil, skip: nil, &blk); end
 
-sig { params(path: String, params: T.nilable(Symbol), description: T.nilable(String), blk: T.untyped).void }
-def put(path, params: nil, description: nil, &blk); end
+sig { params(path: String, params: T.nilable(Symbol), description: T.nilable(String), skip: T.nilable(T::Array[Symbol]), blk: T.untyped).void }
+def put(path, params: nil, description: nil, skip: nil, &blk); end
 
-sig { params(path: String, params: T.nilable(Symbol), description: T.nilable(String), blk: T.untyped).void }
-def patch(path, params: nil, description: nil, &blk); end
+sig { params(path: String, params: T.nilable(Symbol), description: T.nilable(String), skip: T.nilable(T::Array[Symbol]), blk: T.untyped).void }
+def patch(path, params: nil, description: nil, skip: nil, &blk); end
 
-sig { params(path: String, params: T.nilable(Symbol), description: T.nilable(String), blk: T.untyped).void }
-def delete(path, params: nil, description: nil, &blk); end
+sig { params(path: String, params: T.nilable(Symbol), description: T.nilable(String), skip: T.nilable(T::Array[Symbol]), blk: T.untyped).void }
+def delete(path, params: nil, description: nil, skip: nil, &blk); end
 
-sig { params(path: String, params: T.nilable(Symbol), description: T.nilable(String), blk: T.untyped).void }
-def options(path, params: nil, description: nil, &blk); end
+sig { params(path: String, params: T.nilable(Symbol), description: T.nilable(String), skip: T.nilable(T::Array[Symbol]), blk: T.untyped).void }
+def options(path, params: nil, description: nil, skip: nil, &blk); end
 
-sig { params(path: String, params: T.nilable(Symbol), description: T.nilable(String), blk: T.untyped).void }
-def head(path, params: nil, description: nil, &blk); end
+sig { params(path: String, params: T.nilable(Symbol), description: T.nilable(String), skip: T.nilable(T::Array[Symbol]), blk: T.untyped).void }
+def head(path, params: nil, description: nil, skip: nil, &blk); end
 
-sig { params(blk: T.untyped).void }
-def before(&blk); end
+sig { params(name: T.nilable(Symbol), blk: T.untyped).void }
+def before(name = nil, &blk); end
 
 sig { params(blk: T.untyped).void }
 def not_found(&blk); end

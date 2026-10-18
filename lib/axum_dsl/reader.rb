@@ -94,7 +94,7 @@ module AxumDsl
         when :use_bindings then add_bindings(n, p, srv)
         when :cmd_fn then add_cmd(n, p, k, srv)
         when :script_fn then add_script(n, p, k, srv)
-        when :before, :not_found, :error then filters << [n, b]
+        when :before, :not_found, :error then filters << [n, p, k, b]
         when :get, :post, :put, :patch, :delete, :options, :head then route_nodes << [n, p, k, b]
         when :fragment then bad(n, "`fragment` is only written in a file use_dsl includes; this file is built directly")
         else bad(n, "unexpected declaration `#{n.name}`")
@@ -120,8 +120,17 @@ module AxumDsl
       helper_nodes.each { |n, p, k, b| helper_decl(n, p, k, b, srv) }
       srv["user_helpers"] = @helper_table.values
       current_nodes.each { |n, p, k, b| current_decl(n, p, k, b, srv) }
-      filters.each { |n, b| filter_decl(n, b, srv) }
-      route_nodes.each { |n, p, k, b| srv["routes"] << route_decl(n, p, k, b, srv) }
+      filters.each { |n, p, k, b| filter_decl(n, p, k, b, srv) }
+      check_required_currents(srv)
+      check_static_skips(srv)
+      route_nodes.each do |n, p, k, b|
+        decl = route_decl(n, p, k, b, srv)
+        srv["routes"] << decl
+        (@route_decl_nodes ||= []) << [decl, n]
+      end
+      check_private_cache_except(srv) # statics and routes are both complete now
+      check_filter_skips(srv)
+      srv["filter_skips"] = true if srv["routes"].any? { |r| r["skip"].to_a.any? } || srv["statics"].any? { |s| s["skip"].to_a.any? }
       check_errors_routes(srv)
       check_openapi(srv)
       lower_bindings(srv)
@@ -132,6 +141,7 @@ module AxumDsl
       srv["queries_in_tx"] = (@flags["queries_in_tx"] || {}).keys.sort # statements called inside a transaction
       srv["queries_outside"] = (@flags["queries_outside"] || {}).keys.sort # statements whose pooled wrapper is emitted
       srv["sanitize"] = true if @flags["sanitize"] # a view used |sanitize, so the crate gets the sanitiser
+      srv["required_current"] = true if @flags["required_current"] # a route read a `required:` current at its non-nil type
       srv["builtins"] = (@flags["builtins"] || {}).keys.sort # random_token, request_ip, user_agent, Bcrypt.*: the runtime each needs
       srv["cookies"].merge!((@flags["cookie_use"] || {}).transform_keys(&:to_s)) if srv["cookies"]
       # Every view the compiler read is an input of the compile, like a binding or a rust_file, so
@@ -406,7 +416,7 @@ module AxumDsl
     COOKIE_KEY_MIN = Cookies::KEY_MIN
 
     # cookies secret: :secret_key, format: :hmac. Every signed cookie uses the value of that setting
-    # (docs/sessions.md); `format:` is :hmac (the default) or :rails, and a cookie call may override it. The
+    # (docs/sessions.md); `format:` is :hmac (the default), :rails (the classic Marshal value) or :rails7 (JSON/metadata), and a cookie call may override it. The
     # setting is read once as the server starts, so its length is checked there (Cookies.start_lines); here the
     # reader checks what it can: the setting is declared, is a required string, and a `default:` is long enough.
     # Which cookie calls the bodies make is known only once they are lowered (check_cookies reads it then).
@@ -452,9 +462,18 @@ module AxumDsl
       bad(node, "duplicate current `#{name}`#{first_at(node, earlier && @current_nodes[name])}") if earlier
       bad(node, "`#{name}` is reserved; pick another current name") if RESERVED_HELPERS.include?(name) || name.start_with?("__")
       ret = current_returns(node, kw[:returns], srv)
+      required = kw[:required]
+      if required
+        nilable = ret["shape"] == "one" || ret["nilable"]
+        bad(node, "current `#{name}` already returns #{TypeNames.display(ret['rtype'].to_sym)}; `required:` is for a nil-able current, `returns: :Record?` or a `:type?`") unless nilable
+      end
       body = Body.new(@path, { "fields" => [] }, @regexes, srv["externs"], @flags, "current `#{name}`", @binding_modules,
                       @helper_table, srv["params"] + srv["records"], kind: :current).lower_current(blk, name, ret["rtype"].to_sym)
       entry = { "name" => name, **ret, "body" => body, **located(node) }
+      if required
+        entry["required"] = required
+        entry["rtype_required"] = ret["shape"] == "one" ? "struct:#{ret['record']}" : ret["type"]
+      end
       srv["currents"] << entry
       (@current_nodes ||= {})[name] = node
       (@flags["currents"] ||= {})[name] = entry
@@ -817,12 +836,13 @@ module AxumDsl
     # in for the file on disk, as it does for every other input.
     ASSET_MAX_BYTES = 8 * 1024 * 1024
     # The crate's own files and folders: an asset at one of these paths, or under one, would overwrite what
-    # Emit writes there (the manifest, the lock file, the sources, the build output, the provenance map).
-    CRATE_OWNED = ["Cargo.toml", "Cargo.lock", "src", "target", CargoBuild::MAP].freeze
+    # Emit writes there (the crate manifest, the lock file, the sources, the build output, the provenance
+    # map) or what a build records after it (the emitted-file manifest).
+    CRATE_OWNED = ["Cargo.toml", "Cargo.lock", "src", "target", CargoBuild::MAP, Manifest::NAME].freeze
     def add_asset(node, srv, crate_path, real, text: nil)
       owned = crate_path.split("/").reject { |s| s.empty? || s == "." }.first
       if CRATE_OWNED.include?(owned)
-        bad(node, "#{crate_path} would overwrite #{owned}, which the emitted crate writes itself; give the asset another path (not Cargo.toml, Cargo.lock, src/, target/ or #{CargoBuild::MAP})")
+        bad(node, "#{crate_path} would overwrite #{owned}, which the emitted crate writes itself; give the asset another path (not Cargo.toml, Cargo.lock, src/, target/, #{CargoBuild::MAP} or #{Manifest::NAME})")
       end
       text ||= asset_text(real)
       bad(node, "#{crate_path} is larger than #{ASSET_MAX_BYTES} bytes") if text.bytesize > ASSET_MAX_BYTES
@@ -882,6 +902,10 @@ module AxumDsl
     # mount without the keyword copies and serves exactly the paths it always did.
     def add_static(node, prefix, dir, kw, srv)
       pre = service_path(node, prefix, "a static mount path")
+      if pre == "/" && kw[:skip].to_a.any?
+        bad(node, "`static \"/\"` is axum's fallback for every GET path, so a `skip:` on it cannot be scoped; " \
+                  "mount the directory at a prefix such as \"/assets\" and skip that mount instead")
+      end
       srv["statics"].each do |s|
         next unless pre == s["prefix"] || pre.start_with?("#{s['prefix']}/") || s["prefix"].start_with?("#{pre}/")
 
@@ -889,6 +913,7 @@ module AxumDsl
       end
       real = asset_path(node, dir, "static dir")
       bad(node, "static dir #{dir.inspect} is not a directory") unless File.directory?(real)
+      (@static_nodes ||= {})[pre] = node
       files = asset_dir_files(node, real, dir, real)
       if kw[:digest]
         base = dir.chomp("/")
@@ -908,10 +933,14 @@ module AxumDsl
         end
         (@flags["asset_mounts"] ||= []) << pre
         (@flags["asset_urls"] ||= {})[pre] = urls
-        srv["statics"] << { "prefix" => pre, "dir" => dir, "files" => files.size, "digest" => true, **located(node) }
+        entry = { "prefix" => pre, "dir" => dir, "files" => files.size, "digest" => true, **located(node) }
+        entry["skip"] = kw[:skip] if kw[:skip]
+        srv["statics"] << entry
       else
         files.each { |crate_path, file| add_asset(node, srv, crate_path, file) }
-        srv["statics"] << { "prefix" => pre, "dir" => dir, "files" => files.size, **located(node) }
+        entry = { "prefix" => pre, "dir" => dir, "files" => files.size, **located(node) }
+        entry["skip"] = kw[:skip] if kw[:skip]
+        srv["statics"] << entry
       end
     end
 
@@ -956,19 +985,22 @@ module AxumDsl
       Notify.add(@path, node, "N-OPENAPI", "GET #{decl['path']} serves an OpenAPI 3.1 document of #{srv['routes'].size} operation(s)")
     end
 
-    # use_layer :compression (or :cors, :timeout, :trace, :fetch_metadata, :csrf): name a middleware the whole router
-    # is wrapped in. A layer answers every route, and the emitter fixes the order it puts them on the
-    # router (Emit::LAYER_ORDER), so where the declaration sits in the file does not change the service.
+    # use_layer :compression (or :cors, :timeout, :trace, :fetch_metadata, :csrf, :private_cache): name a
+    # middleware the whole router is wrapped in. A layer answers every route, and the emitter fixes the
+    # order it puts them on the router (Emit::LAYER_ORDER), so where the declaration sits in the file does
+    # not change the service.
     # A layer's own keywords are checked here, because SIG takes the same keyword list for every name:
     # `:cors` takes `origins:` (a list of origins, each a string that looks like https://example.com;
     # without it the layer is permissive) and `:timeout` takes `secs:` (a positive whole number of
     # seconds), `:trace` takes `forwarded:` (true logs the visitor's address from X-Forwarded-For
     # instead of the peer's), `:rate_limit` takes `per:` (window seconds), `burst:` (requests in it)
     # and an optional `path:`, and `:csrf` takes nothing: it needs the `cookies secret:` declaration (checked
-    # in check_cookies), and its runtime is Csrf::RUNTIME. A name declared twice is refused rather than
-    # emitted twice.
+    # in check_cookies), and its runtime is Csrf::RUNTIME. `:private_cache` appends cache headers to every
+    # response, or takes `except:` to leave them off the public files under a `static` mount. A name declared
+    # twice is refused rather than emitted twice.
     LAYER_KEYWORDS = { "compression" => [], "cors" => [:origins], "timeout" => [:secs], "trace" => [:forwarded],
-                       "fetch_metadata" => [], "csrf" => [], "rate_limit" => [:per, :burst, :path] }.freeze
+                       "fetch_metadata" => [], "csrf" => [], "rate_limit" => [:per, :burst, :path],
+                       "private_cache" => [:except] }.freeze
     LAYER_ORIGIN = /\A[A-Za-z][A-Za-z0-9+.\-]*:\/\/[!-~]+\z/
     def add_layer(node, pos, kw, srv)
       name = pos[0].to_s
@@ -1027,8 +1059,52 @@ module AxumDsl
         writes = (use["set_formats"] ||= [])
         writes << "hmac" unless writes.include?("hmac")
         @csrf_node = node
+      when "private_cache"
+        # `except:` is the explicit list of public static prefixes that leave the layer off. It stays on for
+        # every other response, so a page with a session or a CSRF token cannot be exempted by accident.
+        except = kw[:except]
+        if except
+          if except.empty?
+            bad(node, "`use_layer :private_cache` `except:` needs at least one path prefix; drop the keyword to keep the layer on every response")
+          end
+          except.each do |prefix|
+            unless prefix.start_with?("/")
+              bad(node, "`use_layer :private_cache` `except:` entry #{prefix.inspect} must start with /, a path prefix as `static` writes it")
+            end
+            if prefix != "/" && prefix.end_with?("/")
+              bad(node, "`use_layer :private_cache` `except:` entry #{prefix.inspect} must not end with /; name the static mount's prefix without it")
+            end
+            if prefix.match?(/[?#*{}]/)
+              bad(node, "`use_layer :private_cache` `except:` entry #{prefix.inspect} must be one literal path prefix without ? # * { or }")
+            end
+          end
+          duplicated = except.tally.find { |_, count| count > 1 }
+          bad(node, "`use_layer :private_cache` `except:` lists #{duplicated[0].inspect} twice") if duplicated
+          entry["except"] = except
+        end
+        @private_cache_node = node
       end
       srv["layers"] << entry
+    end
+
+    # `use_layer :private_cache, except: ["/assets"]`: the layer stays on for every response except a GET
+    # under one of the listed prefixes, and each prefix must be served by a `static` mount (the mount itself,
+    # or a path inside it at a segment boundary). Only public files may leave the layer off: a route's page
+    # can carry a session or a CSRF token, so a prefix no mount serves is refused rather than guessed at. A
+    # route under a mount's prefix is already refused by refuse_route_mount_clash, which is why this needs
+    # no second route-overlap rule. Statics and routes are both complete when this runs.
+    def check_private_cache_except(srv)
+      entry = srv["layers"].find { |l| l["name"] == "private_cache" }
+      return unless entry && entry["except"]
+
+      entry["except"].each do |prefix|
+        if prefix == "/"
+          bad(@private_cache_node, "`use_layer :private_cache` `except: [\"/\"]` is refused: the layer would not apply anywhere; name the static mount's prefix instead")
+        end
+        next if srv["statics"].any? { |s| s["prefix"] == prefix || prefix.start_with?("#{s['prefix']}/") }
+
+        bad(@private_cache_node, "`use_layer :private_cache` `except:` entry #{prefix.inspect} is not served by a `static` mount; only public files may leave the layer off: name a static mount's prefix, or drop the prefix")
+      end
     end
 
     # A route and a mount (or a served file) that answer one path would panic inside axum when it builds the
@@ -1739,8 +1815,15 @@ module AxumDsl
       (path_fields - names).each do |name|
         bad(node, "field `#{name}` of params `#{prm_name}` says `in: :path`, but route path #{path.inspect} has no `:#{name}` capture")
       end
+      skips = kw[:skip] || []
+      named_filters = srv["before"].filter_map { |f| f["name"] }
+      skips.each do |filter_name|
+        next if named_filters.include?(filter_name)
+
+        bad(node, "route `#{verb} #{path}` skips `:#{filter_name}`, but no `before :#{filter_name}` filter is declared#{named_filters.empty? ? '' : " (named filters: #{named_filters.join(', ')})"}")
+      end
       body = Body.new(@path, prm || { "fields" => [] }, @regexes, srv["externs"], @flags, "route `#{verb} #{path}`",
-                      @binding_modules, @helper_table, srv["params"] + srv["records"], kind: :route).lower(blk)
+                      @binding_modules, @helper_table, srv["params"] + srv["records"], kind: :route, skip: skips).lower(blk)
       if body["content_type"]
         bad(node, "`content_type(...)` is only meaningful in a `before` filter; it sets the default for the routes that follow")
       end
@@ -1750,8 +1833,95 @@ module AxumDsl
       decl = { "method" => verb, "path" => axum_path, "names" => names, "params" => prm_name,
                "description" => kw[:description], "body" => body, **located(node) }
       decl["field_in"] = field_in unless field_in.empty?
+      decl["skip"] = skips unless skips.empty?
       decl
     end
+
+    # A static mount can name the named `before` filters it does not run. The mount is declared before the
+    # filters are read, so the names are checked here, once both lists are complete. A mount at "/" takes
+    # no skip at all (add_static refuses one: the fallback would cover every GET path), and `serve_file`
+    # and `set :public_folder` take no skip for now.
+    def check_static_skips(srv)
+      named = srv["before"].filter_map { |f| f["name"] }
+      srv["statics"].each do |s|
+        s["skip"].to_a.each do |filter_name|
+          next if named.include?(filter_name)
+
+          bad(@static_nodes[s["prefix"]], "static `#{s['prefix']}` skips `:#{filter_name}`, but no `before :#{filter_name}` filter is declared#{named.empty? ? '' : " (named filters: #{named.join(', ')})"}")
+        end
+      end
+    end
+
+    # `current :user, returns: :User?, required: :authenticate`: the named `before` filter must exist and must
+    # read the current (a filter that never reads it cannot stop the request when it is nil). Filters are read
+    # after the currents, so this runs once both lists are complete, before any route is lowered.
+    def check_required_currents(srv)
+      srv["currents"].each do |c|
+        req = c["required"] or next
+        node = @current_nodes[c["name"]]
+        filter = srv["before"].find { |f| f["name"] == req }
+        unless filter
+          named = srv["before"].filter_map { |f| f["name"] }
+          bad(node, "current `#{c['name']}` says `required: :#{req}`, but no `before :#{req}` filter is declared" \
+                    "#{named.empty? ? '' : " (named filters: #{named.join(', ')})"}")
+        end
+        unless filter["currents"].to_a.include?(c["name"])
+          bad(node, "`before :#{req}` is named by current `#{c['name']}`'s `required:`, but its body never reads " \
+                    "`current(:#{c['name']})`, so it cannot establish it; read the current there and stop when it is nil")
+        end
+      end
+    end
+
+    # A route's `skip:` is matched at run time by method and path, so a skip pattern must not also match a
+    # route that does not skip that filter: `/rooms/:id` would match a request for a literal `/rooms/new`.
+    # Refused rather than narrowed, because the filter layer runs before axum has chosen a route.
+    def check_filter_skips(srv)
+      by_method = srv["routes"].group_by { |r| r["method"] }
+      # A `serve_file` and the OpenAPI document are axum routes too, but neither takes `skip:`, so a route
+      # pattern that matches one of them would step the filter aside for it. Compare against them as routes
+      # that do not skip the filter, exactly like a literal route beside a capture.
+      srv["serve_files"].to_a.each do |f|
+        %w[get head].each { |method| (by_method[method] ||= []) << { "method" => method, "path" => f["path"], "skip" => [] } }
+      end
+      if srv["openapi"]
+        %w[get head].each { |method| (by_method[method] ||= []) << { "method" => method, "path" => srv["openapi"]["path"], "skip" => [] } }
+      end
+      @route_decl_nodes.to_a.each do |route, node|
+        route["skip"].to_a.each do |filter_name|
+          by_method.fetch(route["method"], []).each do |other|
+            next if other.equal?(route) || other["skip"].to_a.include?(filter_name)
+            next unless path_patterns_overlap?(route["path"], other["path"])
+
+            bad(node, "route `#{route['method']} #{route['path']}` skips `:#{filter_name}`, but the run-time skip " \
+                      "(method and path) also matches `#{other['method']} #{other['path']}`, which does not skip it; " \
+                      "give every handler that path reaches the same `skip:` (a `serve_file` or the OpenAPI " \
+                      "document takes none, so narrow this route's path), or use paths that cannot overlap")
+          end
+        end
+      end
+    end
+
+    # Whether two axum path patterns can match one request path: the same segment count and every segment
+    # compatible (a `{name}` capture matches any non-empty segment), or a `{*name}` tail, which matches the rest.
+    def path_patterns_overlap?(a, b)
+      left = a.split("/")
+      right = b.split("/")
+      i = 0
+      loop do
+        x = left[i]
+        y = right[i]
+        return true if x.nil? && y.nil?
+        return true if wildcard_segment?(x) || wildcard_segment?(y)
+        return false if x.nil? || y.nil?
+        return false unless x == y || capture_segment?(x) || capture_segment?(y)
+
+        i += 1
+      end
+    end
+
+    def capture_segment?(seg) = seg.start_with?("{") && seg.end_with?("}") && !seg.start_with?("{*")
+
+    def wildcard_segment?(seg) = seg.to_s.start_with?("{*")
 
     # A route whose body reads errors[:field] takes the generated check()'s messages into its own body, so
     # its params group has to carry a constraint that check() can report. Emit.checked? is the same
@@ -1771,14 +1941,20 @@ module AxumDsl
     # `before`, `not_found` and `error` are request filters; each is a response body (Body kinds :before,
     # :not_found, :error), so the response helpers are in scope. `before` may be repeated and runs before the
     # routes that follow it; `not_found` and `error` describe what one request answers with.
-    def filter_decl(node, blk, srv)
+    def filter_decl(node, pos, _kw, blk, srv)
       if node.name == :not_found && srv["statics"].any? { |s| s["prefix"] == "/" }
         bad(node, "a `not_found` filter and a directory mounted at \"/\" (`set :public_folder`) both answer a request no route matched, and axum has one fallback; mount the directory at a prefix with `static \"/assets\", dir: ...` instead")
       end
       # `located` gives the filter body the line and file of its declaration, so Emit's source map can
       # point a generated-rustc error back at the filter, like every other declaration.
       if node.name == :before
-        srv["before"] << filter_body(node, blk, srv).merge(located(node))
+        name = pos[0]
+        if name
+          earlier = srv["before"].find { |f| f["name"] == name }
+          bad(node, "duplicate `before :#{name}` filter#{first_at(node, (@before_nodes ||= {})[name])}") if earlier
+          (@before_nodes ||= {})[name] = node
+        end
+        srv["before"] << filter_body(node, blk, srv).merge(located(node)).merge(name ? { "name" => name } : {})
       else
         key = node.name.to_s
         bad(node, "duplicate `#{node.name}` filter#{first_at(node, @filter_nodes&.[](key))}") if srv[key]
@@ -1961,8 +2137,10 @@ module AxumDsl
 
     # The call shape for error messages, e.g. `tool(name, params:, description:, [title:], ...)`: optional keywords are bracketed.
     def shape(name, sig)
+      optional = sig[:optional_pos] || 0
+      pos = sig[:names].each_with_index.map { |arg, i| i >= sig[:names].size - optional ? "[#{arg}]" : arg.to_s }
       kws = sig[:kw].map { |k, (_, req)| req ? "#{k}:" : "[#{k}:]" }
-      "#{name}(#{(sig[:names] + kws).join(", ")})"
+      "#{name}(#{(pos + kws).join(", ")})"
     end
 
     # Refuses a reference to a params/output struct that was not declared above, listing what is.
@@ -1974,10 +2152,13 @@ module AxumDsl
     def args(node, sig)
       list = (node.arguments&.arguments || []).dup
       kwn = list.last.is_a?(Prism::KeywordHashNode) ? list.pop : nil
-      unless list.size == sig[:pos].size
-        bad(node, "`#{node.name}` takes #{sig[:pos].size} positional argument(s), got #{list.size}; expected `#{shape(node.name, sig)}`")
+      optional = sig[:optional_pos] || 0
+      least = sig[:pos].size - optional
+      unless list.size.between?(least, sig[:pos].size)
+        takes = optional.zero? ? "#{sig[:pos].size} positional argument(s)" : "#{least} to #{sig[:pos].size} positional argument(s)"
+        bad(node, "`#{node.name}` takes #{takes}, got #{list.size}; expected `#{shape(node.name, sig)}`")
       end
-      pos = list.zip(sig[:pos]).map { |n, want| value(n, want) }
+      pos = list.each_with_index.map { |n, i| value(n, sig[:pos][i]) }
       kw = {}
       (kwn ? kwn.elements : []).each do |el|
         ok = el.is_a?(Prism::AssocNode) && el.key.is_a?(Prism::SymbolNode) && !el.value.is_a?(Prism::ImplicitNode)
@@ -2075,6 +2256,12 @@ module AxumDsl
       if want == :strs
         bad(node, "expected an array of string literals, got #{nodename(node)}") unless node.is_a?(Prism::ArrayNode)
         return node.elements.map { |el| value(el, :str) }
+      end
+      if want == :filter_name
+        if node.is_a?(Prism::TrueNode)
+          bad(node, "`required:` names the `before` filter that establishes the current, as in `required: :authenticate`; `required: true` cannot say which filter stops the request")
+        end
+        return value(node, :snake)
       end
       if want == :str
         # A squiggly heredoc (<<~) arrives as an InterpolatedStringNode whose parts are plain

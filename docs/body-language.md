@@ -113,7 +113,15 @@ instead. `axum_dsl skill` writes the complete, generated reference; the outline:
   304 with no body and the ETag still set. Only a strong, exact tag matches today: `If-None-Match: *` and a
   weak `W/"v1"` are not matched, and a non-GET request with a matching tag still answers 304 rather than
   412. `headers` stays literal; `etag` is the computed header, and a body sets it once. A body that ends in
-  a plain string is a 200 text response.
+  a plain string is a 200 text response. `send_file(path, content_type: "image/webp")` is the response for
+  bytes chosen while the request runs: it awaits `tokio::fs::read` on the path (a string expression), puts the
+  bytes on the response with the literal Content-Type, and answers a plain 500 if the read fails. The file is
+  not declared beside the DSL file and is not copied into the crate; a path that comes from a request is the
+  application's trust decision, so check the row or the prefix first and answer 404 yourself.
+  `rails_signed_id(token, purpose: "user/avatar", secret: :secret_key)` is a value, not a response: it is the
+  integer id inside a Rails 8 `signed_id` token, or nil when the token is malformed, unsigned with that key,
+  for another purpose, carries an expiry, or its payload is not an integer. `secret:` names a required string
+  setting (usually SECRET_KEY_BASE); `purpose:` is the full `"<model>/<purpose>"` string Rails composes.
 - **Escaping.** `h(value)` escapes `&`, `<`, `>`, `"` and `'` and gives a string: it is what a page
   interpolates, inside `html(...)` or a string. `raw(value)` is the same value with no escaping, and is
   the XSS door, named so a review can grep for `raw(`; a view's `{{ name }}` and `{{ name|raw }}` are exactly

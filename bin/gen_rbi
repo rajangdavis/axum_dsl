@@ -116,6 +116,13 @@ BODY_SURFACE = {
   # out of the `set :layout` default.
   render: ["sig { params(name: T.any(Symbol, String), locals: T.untyped, layout: T.nilable(T.any(Symbol, String)), status: T.nilable(Integer), content_type: T.nilable(String)).returns(T.untyped) }",
            "def render(name, locals: nil, layout: nil, status: nil, content_type: nil); end"],
+  # send_file(path, content_type:): a response whose body is the file at a path computed when the request
+  # runs. The content type is required because the compiler does not guess one from the path.
+  send_file: ["sig { params(path: String, status: T.nilable(Integer), content_type: T.nilable(String)).returns(T.untyped) }",
+              "def send_file(path, status: nil, content_type: nil); end"],
+  # rails_signed_id(token, purpose:, secret:): the integer id inside a Rails 8 signed ID, or nil.
+  rails_signed_id: ["sig { params(token: String, purpose: String, secret: Symbol).returns(T.nilable(Integer)) }",
+                    "def rails_signed_id(token, purpose:, secret:); end"],
   # h(value) escapes a value for HTML; raw(value) gives the same value with no escaping (the XSS door).
   h: ["sig { params(value: T.any(String, Integer, Float, T::Boolean)).returns(String) }",
       "def h(value); end"],

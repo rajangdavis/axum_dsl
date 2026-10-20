@@ -30,14 +30,14 @@ module AxumDsl
     # calls on a value (ALLOWED_METHODS, above) are the other half of the surface: Sorbet's own String, Array
     # and Hash rbis declare those, together with the Rust::Str section of the generated rbi.
     BODY_CALLS = %i[params errors text json html halt redirect status content_type headers etag setting rust
-                    file_text file_path entry entry_args h raw render
+                    file_text file_path entry entry_args h raw render send_file rails_signed_id
                     cookie set_cookie delete_cookie random_token request_ip user_agent current transaction].freeze
 
     # The response helpers and the statuses and types they name (Sinatra's spelling, axum's semantics). A
     # route body, and the filters around it, is a body that answers an HTTP request: the reader passes
     # `kind:` for one of these, and the response helpers are only in scope there.
     RESPONSE_BODY_KINDS = %i[route before not_found error].freeze
-    RESPONSE_HELPERS = %i[json text html halt redirect render].freeze
+    RESPONSE_HELPERS = %i[json text html halt redirect render send_file].freeze
     # `::axum::response::Response`, what an axum handler returns, and the trait method every helper goes
     # through so its concrete type is named exactly once.
     INTO = "::axum::response::IntoResponse::into_response"
@@ -678,6 +678,7 @@ module AxumDsl
       return raise_call(n, args, env) if name == :raise && n.receiver.nil?
       return output_new(n, args, env) if name == :result && n.receiver.nil?
       return setting_call(n, args) if name == :setting && n.receiver.nil?
+      return rails_signed_id_call(n, args, env) if name == :rails_signed_id && n.receiver.nil?
       return cookie_call(n, args) if name == :cookie && n.receiver.nil?
       return current_call(n, args) if name == :current && n.receiver.nil?
       return request_value_call(n, args) if REQUEST_VALUES.include?(name) && n.receiver.nil?
@@ -2435,6 +2436,57 @@ module AxumDsl
       ["settings().#{name}.clone()", type, true]
     end
 
+    # rails_signed_id(token, purpose: "user/avatar", secret: :secret_key): the integer id inside a Rails 8
+    # signed ID, or nil when the token is not one this secret signed for this purpose. The secret names a
+    # required string setting (usually SECRET_KEY_BASE); the purpose is the full `"<model>/<purpose>"` Rails
+    # composes, because the compiler cannot infer a model from a token.
+    def rails_signed_id_call(node, args, env)
+      rest = args.dup
+      hash = rest.last.is_a?(Prism::KeywordHashNode) ? rest.pop : nil
+      bad(node, "rails_signed_id takes exactly one token") unless rest.size == 1
+      token = expr(rest[0], env)
+      bad(rest[0], "rails_signed_id takes a token string, got #{TypeNames.display(token[1])}") unless %i[str string].include?(token[1])
+      purpose = nil
+      secret = nil
+      seen = {}
+      hash&.elements&.each do |el|
+        unless el.is_a?(Prism::AssocNode) && el.key.is_a?(Prism::SymbolNode)
+          bad(el, "unsupported #{nodename(el)} in rails_signed_id (write `purpose: \"user/avatar\", secret: :secret_key`)")
+        end
+        key = el.key.unescaped.to_sym
+        unless %i[purpose secret].include?(key)
+          bad(el, "unknown keyword `#{key}:` for rails_signed_id (allowed: purpose, secret)", word: key, from: %i[purpose secret])
+        end
+        bad(el, "duplicate keyword `#{key}:`") if seen[key]
+        seen[key] = true
+        if key == :purpose
+          bad(el.value, "rails_signed_id's `purpose:` is a string literal, such as \"user/avatar\"") unless el.value.is_a?(Prism::StringNode)
+          purpose = el.value.unescaped
+          bad(el.value, "rails_signed_id's `purpose:` must not be empty") if purpose.empty?
+        else
+          bad(el.value, "rails_signed_id's `secret:` is a setting name, such as :secret_key") unless el.value.is_a?(Prism::SymbolNode)
+          secret = el.value.unescaped
+        end
+      end
+      bad(node, "rails_signed_id needs `purpose:` and `secret:`") if purpose.nil? || secret.nil?
+      declared = @flags["settings"] || {}
+      entry = declared[secret] or
+        bad(node, "no setting `#{secret}` is declared#{declared.empty? ? '' : " (declared: #{declared.keys.join(', ')})"}; " \
+                  "rails_signed_id's `secret:` names the required string setting that holds SECRET_KEY_BASE",
+            word: secret, from: declared.keys)
+      if entry["type"] || entry["optional"]
+        bad(node, "rails_signed_id's `secret:` must name a required string setting, not #{entry['type'] ? "a `type: :#{entry['type']}`" : 'an optional'} one")
+      end
+      if (earlier = @flags["signed_id_secret"]) && earlier != secret
+        bad(node, "rails_signed_id already uses setting `#{earlier}`; a service derives one signed-ID key per process, so every call must name the same `secret:`")
+      end
+      @flags["signed_id_secret"] = secret
+      (@flags["used_settings"] ||= {})[secret] = true
+      (@flags["builtins"] ||= {})["rails_signed_id"] = true
+      token_arg = token[1] == :str ? token[0] : "&#{wrap(token)}"
+      ["axum_dsl_rails_signed_id(settings().#{secret}.as_bytes(), #{token_arg}, #{AxumDsl.rstr(purpose)})", :oi64, true]
+    end
+
     # h(value) escapes a value for HTML; raw(value) gives the same value with no escaping, the XSS door a
     # review greps for by name. Either takes any value a string interpolation takes and gives a string, so
     # both compose inside text(...), html(...) and interpolation. h is the only one that needs the escaper.
@@ -2631,6 +2683,7 @@ module AxumDsl
       when :redirect then redirect_response(node, args, env)
       when :halt then halt_response(node, args, env)
       when :render then render_response(node, args, env)
+      when :send_file then send_file_response(node, args, env)
       end
     end
 
@@ -2787,6 +2840,37 @@ module AxumDsl
       body = "#{wrapper}(#{body})" if wrapper
       body = "(#{status}, #{body})" if status
       [with_content_type("#{INTO}(#{body})", content_type), :response, false]
+    end
+
+    # `send_file(path, content_type: "image/webp")`: a response whose body is the file at a path computed
+    # while the request runs. The read is tokio's async fs, so the path need not be declared beside the DSL
+    # file and the bytes are not copied into the crate. `content_type:` is required: a path's extension is
+    # not a MIME type the compiler can trust. A read failure is a plain 500; a caller that wants a 404 checks
+    # that the row exists first.
+    def send_file_response(node, args, env)
+      args, status, content_type = response_args(node, "send_file", args)
+      bad(node, "send_file takes exactly one path") unless args.size == 1
+      bad(node, "send_file needs `content_type:` with a MIME type, such as `content_type: \"image/webp\"`") if content_type.nil?
+      v = expr(args[0], env)
+      bad(args[0], "send_file takes a path string, got #{TypeNames.display(v[1])}") unless %i[str string].include?(v[1])
+      (@flags["builtins"] ||= {})["send_file"] = true
+      path = v[1] == :str ? "#{v[0]}.to_string()" : "#{wrap(v)}.clone()"
+      status_code = status || "::axum::http::StatusCode::OK"
+      code = <<~RS
+        {
+            let __path = #{path};
+            match ::tokio::fs::read(&__path).await {
+                Ok(__bytes) => {
+                    let mut __response = ::axum::response::Response::new(::axum::body::Body::from(__bytes));
+                    *__response.status_mut() = #{status_code};
+                    __response.headers_mut().insert(::axum::http::header::CONTENT_TYPE, ::axum::http::HeaderValue::from_static(#{content_type}));
+                    __response
+                }
+                Err(_) => ::axum::response::IntoResponse::into_response((::axum::http::StatusCode::INTERNAL_SERVER_ERROR, "")),
+            }
+        }
+      RS
+      [code.strip, :response, false]
     end
 
     # `redirect("/path")`: a 302 to that path, as Rails and Sinatra answer. `status:` names another

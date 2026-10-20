@@ -341,10 +341,10 @@ module AxumDsl
 
         [dependencies]
         axum = { version = "0.8", default-features = false, features = [#{axum_features(ir).map { |f| "\"#{f}\"" }.join(", ")}] }
-        tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "signal"#{Sessions.tokio_features(ir)}] }
+        tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "signal"#{Sessions.tokio_features(ir)}#{SendFile.tokio_features(ir)}] }
         serde = { version = "1", features = ["derive"] }
         serde_json = "1"
-        anyhow = "1"#{regex_dep(ir)}#{tower_http_dep(ir)}#{tracing_deps(ir)}#{crate_deps(ir)}#{database_deps(ir)}#{Cookies.deps(ir)}#{Sessions.deps(ir)}#{Sanitize.deps(ir)}
+        anyhow = "1"#{regex_dep(ir)}#{tower_http_dep(ir)}#{tracing_deps(ir)}#{crate_deps(ir)}#{database_deps(ir)}#{dependency_lines(Cookies.deps(ir), SignedId.deps(ir), Sessions.deps(ir), Sanitize.deps(ir))}
       TOML
     end
 
@@ -381,6 +381,13 @@ module AxumDsl
 
     # The regex crate is only a dependency when some body uses a regex literal.
     def regex_dep(ir) = ir["regexes"].to_a.empty? ? "" : "\nregex = \"1\""
+
+    # The runtime modules' Cargo lines, with a line two modules both need written once. The modules each
+    # lead their line with a newline so an absent one adds nothing; this reassembles the non-empty lines
+    # in their original order.
+    def dependency_lines(*groups)
+      groups.join.lines.map(&:chomp).reject(&:empty?).uniq.map { |line| "\n#{line}" }.join
+    end
 
     # The tower-http features a file's declarations need, in a fixed order: "fs" when a `static` mount or
     # a `serve_file` needs ServeDir/ServeFile, then one per `use_layer` (Emit::LAYER_FEATURES). A file that
@@ -1485,6 +1492,7 @@ module AxumDsl
       o.concat([*settings_runtime(ir), ""]) if settings?(ir)
       database_items(o, ranges, ir) if ir["database"]
       o.concat([*Cookies.runtime_lines(ir), ""]) if ir["cookies"]
+      o.concat([*SignedId.items(ir), ""]) if SignedId.used?(ir)
       o.concat(Sessions.items(ir))
       o.concat(Csrf.items(ir))
       o.concat([*private_cache_runtime(ir), ""]) if layer?(ir, "private_cache")

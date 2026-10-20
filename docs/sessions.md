@@ -126,6 +126,26 @@ The cookie header is parsed by the emitted code (no cookie crate). The crates ar
 0.12, `sha1` 0.10, `sha2` 0.10, `pbkdf2` 0.12 and `base64` 0.22 for `:rails7`; and none for a service that
 only reads or writes plain cookies. They are added only when a body uses them.
 
+## Rails signed IDs
+
+`rails_signed_id(token, purpose: "user/avatar", secret: :secret_key)` verifies a Rails 8
+`ActiveRecord::Base#signed_id` value without the Rails gems, and returns its integer id (`nil` for any
+failure). Rails 8.2's `signed_id_verifier` is `ActiveRecord.message_verifiers["active_record/signed_id"]`:
+the key is `ActiveSupport::KeyGenerator#generate_key("active_record/signed_id", 64)` over SECRET_KEY_BASE
+(PBKDF2-HMAC-SHA256, 1000 iterations), derived once per process as Rails does; every call must name the same
+`secret:` setting, and a second different one is refused. The verifier's options are
+digest SHA256, serializer JSON and
+`url_safe: true` (`activerecord/lib/active_record/signed_id.rb`,
+`activerecord/lib/active_record/railtie.rb`, `railties/lib/rails/application.rb`). The payload is the
+`_rails` metadata envelope `{"_rails":{"data":<id>,"pur":"<model>/<purpose>"}}`; a token is its URL-safe
+Base64 without padding, `"--"`, and the lower-case hex HMAC-SHA256 of that text. The purpose is the full
+`"user/avatar"` string: `signed_id(purpose: :avatar)` on User composes it in
+`combine_signed_id_purposes`, so the caller passes the Rails string rather than a model name. Signature,
+purpose and the integer payload are checked in that order; a non-string `data`, a missing envelope, a bad
+MAC or a wrong purpose is nil. An `exp` in the envelope is refused in this version: an expiring token is
+safe to reject, while accepting it without checking the expiry would not be. The crates are `hmac` 0.12,
+`sha2` 0.10, `pbkdf2` 0.12 and `base64` 0.22, added only when a body calls the verifier.
+
 ## Values: `random_token`, `request_ip`, `user_agent`
 
 - `random_token` is a string of 24 characters from the base58 alphabet Rails' `has_secure_token` uses

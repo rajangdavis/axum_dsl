@@ -41,6 +41,12 @@ def halt(status, body = nil); end
 sig { params(name: T.any(Symbol, String), locals: T.untyped, layout: T.nilable(T.any(Symbol, String)), status: T.nilable(Integer), content_type: T.nilable(String)).returns(T.untyped) }
 def render(name, locals: nil, layout: nil, status: nil, content_type: nil); end
 
+sig { params(path: String, status: T.nilable(Integer), content_type: T.nilable(String)).returns(T.untyped) }
+def send_file(path, status: nil, content_type: nil); end
+
+sig { params(token: String, purpose: String, secret: Symbol).returns(T.nilable(Integer)) }
+def rails_signed_id(token, purpose:, secret:); end
+
 sig { params(value: T.any(String, Integer, Float, T::Boolean)).returns(String) }
 def h(value); end
 

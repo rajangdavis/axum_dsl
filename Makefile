@@ -6,7 +6,7 @@
 #   check-e2e    the example services over HTTP
 #   check        all three, for the host
 
-.PHONY: probe test-ruby test-ruby-rust gen-diff test-diff dsl-check rbi rbi-check rbi-helpers rbi-helpers-check typecheck check-fast check-build check-e2e check e2e e2e-add e2e-validate e2e-assets e2e-csrf e2e-login e2e-login-rails e2e-views e2e-proxy e2e-case e2e-split e2e-hatches e2e-notes e2e-tls e2e-dev golden golden-update gem-test
+.PHONY: probe test-ruby test-ruby-rust gen-diff test-diff dsl-check rbi rbi-check rbi-helpers rbi-helpers-check typecheck check-fast check-build check-e2e check e2e e2e-add e2e-validate e2e-assets e2e-csrf e2e-method-override e2e-upload e2e-login e2e-login-rails e2e-views e2e-proxy e2e-case e2e-split e2e-hatches e2e-notes e2e-cable e2e-tls e2e-dev golden golden-update gem-test
 
 # Every cargo invocation shares one target dir, so axum and its dependencies compile once
 # for the whole suite instead of once per generated crate.
@@ -53,7 +53,7 @@ check-build: test-ruby-rust test-diff
 
 # Each e2e target has its own port (the example's `set :port`) and its own out dir, so `make -j check-e2e`
 # runs them concurrently.
-check-e2e: e2e-add e2e-validate e2e-assets e2e-csrf e2e-views e2e-proxy e2e-case e2e-split e2e-hatches e2e-notes e2e-login e2e-login-rails e2e-tls e2e-dev
+check-e2e: e2e-add e2e-validate e2e-assets e2e-csrf e2e-method-override e2e-upload e2e-views e2e-proxy e2e-case e2e-split e2e-hatches e2e-notes e2e-cable e2e-login e2e-login-rails e2e-tls e2e-dev
 
 check: check-fast check-build check-e2e
 
@@ -143,6 +143,18 @@ e2e-csrf:
 	ruby exe/axum_dsl build examples/csrf.axum.rb -o /tmp/axum_dsl_csrf-out
 	sh test/e2e_csrf.sh /tmp/axum_dsl_csrf-out
 
+# The method override example: `use_layer :method_override` routes a POST with `_method=delete|patch` (or an
+# X-HTTP-Method-Override header) as that method. Port 8101 and its own out dir.
+e2e-method-override:
+	ruby exe/axum_dsl build examples/method_override.axum.rb -o /tmp/axum_dsl_method_override-out
+	sh test/e2e_method_override.sh /tmp/axum_dsl_method_override-out
+
+# The upload example: a multipart form (curl -F) with a file, `_method` in a multipart body, `store` writing the Disk
+# service's path, blob and attachment rows, and repeated `user_ids[]` keys read as a list. Port 8111 and its own out dir.
+e2e-upload:
+	ruby exe/axum_dsl build examples/upload.axum.rb -o /tmp/axum_dsl_upload-out
+	sh test/e2e_upload.sh /tmp/axum_dsl_upload-out
+
 # The proxy example: `use_layer :trace, forwarded: true`, whose log line names the X-Forwarded-For address.
 # Its own port (8095) and out dir, like the others.
 e2e-proxy:
@@ -172,6 +184,13 @@ e2e-hatches:
 e2e-notes:
 	ruby exe/axum_dsl build examples/notes.axum.rb -o /tmp/axum_dsl_notes-out
 	sh test/e2e_notes.sh /tmp/axum_dsl_notes-out
+
+# The Action Cable example: channels that stream, `perform` and broadcast, and routes that broadcast (`broadcast`,
+# `broadcast_turbo`). Port 8105 and its own out dir; test/e2e_cable.sh starts the service and test/cable_broadcast_check.mjs
+# opens two WebSocket clients and checks the exact frames. It needs node and skips without it.
+e2e-cable:
+	ruby exe/axum_dsl build examples/cable.axum.rb -o /tmp/axum_dsl_cable-out
+	sh test/e2e_cable.sh /tmp/axum_dsl_cable-out
 
 # The sessions example: signed cookies, `current`, Bcrypt, `use_layer :fetch_metadata` and `set :rust, :none`. Port 8086
 # and its own out dir; the script signs up, logs in and out, and checks the cookie, the guard and a short key.

@@ -134,12 +134,12 @@ want() {
 	echo "      body: [$got]"
 }
 
-# redirects LABEL LOCATION: the last req answered a redirect to that Location.
+# redirects LABEL PATH: the last req answered a redirect to that path as an absolute URL on this host (Rails' redirect_to).
 redirects() {
 	location=$(sed -n 's/^[Ll]ocation: *//p' "$hdr" | tr -d '\r' | head -n 1)
 	case "$status" in
 	301 | 302 | 303 | 307 | 308)
-		if [ "$location" = "$2" ]; then
+		if [ "$location" = "$base$2" ]; then
 			ok "$1 -> $status, Location $location"
 			return 0
 		fi

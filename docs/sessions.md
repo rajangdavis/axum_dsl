@@ -52,6 +52,7 @@ or `set_cookie` call may give `format:` to use the other one for that cookie.
 - `set_cookie :name, value, signed: false` writes a plain cookie: `name=value`, no MAC (the need is Rails'
   `last_room`). A plain cookie's value is percent-encoded as Rack encodes a cookie and decoded when read, so
   `Room 1` travels as `Room+1`; a signed `:hmac` value is base64url and needs no escaping.
+- A cookie name is snake_case, and may start with one underscore (Rails' `_campfire_session`).
 - `delete_cookie :name` is a statement of a route body that tells the browser to drop the cookie (`Max-Age=0`).
 
 A `set_cookie` or `delete_cookie` goes on the response the route ends in, as `status` and `headers` do: they are
@@ -142,21 +143,37 @@ Base64 without padding, `"--"`, and the lower-case hex HMAC-SHA256 of that text.
 `"user/avatar"` string: `signed_id(purpose: :avatar)` on User composes it in
 `combine_signed_id_purposes`, so the caller passes the Rails string rather than a model name. Signature,
 purpose and the integer payload are checked in that order; a non-string `data`, a missing envelope, a bad
-MAC or a wrong purpose is nil. An `exp` in the envelope is refused in this version: an expiring token is
-safe to reject, while accepting it without checking the expiry would not be. The crates are `hmac` 0.12,
+MAC or a wrong purpose is nil. Without `check_expiry:` an `exp` in the envelope is refused: an expiring token is
+safe to reject, while accepting it without checking the expiry would not be. `check_expiry: true` is Rails'
+`signed_id_verifier.verified(token, purpose:)` / `User.find_signed`: no `exp` and a future `exp` return the id,
+and an `exp` now or in the past is nil. The crates are `hmac` 0.12,
 `sha2` 0.10, `pbkdf2` 0.12 and `base64` 0.22, added only when a body calls the verifier.
 
-## Values: `random_token`, `request_ip`, `user_agent`
+## Values: `random_token`, `request_ip`, `request_base_url`, `user_agent`
 
 - `random_token` is a string of 24 characters from the base58 alphabet Rails' `has_secure_token` uses
   (`123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz`), drawn from `rand` 0.9's thread generator, which
   is seeded by the operating system.
-- `request_ip` is the client address: the peer's. With `use_layer :trace, forwarded: true`, which already says a
-  proxy is trusted, the first `X-Forwarded-For` entry comes first, as in that layer's log line.
+- `request_ip` is the client address: the peer's. With `set :trust_forwarded_for, true`, or with
+  `use_layer :trace, forwarded: true` (which already says a proxy is trusted), the first
+  `X-Forwarded-For` entry comes first, when it is not empty. Rails' `ActionDispatch::RemoteIp` reads the header from a private or
+  loopback proxy the same way, so `request.remote_ip` is the visitor's address rather than the proxy's.
+  `set :trust_forwarded_for` trusts only this header: it turns on no request log, and `request_base_url` still
+  ignores `X-Forwarded-Host` and `X-Forwarded-Proto`.
+- `request_base_url` is Rails' `request.base_url`: the scheme and host (with any port) the request was
+  addressed to, such as `https://chat.example.com`, with no trailing slash, for the absolute URLs a page writes.
+  The host is the `Host` header and the scheme is `http`; with `use_layer :trace, forwarded: true`, the one option
+  that also lets a trusted proxy choose the host (as `request_ip` trusts it for the address), the last `X-Forwarded-Host` entry comes first and the first
+  `X-Forwarded-Proto` entry makes the scheme `https`. Without that layer option a client cannot choose the host. It is
+  empty when the request names no host.
 - `user_agent` is the `User-Agent` header, empty when the request has none.
+- `turbo_frame_request?` is true when the request has a non-blank `Turbo-Frame` header (turbo-rails' `turbo_frame_request?`). A layout is chosen at compile time, so branch with `if turbo_frame_request?` and give each branch its own `render ..., layout:`.
 
-`request_ip` and `user_agent` read the request, so they are for route, `before` and `current` bodies; a helper or
-a binding computes from its arguments, and `not_found` and `error` run without the request.
+`request_path` is the URI path (no query string) and is for a `before` filter only: a filter has no `params`, yet must tell which request it is running for (a bot key in the path). `request_method` is the HTTP method in upper case (`"GET"`, `"POST"`) for a route or a `before` filter (Rails' `request.get?`/`request.head?`); it reads the method after `use_layer :method_override` has rewritten it.
+
+`request_ip`, `request_base_url`, `user_agent` and `turbo_frame_request?` read the request, so they are for route, `before` and `current` bodies; a helper or
+a binding computes from its arguments, and `not_found` and `error` run without the request. `request_method` is for a route or a `before` filter only:
+a `current` body does not receive the method.
 
 ## `current`
 
@@ -196,7 +213,7 @@ still a layer, so the skip list is matched at run time: the emitted middleware c
 and URI path with each route that skips it (a `{name}` segment in the route path matches a non-empty
 segment, a `{*tail}` matches the rest).
 Because a router layer runs before axum has chosen a route, a skip that could also match a route which does
-not skip the filter (`get "/rooms/:id"` beside a literal `get "/rooms/me"`, a `serve_file`, or the OpenAPI
+not skip the filter (`get "/rooms/:id"` beside a literal `get "/rooms/me"`, a `serve_file` that does not skip it, or the OpenAPI
 document) is refused at compile time. The
 comparison is on the raw request path, so a percent-encoded literal segment is not decoded: the skip then
 fails closed and the filter still runs, as it does for the implicit HEAD of a `get` route. Only the named
@@ -204,8 +221,8 @@ filter steps aside; every other filter still runs, and the layers keep the order
 (a later declaration wraps an earlier one). A `static` mount takes the same `skip:` list, and its emitted
 entries are GET of the mount path and of its subtree (`/assets` and `/assets/{*path}`). A mount at `/` is
 axum's fallback rather than a prefix, so its entries would cover every GET path and a skip there would
-step the filter aside for every GET route: the compiler refuses that skip; mount at a prefix instead. `serve_file` and `set :public_folder` take no
-`skip:` today.
+step the filter aside for every GET route: the compiler refuses that skip; mount at a prefix instead. A `serve_file` takes the same `skip:` list (its entries are GET and HEAD of its
+path), and `set :public_folder` takes none today.
 
 `current ... required: :authenticate` links a nil-able current to the named filter that establishes it:
 

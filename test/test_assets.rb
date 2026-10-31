@@ -39,7 +39,7 @@ class TestAssets < Minitest::Test
   CSS = "body { color: #123; }\n"
 
   def test_the_digest_names_the_copied_file_and_the_view_writes_the_same_url
-    digest = AxumDsl.short_digest(CSS)
+    digest = "08bc2f1d" # sha1("body { color: #123; }\n" + "1.0")[0, 8], Propshaft's rule
     files = compile_files(<<~RB, views: page("campfire.css"), extra: { "public/campfire.css" => CSS })
       static "/assets", dir: "public", digest: true
 
@@ -55,7 +55,7 @@ class TestAssets < Minitest::Test
   end
 
   def test_a_nested_file_keeps_its_folder_in_the_url_and_the_crate
-    digest = AxumDsl.short_digest("a{}\n")
+    digest = "83f3b409" # sha1("a{}\n" + "1.0")[0, 8]
     files = compile_files(<<~RB, views: page("css/app.css"), extra: { "public/css/app.css" => "a{}\n" })
       static "/assets", dir: "public", digest: true
 
@@ -82,8 +82,8 @@ class TestAssets < Minitest::Test
   end
 
   def test_the_name_follows_the_bytes
-    one = AxumDsl.short_digest("a{}\n")
-    two = AxumDsl.short_digest("b{}\n")
+    one = "83f3b409" # sha1("a{}\n" + "1.0")[0, 8]
+    two = "febc8629" # sha1("b{}\n" + "1.0")[0, 8]
     refute_equal one, two
     body = <<~RB
       static "/assets", dir: "public", digest: true
@@ -96,6 +96,76 @@ class TestAssets < Minitest::Test
     assert a.key?("public/app-#{one}.css")
     assert b.key?("public/app-#{two}.css")
     refute a.key?("public/app-#{two}.css")
+  end
+
+  APP_CSS = "@import url(\"base.css\");\nbody { background: url(img/dot.svg); }\n"
+  BASE_CSS = "@import url(\"vars.css\");\n.a{}\n"
+  VARS_CSS = ":root{--x:1}\n"
+  DOT_SVG = "<svg/>\n"
+  CHAIN = { "public/app.css" => APP_CSS, "public/base.css" => BASE_CSS, "public/vars.css" => VARS_CSS, "public/img/dot.svg" => DOT_SVG }.freeze
+  CHAIN_BODY = <<~RB
+    static "/assets", dir: "public", digest: true
+    get "/" do
+      "ok"
+    end
+  RB
+
+  # The expected digests were computed with sha1sum over the files' bytes, then "1.0" (Propshaft 1.2.1's rule:
+  # the file, then every file its CSS refers to depth first and once each, then the assets version). The same
+  # rule gives Rails' _reset-9c3efd7b.css, lexxy-2876c58e.css, avatars-279376ab.css and composer-e490638a.css.
+  def test_the_digest_covers_the_files_a_stylesheet_refers_to
+    texts = { "app.css" => APP_CSS, "base.css" => BASE_CSS, "vars.css" => VARS_CSS, "img/dot.svg" => DOT_SVG }
+    assert_equal "1b30d4f2", AxumDsl::Propshaft.digest("vars.css", texts)
+    assert_equal "b336e7e8", AxumDsl::Propshaft.digest("img/dot.svg", texts)
+    assert_equal "53e48027", AxumDsl::Propshaft.digest("base.css", texts)
+    assert_equal "2d143daf", AxumDsl::Propshaft.digest("app.css", texts)
+    assert_equal "e67e4717", AxumDsl::Propshaft.digest("x.css", { "x.css" => "a{}\n" }, "2"), "the assets version is the last bytes hashed"
+  end
+
+  def test_a_stylesheets_urls_name_the_digested_files
+    files = compile_files(CHAIN_BODY, extra: CHAIN)
+    assert_equal %(@import url("/assets/base-53e48027.css");\nbody { background: url("/assets/img/dot-b336e7e8.svg"); }\n),
+                 files["public/app-2d143daf.css"]
+    assert_equal %(@import url("/assets/vars-1b30d4f2.css");\n.a{}\n), files["public/base-53e48027.css"]
+    assert_equal VARS_CSS, files["public/vars-1b30d4f2.css"]
+    assert_equal DOT_SVG, files["public/img/dot-b336e7e8.svg"]
+  end
+
+  def test_references_that_are_not_files_of_the_mount_are_left_alone
+    css = "a { background: url(data:image/png;base64,AAAA) url(https://x.test/a.png) url(//x.test/b.png) url(#frag) url(missing.png); }\n"
+    files = compile_files(CHAIN_BODY, extra: { "public/app.css" => css })
+    assert_equal css, files.find { |path, _| path.start_with?("public/app-") }[1]
+  end
+
+  def test_the_assets_version_changes_every_name
+    files = compile_files(<<~RB, extra: { "public/app.css" => "a{}\n" })
+      static "/assets", dir: "public", digest: true, version: "2"
+      get "/" do
+        "ok"
+      end
+    RB
+    assert files.key?("public/app-e67e4717.css")
+  end
+
+  def test_a_version_needs_a_digest_mount
+    assert_includes refusal(<<~RB, extra: { "public/app.css" => "a{}\n" }), "`version:` is the assets version of a `digest: true` mount"
+      static "/assets", dir: "public", version: "2"
+      get "/" do
+        "ok"
+      end
+    RB
+  end
+
+  def test_a_mount_with_a_max_age_sends_its_headers_through_a_router_of_its_own
+    main = compile_files(<<~RB, extra: { "public/app.css" => "a{}\n" })["src/main.rs"]
+      static "/assets", dir: "public", digest: true, max_age: 2592000
+      get "/" do
+        "ok"
+      end
+    RB
+    assert_includes main, "axum_dsl_static_headers_0"
+    assert_includes main, '"max-age=2592000, public"'
+    assert_includes main, 'headers.remove("accept-ranges")', "Propshaft answers whole files"
   end
 
   def test_an_asset_path_needs_a_mounted_file
@@ -132,6 +202,31 @@ class TestAssets < Minitest::Test
     RB
     assert_includes message, "resolves against one fingerprinted mount"
     assert_includes message, "\"/a\", \"/b\""
+  end
+
+  # serve_file takes the same `skip:` as a route: the named filter steps aside for GET and HEAD of its path.
+  def test_serve_file_skip_steps_the_filter_aside_for_its_path
+    main = compile_files(<<~RB, extra: { "public/page.html" => "<p>hi</p>\n" })["src/main.rs"]
+      before :authenticate do
+        "continue"
+      end
+
+      serve_file "/page.html", from: "public/page.html", skip: [:authenticate]
+
+      get "/" do
+        text("ok")
+      end
+    RB
+    assert_includes main, "axum_dsl_skip_match(\"/page.html\", path)"
+    assert_includes main, "Method::GET && axum_dsl_skip_match(\"/page.html\""
+    assert_includes main, "Method::HEAD && axum_dsl_skip_match(\"/page.html\""
+  end
+
+  def test_serve_file_skip_of_an_undeclared_filter_is_refused
+    message = refusal(<<~RB, extra: { "public/page.html" => "<p>hi</p>\n" })
+      serve_file "/page.html", from: "public/page.html", skip: [:nope]
+    RB
+    assert_includes message, "serve_file `/page.html` skips `:nope`, but no `before :nope` filter is declared"
   end
 
   def test_the_marker_takes_a_relative_double_quoted_path

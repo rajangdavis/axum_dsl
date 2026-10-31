@@ -27,7 +27,7 @@ def sorbet_type(kind)
   # a setting's value: a literal, or a symbol naming what the setting points at (`set :layout, :app`)
   return "T.any(String, Symbol, Integer, Float, T::Boolean)" if kind == :setting
   return "T.any(String, Integer, Float, T::Boolean, T::Array[T.any(String, Integer, Float)])" if kind == :default
-  return "T::Hash[String, T.untyped]" if kind == :json || kind == :schema
+  return "T::Hash[String, T.untyped]" if kind == :json || kind == :schema || kind == :hash
   return "T::Hash[Symbol, T.untyped]" if kind == :helper_kw
   return "T::Array[Symbol]" if %i[types htypes snakes file_checks].include?(kind)
   return "T::Hash[Symbol, Symbol]" if kind == :sqlargs
@@ -63,7 +63,9 @@ def method_src(name, sig)
   when :decls
     # A fragment holds what a file holds, and the file level IS this rbi's top level, which has no
     # scope class of its own: its block is untyped. Every other decl block names the class it binds.
-    sparams << (name == :fragment ? "blk: T.untyped" : "blk: T.proc.bind(#{scope(name)}).void")
+    block_type = name == :fragment ? "T.untyped" : "T.proc.bind(#{scope(name)}).void"
+    block_type = "T.nilable(#{block_type})" if sig[:optional_block]
+    sparams << "blk: #{block_type}"
     defs << "&blk"
   when :body
     sparams << "blk: T.untyped"
@@ -118,11 +120,71 @@ BODY_SURFACE = {
            "def render(name, locals: nil, layout: nil, status: nil, content_type: nil); end"],
   # send_file(path, content_type:): a response whose body is the file at a path computed when the request
   # runs. The content type is required because the compiler does not guess one from the path.
-  send_file: ["sig { params(path: String, status: T.nilable(Integer), content_type: T.nilable(String)).returns(T.untyped) }",
-              "def send_file(path, status: nil, content_type: nil); end"],
-  # rails_signed_id(token, purpose:, secret:): the integer id inside a Rails 8 signed ID, or nil.
-  rails_signed_id: ["sig { params(token: String, purpose: String, secret: Symbol).returns(T.nilable(Integer)) }",
-                    "def rails_signed_id(token, purpose:, secret:); end"],
+  send_file: ["sig { params(path: String, status: T.nilable(Integer), content_type: T.nilable(String), disposition: T.nilable(Symbol)).returns(T.untyped) }",
+              "def send_file(path, status: nil, content_type: nil, disposition: nil); end"],
+  # rails_signed_id(token, purpose:, secret:, check_expiry:): the integer id inside a Rails 8 signed ID, or nil.
+  rails_signed_id: ["sig { params(token: String, purpose: String, secret: Symbol, check_expiry: T::Boolean).returns(T.nilable(Integer)) }",
+                    "def rails_signed_id(token, purpose:, secret:, check_expiry: false); end"],
+  # rails_signed_id_for(id, purpose:, secret:): the token Rails' `signed_id(purpose:)` writes for an integer id.
+  rails_signed_id_for: ["sig { params(id: Integer, purpose: String, secret: Symbol, expires_in: Integer).returns(String) }",
+                        "def rails_signed_id_for(id, purpose:, secret:, expires_in: 0); end"],
+  # turbo_signed_stream_name(*parts, secret:): turbo-rails' Turbo::StreamsChannel.signed_stream_name.
+  turbo_signed_stream_name: ["sig { params(parts: T.any(String, Symbol), secret: Symbol).returns(String) }",
+                             "def turbo_signed_stream_name(*parts, secret:); end"],
+  # global_id_param(model, id, app:): record.to_gid_param, the url-safe base64 of "gid://<app>/<Model>/<id>".
+  global_id_param: ["sig { params(model: String, id: Integer, app: String).returns(String) }",
+                    "def global_id_param(model, id, app:); end"],
+  # rails_signed_global_id(model, id, app:, purpose:, secret:): record.attachable_sgid, the signed GlobalID.
+  rails_signed_global_id: ["sig { params(model: String, id: Integer, app: String, secret: Symbol, purpose: T.nilable(String)).returns(String) }",
+                           "def rails_signed_global_id(model, id, app:, secret:, purpose: nil); end"],
+  # json_object("name" => value, ...): one JSON object with keys of different value types.
+  json_object: ["sig { params(pairs: T::Hash[String, T.untyped]).returns(String) }",
+                "def json_object(pairs); end"],
+  # json_array(["{\"a\":1}", ...]): a JSON array of strings already serialized as objects.
+  json_array: ["sig { params(values: T::Array[String]).returns(String) }",
+               "def json_array(values); end"],
+  # The Action Cable broadcasts (docs/cable.md): a JSON object to a broadcasting name, to the channel's own stream, or a
+  # Turbo Stream tag to a stream's name; render_string is the markup the tag carries.
+  broadcast: ["sig { params(name: String, message: T::Hash[String, T.untyped]).void }",
+              "def broadcast(name, message); end"],
+  broadcast_to: ["sig { params(message: T::Hash[String, T.untyped]).void }",
+                 "def broadcast_to(message); end"],
+  # Rails' close_remote_connections: every open connection of the user (an id, or a string current's string) is sent the remote disconnect and closed.
+  close_remote_connections: ["sig { params(user: T.any(Integer, String), reconnect: T.nilable(T::Boolean)).void }",
+                             "def close_remote_connections(user, reconnect: nil); end"],
+  broadcast_turbo: ["sig { params(parts: T.any(String, Symbol), action: Symbol, target: String, html: T.nilable(String), maintain_scroll: T.nilable(T::Boolean)).void }",
+                    "def broadcast_turbo(*parts, action:, target:, html: nil, maintain_scroll: nil); end"],
+  render_string: ["sig { params(name: T.any(Symbol, String), locals: T.untyped).returns(String) }",
+                  "def render_string(name, locals: nil); end"],
+  # urlsafe_base64(text): Base64.urlsafe_encode64 (padded).
+  urlsafe_base64: ["sig { params(text: String).returns(String) }",
+                   "def urlsafe_base64(text); end"],
+  # url_encode(text): URI.encode_www_form_component, the query-string escaping Rails uses for a parameter.
+  url_encode: ["sig { params(text: String).returns(String) }",
+               "def url_encode(text); end"],
+  # urlsafe_decode64(text): Base64.urlsafe_decode64 as UTF-8 text, nil where Ruby raises or the bytes are not text.
+  urlsafe_decode64: ["sig { params(text: String).returns(T.nilable(String)) }",
+                     "def urlsafe_decode64(text); end"],
+  # qr_code_svg(text): RQRCode::QRCode.new(text).as_svg(viewbox: true, fill: :white, color: :black), nil past version 40.
+  qr_code_svg: ["sig { params(text: String).returns(T.nilable(String)) }",
+                "def qr_code_svg(text); end"],
+  # The Active Storage disk service: blob.url, blob.signed_id's id, and the blob key inside a disk URL's signed key.
+  active_storage_disk_path: ["sig { params(key: String, filename: String, content_type: String, secret: Symbol).returns(String) }",
+                             "def active_storage_disk_path(key, filename, content_type, secret:); end"],
+  active_storage_verified_id: ["sig { params(token: String, secret: Symbol).returns(T.nilable(Integer)) }",
+                               "def active_storage_verified_id(token, secret:); end"],
+  active_storage_verified_key: ["sig { params(token: String, secret: Symbol).returns(T.nilable(String)) }",
+                                "def active_storage_verified_key(token, secret:); end"],
+  # inline_disposition(filename): the inline Content-Disposition header value of a file name.
+  inline_disposition: ["sig { params(filename: String).returns(String) }",
+                       "def inline_disposition(filename); end"],
+  # crc32(text): Zlib.crc32(text), the unsigned 32-bit CRC-32 as an Integer.
+
+  crc32: ["sig { params(text: String).returns(Integer) }",
+          "def crc32(text); end"],
+  # plain_text(html): ActionText::Content#to_plain_text of a stored body.
+  plain_text: ["sig { params(html: String).returns(String) }",
+               "def plain_text(html); end"],
   # h(value) escapes a value for HTML; raw(value) gives the same value with no escaping (the XSS door).
   h: ["sig { params(value: T.any(String, Integer, Float, T::Boolean)).returns(String) }",
       "def h(value); end"],
@@ -171,8 +233,21 @@ BODY_SURFACE = {
                  "def random_token; end"],
   request_ip: ["sig { returns(String) }",
                "def request_ip; end"],
+  request_base_url: ["sig { returns(String) }",
+                     "def request_base_url; end"],
+  # request_path: the URI path, for a `before` filter.
+  request_path: ["sig { returns(String) }",
+                 "def request_path; end"],
+  # request_method: the HTTP method in upper case, for a route or a `before` filter.
+  request_method: ["sig { returns(String) }",
+                   "def request_method; end"],
+  # request_body: the whole request body as UTF-8 text (RawRequestBody), for a route.
+  request_body: ["sig { returns(String) }",
+                 "def request_body; end"],
   user_agent: ["sig { returns(String) }",
                "def user_agent; end"],
+  turbo_frame_request?: ["sig { returns(T::Boolean) }",
+                         "def turbo_frame_request?; end"],
   # current(:name) reads a per-request value; its declaration form (a name, `returns:` and a block) shares this
   # one relaxed sig, as `setting` does, because Sorbet cannot pick an overload on a missing keyword argument.
   current: ["sig { params(name: Symbol, returns: T.untyped, required: T.nilable(Symbol), blk: T.untyped).returns(T.untyped) }",

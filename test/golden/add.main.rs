@@ -155,8 +155,37 @@ async fn shutdown_signal() {
     }
 }
 
+// jemalloc as the global allocator, and no transparent huge pages on Linux: written by the compiler
+#[global_allocator]
+static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
+
+// jemalloc reads its options from this exported symbol (tikv-jemallocator's `_rjem_` prefix) when it
+// starts, before main. It is a `const char *`, so a thin pointer to the first byte.
+#[cfg(target_os = "linux")]
+#[allow(unsafe_code)]
+#[unsafe(export_name = "_rjem_malloc_conf")]
+pub static JEMALLOC_CONF: Option<&'static std::ffi::c_char> =
+    // SAFETY: points at the first byte of a static, NUL-terminated string.
+    Some(unsafe { &*c"thp:never".as_ptr() });
+
+// With transparent huge pages set to `always`, every thread stack gets backed by whole 2 MB pages as
+// soon as it is touched; nothing here is big enough to gain from them, so the process opts out.
+#[allow(unsafe_code)]
+fn disable_transparent_huge_pages() {
+    #[cfg(target_os = "linux")]
+    {
+        let off: libc::c_ulong = 1;
+        // SAFETY: PR_SET_THP_DISABLE takes machine-width integer arguments and only changes this
+        // process's memory policy.
+        if unsafe { libc::prctl(libc::PR_SET_THP_DISABLE, off, 0 as libc::c_ulong, 0 as libc::c_ulong, 0 as libc::c_ulong) } != 0 {
+            eprintln!("couldn't disable transparent huge pages: {}", std::io::Error::last_os_error());
+        }
+    }
+}
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
+    disable_transparent_huge_pages();
     let router = axum::Router::new()
         .route("/add", axum::routing::get(route_1))
         .route("/users/{id}", axum::routing::get(route_2))

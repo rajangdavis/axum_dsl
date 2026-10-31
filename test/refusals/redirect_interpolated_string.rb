@@ -1,4 +1,4 @@
-# expect: a redirect path can interpolate only a number (i32, i64 or f64) or a bool
+# expect: a redirect path can interpolate only a number (i32, i64 or f64), a bool, or a url_encode(...) call
 server "refuse", version: "0.1.0"
 set :port, 8080
 

@@ -77,7 +77,10 @@ class TestBodySurface < Minitest::Test
     assert_includes main,
                     "{ let mut __redirect = ::axum::response::IntoResponse::into_response((::axum::http::StatusCode::FOUND, ()));"
     assert_includes main, "::axum::http::header::LOCATION"
-    assert_includes main, "::axum::http::HeaderValue::from_str(\"/session/new\")"
+    # Rails' redirect_to writes an absolute URL: the request's base URL in front of the path.
+    assert_includes main, 'format!("{}{}", axum_dsl_request_base_url(&__headers), "/session/new")'
+    assert_includes main, "fn axum_dsl_request_base_url(", "the base URL helper is emitted for the redirect"
+    assert_includes main, 'HeaderValue::from_static("text/html; charset=utf-8")', "Rails' redirect_to is an empty text/html"
     assert_includes main, "__redirect }", "the block is the response value, so a return can carry it"
     refute_includes main, "Redirect::to", "Redirect::to answers 303; redirect must answer 302"
   end
@@ -92,6 +95,20 @@ class TestBodySurface < Minitest::Test
     assert_includes main, "::axum::http::StatusCode::from_u16(303).unwrap()"
     assert_includes main, "::axum::http::header::LOCATION"
     refute_includes main, "Redirect::to"
+  end
+
+  # A redirect may carry a url_encode(...) result in an interpolated query value: its output is ASCII by
+  # construction, so it cannot carry a byte a Location header rejects. Rails builds a query the same way
+  # (new_session_url(email_address:) writes ?email_address=david%4037signals.com).
+  def test_redirect_may_interpolate_url_encode
+    main = compile(<<~RB)
+      get "/x" do
+        redirect("/session/new?email_address=\#{url_encode("david@example.com")}")
+      end
+    RB
+    assert_includes main, "fn axum_dsl_url_encode(", "url_encode's runtime is emitted for the path"
+    assert_includes main, 'format!("/session/new?email_address={}"', "the encoded value is interpolated into the path"
+    assert_includes main, "axum_dsl_request_base_url(&__headers)", "a path starting with / is still absolute"
   end
 
   # AX11 (b): a render's status rides on the value, so a `return` carries it, and locals still compose.
@@ -175,9 +192,10 @@ class TestBodySurface < Minitest::Test
         redirect("/session/new")
       end
     RB
-    assert_includes main, "::axum::http::HeaderValue::from_str(&format!(\"/rooms/{}\", id))"
-    assert_includes main, "::axum::http::HeaderValue::from_str(&format!(\"/rooms/{}\", room_id))"
-    assert_includes main, "::axum::http::HeaderValue::from_str(\"/session/new\")"
+    base = 'format!("{}{}", axum_dsl_request_base_url(&__headers), '
+    assert_includes main, "#{base}&format!(\"/rooms/{}\", id))"
+    assert_includes main, "#{base}&format!(\"/rooms/{}\", room_id))"
+    assert_includes main, "#{base}\"/session/new\")"
   end
 
   # AX11 (c): `status(...)` (the statement) and a helper's `status:` (on the value) may not meet in one

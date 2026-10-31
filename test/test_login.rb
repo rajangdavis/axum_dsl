@@ -8,6 +8,7 @@
 #   ruby -Ilib test/test_login.rb
 require "minitest/autorun"
 require "tmpdir"
+require "fileutils"
 require "openssl"
 require "json"
 require "time"
@@ -25,8 +26,12 @@ class TestLogin < Minitest::Test
   RB
 
   # Compiles `body` (appended to the header) and returns the emitted files, { "src/main.rs" => ..., "Cargo.toml" => ... }.
-  def compile(body, head: HEAD)
+  def compile(body, head: HEAD, extra: {})
     Dir.mktmpdir("sess") do |dir|
+      extra.each do |rel, text|
+        FileUtils.mkdir_p(File.dirname(File.join(dir, rel)))
+        File.write(File.join(dir, rel), text)
+      end
       file = File.join(dir, "sess.axum.rb")
       File.write(file, head + body)
       AxumDsl::Emit.files(AxumDsl.read(file), file)
@@ -199,6 +204,31 @@ class TestLogin < Minitest::Test
     refute_includes rust, "fn axum_dsl_cookie_verify(", "nothing reads a cookie"
   end
 
+  def test_cookie_name_may_start_with_an_underscore
+    rust = main(COOKIES + <<~'RB')
+      get "/x" do
+        mine = cookie(:_campfire_session, signed: false).to_s
+        set_cookie :_campfire_session, "#{mine}.flash", signed: false
+        redirect("/")
+      end
+    RB
+    assert_includes rust, "axum_dsl_cookie_raw(&__headers, \"_campfire_session\")"
+    assert_includes rust, "axum_dsl_set_cookie_raw(\"_campfire_session\""
+  end
+
+  def test_an_early_return_keeps_the_cookies_the_body_set
+    rust = main(COOKIES + <<~'RB')
+      get "/x" do
+        set_cookie :seen, "1", signed: false
+        return redirect("/") if user_agent == "bot"
+        "ok"
+      end
+    RB
+    assert_includes rust, "Ok(mut response) => { axum_dsl_apply_cookies(&mut response, &__cookies); response }",
+                    "the cookies go on whatever the closure answered, a `return` included"
+    refute_includes rust, "axum_dsl_apply_cookies(&mut __stated, &__cookies);", "and only once"
+  end
+
   def test_delete_cookie_alone_needs_no_signing
     files = compile(COOKIES + "get \"/x\" do\n  delete_cookie :session_token\n  redirect(\"/\")\nend\n")
     assert_includes files["src/main.rs"], 'axum_dsl_delete_cookie("session_token")'
@@ -234,6 +264,103 @@ class TestLogin < Minitest::Test
     assert_includes forwarded, "fn axum_dsl_request_ip(headers:", "the first X-Forwarded-For entry comes first"
     refute_includes plain, "fn axum_dsl_request_ip(headers:"
     assert_includes plain, "::axum::extract::ConnectInfo(__connect)"
+  end
+
+  def test_request_base_url_is_the_requests_scheme_and_host
+    rust = main("get \"/origin\" do\n  request_base_url\nend\n")
+    assert_includes rust, "fn axum_dsl_request_base_url(headers:", "the sessions runtime writes it"
+    assert_includes rust, "axum_dsl_request_base_url(&__headers)"
+    refute_includes rust, "x-forwarded", "an untrusted client does not choose the host"
+    forwarded = main("use_layer :trace, forwarded: true\nget \"/origin\" do\n  request_base_url\nend\n")
+    assert_includes forwarded, "x-forwarded-host", "a trusted proxy may set the host"
+    assert_includes forwarded, "x-forwarded-proto"
+    refute_includes main("get \"/x\" do\n  \"ok\"\nend\n"), "axum_dsl_request_base_url"
+    assert_includes refusal("get \"/x\" do\n  request_base_url(1)\nend\n"), "takes no arguments"
+  end
+
+  def test_request_body_is_the_routes_last_extractor
+    rust = main("put \"/echo\" do\n  request_body\nend\n")
+    assert_includes rust, "__body: ::axum::body::Bytes", "axum's Bytes consumes the body"
+    assert_includes rust, "String::from_utf8_lossy(&__body)"
+    refute_includes main("get \"/x\" do\n  \"ok\"\nend\n"), "::axum::body::Bytes"
+    both = refusal("params :P do\n  field :a, :string\nend\nput \"/echo\", params: :P do\n  request_body + params[:a]\nend\n")
+    assert_includes both, "reads the raw request body", "a JSON params group would take the body too"
+    assert_includes refusal("before do\n  request_body\nend\nget \"/x\" do\n  \"ok\"\nend\n"), "request_body"
+    assert_includes refusal("get \"/x\" do\n  request_body(1)\nend\n"), "takes no arguments"
+  end
+
+  def test_request_path_is_for_a_before_filter
+    rust = main("before do\n  return redirect(\"/\") if request_path == \"/a\"\n  \"continue\"\nend\nget \"/x\" do\n  \"ok\"\nend\n")
+    assert_includes rust, "let __path = request.uri().path().to_string();"
+    assert_includes refusal("get \"/x\" do\n  request_path\nend\n"), "before"
+  end
+
+  def test_request_method_is_the_method_in_upper_case_for_a_route_and_a_filter
+    route = main("get \"/m\" do\n  request_method\nend\n")
+    assert_includes route, "__method: ::axum::http::Method"
+    refute_includes route, "Method(__method)", "http::Method's field is private, so a tuple-struct pattern is E0603"
+    assert_includes route, "__method.as_str().to_string()", "axum's Method as_str is upper case"
+    filter = main("before do\n  return redirect(\"/\") if request_method == \"POST\"\n  \"continue\"\nend\nget \"/x\" do\n  \"ok\"\nend\n")
+    assert_includes filter, "let __method = request.method().clone();", "a filter reads the method before next.run"
+    assert_includes refusal("helper :m, args: [], returns: :string do\n  request_method\nend\n"), "request_method reads the request"
+    assert_includes refusal("get \"/x\" do\n  request_method(1)\nend\n"), "takes no arguments"
+    assert_includes refusal(<<~RB), "route or a `before` filter"
+      current :m, returns: :string do
+        request_method
+      end
+    RB
+  end
+
+  def test_trust_forwarded_for_trusts_the_header_for_request_ip
+    forwarded = main("set :trust_forwarded_for, true\nget \"/ip\" do\n  request_ip\nend\n")
+    assert_includes forwarded, "fn axum_dsl_request_ip(headers:", "the first X-Forwarded-For entry comes first"
+    assert_includes forwarded, "x-forwarded-for"
+    assert_includes forwarded, "::axum::extract::ConnectInfo(__connect)"
+    plain = main("set :trust_forwarded_for, false\nget \"/ip\" do\n  request_ip\nend\n")
+    assert_includes plain, "fn axum_dsl_request_ip(_headers:", "false is the peer's address"
+    refute_includes plain, "x-forwarded-for"
+  end
+
+  def test_trust_forwarded_for_does_not_enable_the_trace_layer_or_host_trust
+    files = compile("set :trust_forwarded_for, true\nget \"/t\" do\n  request_ip + request_base_url\nend\n")
+    rust = files.fetch("src/main.rs")
+    refute_includes rust, "x-forwarded-host", "request_base_url keeps the trace layer's trust"
+    refute_includes rust, "x-forwarded-proto"
+    refute_includes rust, "tracing_subscriber::fmt()", "no subscriber without use_layer :trace or set :log"
+    refute_includes files.fetch("Cargo.toml"), "tracing = \"0.1\""
+    assert_includes refusal("set :trust_forwarded_for, :yes\nget \"/x\" do\n  request_ip\nend\n"), "true or false"
+  end
+
+  def test_trust_forwarded_for_works_from_a_use_dsl_fragment
+    frag = <<~RB
+      fragment do
+        set :trust_forwarded_for, true
+      end
+    RB
+    rust = compile("use_dsl \"controllers/ip.axum.rb\"\nget \"/ip\" do\n  request_ip\nend\n",
+                   extra: { "controllers/ip.axum.rb" => frag }).fetch("src/main.rs")
+    assert_includes rust, "fn axum_dsl_request_ip(headers:"
+  end
+
+  def test_plain_text_writes_the_conversion_and_its_dependency
+    files = compile("get \"/x\" do\n  plain_text(\"<p>a</p>\")\nend\n")
+    assert_includes files["src/main.rs"], "fn axum_dsl_rails_plain_text("
+    assert_includes files["src/main.rs"], "axum_dsl_action_text_plain_text(\"<p>a</p>\")"
+    assert_includes files["Cargo.toml"], "scraper"
+    refute_includes compile("get \"/x\" do\n  \"ok\"\nend\n")["src/main.rs"], "axum_dsl_rails_plain_text"
+    assert_includes refusal("get \"/x\" do\n  plain_text(1)\nend\n"), "takes a string"
+  end
+
+  def test_a_route_header_may_be_computed
+    rust = main("get \"/x\" do\n  n = 3\n  headers \"X-Total-Count\" => n.to_s, \"Cache-Control\" => \"no-store\"\n  \"ok\"\nend\n")
+    assert_includes rust, "let __header_0 = "
+    assert_includes rust, "HeaderName::from_static(\"x-total-count\")"
+    assert_includes rust, "HeaderValue::from_static(\"no-store\")", "a literal one stays static"
+  end
+
+  def test_a_json_object_nests_a_json_object
+    rust = main("get \"/x\" do\n  text(json_object(\"a\" => json_object(\"b\" => 1)))\nend\n")
+    assert_includes rust, "::serde_json::json!({ \"a\": ::serde_json::json!({ \"b\": 1 }) }).to_string()"
   end
 
   def test_fetch_metadata_is_a_layer_that_needs_no_tower_http

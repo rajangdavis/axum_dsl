@@ -47,7 +47,8 @@ end
   only one"). `path:` is the file, relative to the directory the server runs in; `env:` names a variable that
   replaces it when it is set and not empty. A `database` that no `query` or `execute` uses is refused.
 - **`record :Name do ... end`**: the row a query returns. Each `field` has a scalar type (`:string`, `:i64`,
-  `:f64`, `:bool`); `optional: true` marks a column that may be NULL. No other `field` option applies. A record
+  `:f64`, `:bool`); `optional: true` marks a column that may be NULL; `list(:Other), from: :query` is a list of
+  other rows ([below](#a-list-inside-a-record)). No other `field` option applies. A record
   is read in a body like any object a `params` group declares: `note.body`, `notes.map { ... }`, `note&.tag`
   on a nil-able one, and `json(note)`.
 - **`query :name, args: {...}, returns: ..., sql: "..."`**: a statement that reads. `returns:` is
@@ -61,6 +62,40 @@ end
 
 An argument is one of the scalar types. A `query`, an `execute` and a `record` that nothing uses is refused,
 like an unused helper.
+
+## A list inside a record
+
+A row can carry a list of other rows, such as a message with its boosts. A `list(:Record)` field names, with
+`from:`, the query that fills it:
+
+```ruby
+record :Boost do
+  field :id, :i64
+  field :content, :string
+end
+
+record :Message do
+  field :id, :i64
+  field :body, :string
+  field :boosts, list(:Boost), from: :boosts_of   # not a column
+end
+
+query :boosts_of, args: { id: :i64 }, returns: list(:Boost), sql: "SELECT id, content FROM boosts WHERE message_id = :id ORDER BY id"
+query :messages, args: {}, returns: list(:Message), sql: "SELECT id, body FROM messages ORDER BY id"
+```
+
+Whenever `messages` (or any statement returning `list(:Message)` or `:Message?`) reads its rows, it then runs
+`boosts_of` once for each row, on the same connection, and puts the answer in `boosts`. The sub-query's arguments
+are the row's columns **of the same names and types** (`id` here), so there is no mapping to write. A view loops
+over it as over any list field, `{% for b in m.boosts %}`, and a partial takes it as an argument
+(`{{ partial :boosts, boosts: m.boosts }}`); `json(messages)` writes it as an array.
+
+The list field is not a column, so the query selects only the record's columns and the startup check leaves the
+field out. It costs one statement per row (a prepared, cached statement on an open connection, with no pool
+round trip). Refused: a list field without `from:`, `from:` on a column, a name that is not a query, a query
+that does not return `list(:Element)`, an argument that is not a non-optional column of the record with the same
+type, and an element record that has list fields of its own (one level). A sub-query that no body calls gets no
+async wrapper; one that is also called from a body gets one as usual.
 
 ## Placeholders
 
@@ -152,6 +187,18 @@ clone it or compute it outside the block. The block is refused in a file with no
 nested, and refused for anything that is not SQL: `return`, `raise`, a guard clause or any other statement.
 A `return` would leave the block without its rollback, and non-SQL work does not belong in a
 retried/rolled-back unit.
+
+## SQL functions
+
+A statement may call one function SQLite does not have: `action_text_attachable_ids(html, 'User')`, the ids the
+`sgid`s of an Action Text body's `<action-text-attachment>`s name for the given model, as a JSON array text such as
+`[3,7]` (each id once, in order of appearance; `[]` for a body with none or with a different model). It is for the
+query that finds who a message mentions, `SELECT ... FROM users WHERE id IN (SELECT value FROM
+json_each(action_text_attachable_ids(:body, 'User')))`. The sgid is decoded without a signature check (see
+[Views](views.md#attachments-and-sounds)). The compiler registers the function (a deterministic scalar function with two
+arguments) on every connection the pool opens only when some statement's SQL contains `action_text_attachable_ids(`,
+and the crate's `rusqlite` has the `functions` feature on either way; a crate whose SQL never calls it has no
+sgid-decoding Rust and no registration.
 
 ## What is not there
 

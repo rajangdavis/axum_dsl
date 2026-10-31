@@ -36,6 +36,7 @@ module AxumDsl
         when CompositeTypes::OPAQUE_FIELD then CompositeTypes::Opaque.symbol(field["type"])
         when CompositeTypes::OPAQUE_LIST_FIELD then CompositeTypes::Opaque.list_symbol(field["type"][CompositeTypes::OPAQUE_LIST_FIELD, 1])
         when CAMEL then :"struct:#{field['type']}"
+        when "upload" then :"struct:Upload"
         else field["type"].to_sym
         end
       field["optional"] ? Body::OPT_OF.fetch(base) : base

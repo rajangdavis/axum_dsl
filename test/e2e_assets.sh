@@ -289,11 +289,12 @@ if grep -q 'package' "$body" 2>/dev/null; then
 fi
 
 # --- static "/assets", dir: "fingerprints", digest: true ---------------------------------------
-# The name is re-derived here from the fixture's own bytes with Ruby's SHA-256 instead of being read from
-# the compiler: the rule is `<stem>-<the first 12 hex digits><ext>`, and the bytes come back unchanged.
-has ruby || fail "the fingerprint checks compute SHA-256 with ruby, which is not on PATH"
+# The name is re-derived here from the fixture's own bytes with Ruby's SHA-1 instead of being read from
+# the compiler: Propshaft's rule is `<stem>-<the first 8 hex digits of SHA-1(bytes + "1.0")><ext>` (the fixture
+# refers to no other file), and the bytes come back unchanged.
+has ruby || fail "the fingerprint checks compute SHA-1 with ruby, which is not on PATH"
 fixture_css="$repo/examples/fingerprints/campfire.css"
-digest=$(ruby -rdigest -e 'print Digest::SHA256.hexdigest(File.binread(ARGV[0]))[0, 12]' "$fixture_css") || fail "could not digest $fixture_css"
+digest=$(ruby -rdigest -e 'print Digest::SHA1.hexdigest(File.binread(ARGV[0]) + "1.0")[0, 8]' "$fixture_css") || fail "could not digest $fixture_css"
 [ -n "$digest" ] || fail "empty digest for $fixture_css"
 want_file "fingerprint: the digested stylesheet" "/assets/campfire-$digest.css" 200 "$fixture_css"
 want_ctype "fingerprint: a css file is text/css" "/assets/campfire-$digest.css" "text/css"

@@ -1,6 +1,6 @@
 # Views
 
-Pages the server renders: a `.html` file the compiler reads, the ten markers it may hold, and where a
+Pages the server renders: a `.html` file the compiler reads, the twelve markers it may hold, and where a
 client framework's template ends and a static asset begins.
 
 _See also: [The DSL](dsl.md), [The body language](body-language.md), [Coverage](coverage.md)._
@@ -55,24 +55,71 @@ A view rendered directly (no layout) may not write `{{ yield }}`: it has no chil
 checked when it is declared, so a setting that names a view which is not there, is not `.html`, or writes no
 `{{ yield }}` is refused at the setting rather than at every render that inherits it.
 
-## The ten markers
+### Named regions
+
+A layout often has more than one hole: a `<head>` the page adds a stylesheet to, a nav bar the page fills, a
+footer. Rails writes `<%= yield :nav %>` in the layout and `content_for :nav do ... end` in the page; here:
+
+```html
+<!-- views/app.html -->
+<head><title>{{ title }}</title>{{ yield :head }}</head>
+<body>
+<nav>{{ yield :nav }}</nav>
+<main>{{ yield }}</main>
+</body>
+```
+
+```html
+<!-- views/room.html -->
+{% content_for :nav %}<a href="/">Rooms</a>{% endcontent_for %}
+<h1>{{ room_name }}</h1>
+```
+
+`{% content_for :nav %}` … `{% endcontent_for %}` writes nothing where it stands: the markup between the two
+directives (built like the rest of the view, its markers resolved against the render's `locals:`) is the region
+`nav`, and the layout writes it where its `{{ yield :nav }}` is. `{{ yield }}` is unchanged and writes the page
+without its regions. As in Rails:
+
+- a region the page never fills is empty (`{{ yield :head }}` writes nothing);
+- filling the same region twice **appends**, in the order the page writes them (so a page and the partials it
+  calls can each add to `:head`);
+- a partial may hold `{% content_for %}`; it fills the region of the page that calls it, as in Rails.
+
+The names are checked at compile time, which Rails cannot do: a region the page fills and the layout never
+writes would be silently dropped, so it is refused with both names; `{{ yield :nav }}` in a view rendered with
+no layout, in the page a layout wraps or in a partial is refused (only a layout writes a region), and so is a
+`{% content_for %}` in a layout or in a render with no layout. A region is filled once, at the top level of the
+page: `{% content_for %}` inside a `{% for %}`, an `{% if %}` or another `{% content_for %}` is refused, also
+when the partial that holds it is called from one. Markers inside a region count toward the render's `locals:`
+like any other.
+
+## The twelve markers
 
 | Marker | Is |
 |--------|-----|
 | `{{ name }}` | the local `name`, escaped for HTML: the same bytes `h(name)` produces |
 | `{{ name\|raw }}` | the local `name` with no escaping: the same bytes `raw(name)` produces |
 | `{{ name\|sanitize }}` | the local `name` run through the compiler's HTML sanitiser (ammonia, default allowlist plus generic `class`), not escaped: for an Action Text body already holding markup |
+| `{{ name\|sanitize :profile }}` | the same, cleaned with the allowlist a top-level `sanitizer :profile, tags: [...], attributes: [...]` declares (see [Declared sanitizers](#declared-sanitizers)); `{{ name\|sanitize :profile, host: base_url }}` also names the request host a sanitizer with `attachments:` needs (see [Attachments and sounds](#attachments-and-sounds)) |
 | `{{ yield }}` | the wrapped view's markup, already built and never re-escaped; legal only in a layout |
+| `{{ yield :name }}` | the named region of the wrapped view (what its `{% content_for :name %}` collected), empty when it filled none; legal only in a layout (see [Named regions](#named-regions)) |
+| `{% content_for :name %}…{% endcontent_for %}` | the region `name`: the text between the directives, written by the layout's `{{ yield :name }}` and not in place; legal at the top level of a page or a partial |
 | `{{ csrf_token }}` | the CSRF token `use_layer :csrf` put on the request, for a form's hidden `authenticity_token` |
 | `{{ asset_path "campfire.css" }}` | the fingerprinted URL of a file under a `static ... digest: true` mount |
+| `{{ rails_signed_id user_id, purpose: "user/avatar", secret: :secret_key }}` | the Rails 8 signed id (`record.signed_id(purpose:)`) of an integer local, or of an integer field of a loop variable (`boost.booster_id`): the token `rails_signed_id_for` writes, for a value only known inside a partial or a loop; `secret:` names a required string setting (see [Body language](body-language.md)) |
+| `{{ rails_signed_global_id "User", user.id, app: "campfire", purpose: "attachable", secret: :secret_key }}` | `record.attachable_sgid`: the SignedGlobalID token (purpose `attachable` by default) an Action Text mention attachment or a `<lexxy-prompt-item>` carries, for an integer local or loop-variable field; `model:` and `app:` are string literals |
+| `{{ active_storage_blob_id blob_id, secret: :secret_key }}` | `blob.signed_id`: the token of a blob in an Active Storage URL (ActiveStorage.verifier: SHA1, padded base64, purpose `blob_id`), of an integer local or loop variable field |
+| `{{ active_storage_variation format, resize_to_limit: [1200, 800], secret: :secret_key }}` | the signed variation key of a representation URL (`{"format":format,"resize_to_limit":[w,h]}`, purpose `variation`), for a string local or loop variable field |
+| `{{ x\|sanitize :profile, host: base_url, mentions: users }}` | a sanitizer whose `attachments:` lists `"application/vnd.campfire.mention" => :mention` draws each such `<action-text-attachment sgid>` with that partial (args `id`, `name`, `title`, `version`), looking the user up in `users`, a list of records with those fields; the SQL function `action_text_attachable_ids(html, 'User')` gives a query the ids a body names |
+| `{{ x\|editable :profile, host: base_url, mentions: users }}` | the editor's `value="..."` attribute for the Action Text body `x`, written whole (no attribute at all when the body is blank), as Rails' `RichTextHelper#editable_body` and Lexxy's `render_custom_attachments_in` give `<lexxy-editor>`: every mention and opengraph embed is rebuilt from the sanitizer `profile`'s partials (the same ones `\|sanitize` draws), its `content-type` and `content` set, then the `content` of each attachment without a `url` replaced by the JSON string of the partial (`<`, `>` and `&` as `\u003c`, `\u003e`, `\u0026`); a mention of a user not in `users` is removed. The arguments are `\|sanitize`'s, and the sanitizer must list both `attachments:` partials (see [Declared sanitizers](#declared-sanitizers)) |
 | `{% raw %}…{% endraw %}` | the text between the two directives, copied byte for byte |
 | `{{ partial :name, key: value }}` | another view file, read at compile time and inlined here (see [Partials](#partials)) |
 | `{% for x in xs %}…{% endfor %}` | the text between the two directives, once for each element of the list `xs` (see [Loops](#loops)) |
 | `{% if name %}…{% else %}…{% endif %}` | one of two branches, chosen by the bool or nil-able `name`; `{% else %}` is optional (see [Conditionals](#conditionals)) |
 
-`|raw` and `|sanitize` are filters on the first marker, not separate directives. Whitespace inside a marker is optional
+`|raw`, `|sanitize` and `|editable` are filters on the first marker, not separate directives. Whitespace inside a marker is optional
 (`{{name}}` is `{{ name }}`), and there are no other forms: no expressions
-(`{{ a + b }}` is refused), no filters beyond `|raw` and `|sanitize` (`{{ name|upcase }}` is refused), no comparisons, no
+(`{{ a + b }}` is refused), no filters beyond `|raw`, `|sanitize` and `|editable` (`{{ name|upcase }}` is refused), no comparisons, no
 negation and no `{% elsif %}`. **The logic lives in the route body**; a view says only where the values go. That
 is deliberate: a view that could compute would be a second language to learn, to type-check and to keep in step
 with the body language, which already has the blocks, the conditionals and the helpers. Three forms grew the
@@ -91,8 +138,9 @@ syntax may hold another's.
 ## Fingerprinted assets
 
 `static "/assets", dir: "public", digest: true` copies each file under a content-hash name and serves only
-that name: `campfire.css` becomes `/assets/campfire-3f9a0c1b2d4e.css`, where the twelve hex digits are the
-first twelve of the file's SHA-256, computed when the compiler runs from the bytes it copied. Because the
+that name: `campfire.css` becomes `/assets/campfire-3f9a0c1b.css`, where the eight hex digits are Propshaft's
+(SHA-1 of the file, the files its CSS refers to, and the assets version `"1.0"`, so the name is the one Rails
+serves), computed when the compiler runs from the bytes it copied. Because the
 name changes whenever the bytes do, that URL is safe to configure a far-future `Cache-Control` for. The
 undigested name is not copied, so it is a 404 rather than a stale second URL.
 
@@ -157,8 +205,9 @@ This mirrors Askama's `{% macro field(label, hint = "") %}`.
 A partial that reaches itself, directly or through a chain of partials, is refused as a cycle rather than
 expanded, because a partial is inlined into its caller and the recursion would never finish.
 
-There is no `{% include %}`, no named block, no slot and no template inheritance beyond the single
-`{{ yield }}`: a partial is one file spliced in, and that is the whole of it.
+There is no `{% include %}`, no slot and no template inheritance beyond the layout's `{{ yield }}` and its named
+regions (`{{ yield :name }}` / `{% content_for :name %}`): a partial is one file spliced in, and that is the whole
+of it.
 
 ## Loops
 
@@ -176,7 +225,8 @@ Askama's `{% for x in xs %}`. It is the smallest loop: no expressions, no filter
 - `name` is a local the render passes (`locals: { notes: recent_notes(limit: 20) }`), a list of strings, integers
   or floats, of a query's records, or of a params object (`list(:Address)`). The list is a read: `locals:` must
   pass it, as for any marker. A loop over a field of an enclosing loop variable is written
-  `{% for tag in note.tags %}` (the field must be a list); any other expression is refused.
+  `{% for tag in note.tags %}` (the field must be a list; a record's `list(:Boost), from: :boosts_of` field is one, see
+  [A list inside a record](database.md#a-list-inside-a-record)); any other expression is refused.
 - `x` is a new snake_case name. It is not a local, so `locals:` never lists it, and it may not shadow a local
   or the variable of an enclosing loop. It exists only between `{% for %}` and `{% endfor %}`.
 - Inside, `{{ x }}` writes an element of a list of strings or integers, and `{{ x.field }}` writes a field of a
@@ -185,13 +235,13 @@ Askama's `{% for x in xs %}`. It is the smallest loop: no expressions, no filter
   never writes a nil, so the body supplies a value for it before the list reaches the view.
 - Loops nest, and they work in a layout and in a partial. A partial that loops declares the list in its
   `{% args %}` like any name it reads (`{% args items: %}`); the loop variable is not an argument. Inside a loop a
-  partial argument may be `x` or `x.field`. `{{ yield }}` and `{% args %}` cannot sit inside a loop, and a
+  partial argument may be `x` or `x.field`, and `x.field` may be a list field, which the partial loops over. `{{ yield }}` and `{% args %}` cannot sit inside a loop, and a
   `{% raw %}` region inside one stays byte for byte.
 - An unclosed `{% for %}`, an `{% endfor %}` without a `{% for %}`, a loop variable used outside its loop and a
   loop over a local that is not a list are refused with the view's file and line.
 
-The loop compiles to a block that builds a `String` — `for x in &list { s.push_str(&format!(…)); }` — spliced
-into the page's `format!` as one argument, with the same `axum_dsl_html_escape` the plain markers use.
+The loop compiles to a `for` statement that writes into the render's one buffer — `for x in &list { … }` — with
+the same escaping the plain markers use (see [How a view is emitted](#how-a-view-is-emitted)).
 
 ## Conditionals
 
@@ -217,9 +267,8 @@ variable, and the branch is chosen by Ruby truthiness: `nil` and `false` are fal
 - There is no `{% elsif %}`, no comparison and no negation: a condition is one name, and a route that must
   combine tests decides in the body and passes the result.
 
-The conditional compiles to a block that builds a `String`, spliced into the page's `format!` as one argument:
-`{ let mut __s = String::new(); if name { __s.push_str(&format!(…)); } else { … } __s }`, with an `if let
-Some(__if_name) = name` guard where the name is nil-able.
+The conditional compiles to an `if` statement that writes the taken branch into the render's one buffer:
+`if name { … } else { … }`, with an `if let Some(__if_name) = name` guard where the name is nil-able.
 
 ## Locals
 
@@ -246,6 +295,18 @@ own position in the DSL file.
 The refusal is reported at the declaration that named the view (the position an editor can show, and the one
 `test/refusals/` pins), and the view's own file and line travel inside the message.
 
+## How a view is emitted
+
+A render is one `String` created with `String::with_capacity(N)` — N is the view's literal bytes (layout, page
+and partials together) plus a small allowance per value — and every part of the view writes into it, as Askama's
+generated code does. Literal text is `__out.push_str("…")`; a layout writes the page at its `{{ yield }}` straight
+into the same buffer; a partial, a `{% for %}` and an `{% if %}` are inlined as statements on it. `{{ name }}` is
+`axum_dsl_html_escape_into(&mut __out, &name)`, which appends the escaped text with no `String` of its own, `|raw`
+is `__out.push_str(&name)`, a number is written with its `Display`, and `|sanitize` appends the memoized output
+(`axum_dsl_sanitize_into`). A value the compiler already knows — a string, integer or bool literal passed as a
+partial argument or a `locals:` value — is escaped by the compiler and joins the literal text around it. The
+rendered bytes are the same as with nested `format!` calls; only how they are built differs.
+
 ## Escaping
 
 `{{ name }}` is exactly `h(name)`, and `{{ name|raw }}` is exactly `raw(name)`: the two spellings share one
@@ -262,6 +323,98 @@ without escaping it first hands the browser a tag of the visitor's choosing. `{{
 exactly each other; the sanitiser does not replace them, and a value that is not a string is refused where
 `|sanitize` reads it. `examples/views.axum.rb` shows the shape that is right: the route escapes each value with
 `h(...)` as it builds the fragment, and the page writes that fragment as markup.
+
+### Declared sanitizers
+
+Rails configures its sanitizer by the tags and attributes it allows, and a rich-text body such as Campfire's
+passes through one such list. The DSL does the same with a named, declared configuration that a view refers to:
+
+```ruby
+sanitizer :message_body,
+          tags: %w[a b blockquote br code div em h1 p pre s span strong table tbody td th tr u ul],
+          attributes: %w[href src class data-language],
+          link_rel: false,
+          autolink_target: "_blank"
+```
+
+```html
+<div class="lexxy-content">{{ body|sanitize :message_body }}</div>
+```
+
+- `tags:` is the whole tag list. A tag that is not listed is dropped and its children kept, so a wrapper such as
+  `<figure class="lexxy-content__table-wrapper">` unwraps simply by `figure` not being listed.
+- `attributes:` are allowed on any listed tag, as Rails' safe-list takes them. `href`, `src` and the other URL
+  attributes are still checked against ammonia's URL schemes, so `javascript:` is dropped.
+- `link_rel: false` keeps ammonia from adding `rel="noopener noreferrer"` to links (Rails does not).
+- `autolink_target: "_blank"` runs rails_autolink's `auto_link` (`link: :all`) over the cleaned HTML: bare
+  `http(s)://`, `www.` and other scheme URLs and e-mail addresses become `<a target="_blank" href="...">`, except
+  inside a tag or an open link; trailing punctuation and unbalanced brackets stay outside the link.
+- The compiler refuses, at the declaration, a tag that runs script or loads active content (`script`, `style`,
+  `iframe`, `object`, `embed`, `svg`, `math` and similar) and the attributes `on*`, `style`, `srcdoc` and
+  `formaction`; a `|sanitize :name` without a matching `sanitizer`, and a `sanitizer` no view names, are refused.
+- Each sanitizer is one ammonia builder built once, and its output is memoized by the full input like the default
+  one. What it cannot do (render the `<action-text-attachment>` of a record: a mention, an Active Storage file) is
+  listed in [Coverage](coverage.md).
+
+#### Attachments and sounds
+
+Two more keywords let a sanitizer draw what a plain allowlist would drop, each with ordinary view partials so the
+markup stays in the views:
+
+```ruby
+sanitizer :message_body, tags: ..., attributes: ...,
+          attachments: { "application/vnd.actiontext.opengraph-embed" => :opengraph_embed },
+          sound_partials: { text: :sound_with_text, image: :sound_with_image },
+          sounds: { "bell" => "🔔", "56k" => ["sounds/56k.webp", 79, 33] }
+```
+
+```html
+{% if body|sound :message_body %}{{ body|sanitize :message_body, host: base_url }}{% else %}
+<div class="lexxy-content">{{ body|sanitize :message_body, host: base_url }}</div>{% endif %}
+```
+
+- `attachments:` maps a content type to a partial. The only type the compiler can read is Action Text's opengraph
+  embed (`application/vnd.actiontext.opengraph-embed`), whose details it takes from the node's `href`, `url`,
+  `filename` and `caption` attributes (Trix) or from the `.og-embed__*` markup in its `content` attribute
+  (Lexxy). Its partial reads exactly `href`, `title`, `description`, `image`, `twitter_avatar`, `has_href` and
+  `has_image` (title and description are already truncated to 280 and 560 characters). The drawn partial goes
+  through the same allowlist as the rest of the body, so its tags must be listed or they unwrap. A link or image
+  address is kept only if it is an `http`/`https` URL on a named host (a dot, an alphabetic last label, no `%`)
+  that is not the request's own host, as once-campfire's `web_url` does; so a `|sanitize` of a sanitizer with
+  `attachments:` must name the host: `host: base_url`, a string local holding the host or a base URL (a scheme and port
+  are ignored). A body that holds one embed and nothing else (its plain text, whitespace included, is the embed's
+  link) loses the paragraphs of that link, or keeps only the embed inside a Trix `<div>`, as RemoveSoloUnfurledLinkText
+  does. A body with an attachment is drawn per request and is not memoized.
+- `"application/vnd.campfire.mention" => :mention` draws a mention of a user: an `<action-text-attachment sgid="...">`
+  whose sgid names a `User`. The sgid is decoded without checking its signature (the GlobalID inside names the model
+  and the id, as once-campfire's `action_text_attachables` accepts a Rails 7 Marshal-era one), so the attachment is
+  trusted only as far as the lookup: the user must be in the list the view passes, `{{ body|sanitize :message_body,
+  host: base_url, mentions: users }}`, with `users` a list of records with the fields `id`, `name`, `title` and `version`
+  (`mentions:` is required for such a sanitizer and refused for any other). The partial reads exactly `id`, `name`,
+  `title` and `version`. A mention whose user is not in the list is dropped, as is one of another model.
+  `action_text_attachable_ids(html, 'User')` is the SQL function that gives a query those ids (see
+  [Database](database.md#sql-functions)).
+- `{{ body|editable :message_body, host: base_url, mentions: users }}` writes `value="..."` for the editor that edits a
+  message (Lexxy's `<lexxy-editor>`), from the same partials, so the mention chip is drawn by the one implementation. It
+  follows Rails in two passes over the stored body. First `RichTextHelper#editable_body` rebuilds each attachment from
+  what it attaches: an opengraph embed (chosen by its content type, ahead of an sgid), else a `User` named by the sgid
+  (so a mention saved under Trix with another content type gets `application/vnd.campfire.mention` back), with
+  `content-type` and `content` set to the partial's markup, chomped; a mention of a user not in `users` leaves the
+  editor, where Rails would raise. Then Lexxy's `render_custom_attachments_in` replaces the `content` of every
+  attachment without a `url` by the partial as an ActiveSupport JSON string (`"` as `\"`, and `<`, `>` and `&` as
+  `\u003c`, `\u003e` and `\u0026`); a Trix-era embed with a `url` keeps the markup. The value is HTML-escaped into the
+  attribute, and a blank body writes nothing. Attributes keep the order they were written in; an attachment of any other
+  kind is left as it is. The sanitizer must list both partials, the arguments are `|sanitize`'s, and the partial for a
+  mention should write the user's `sgid` (`{{ rails_signed_global_id "User", id, app: "campfire", secret: :secret_key }}`)
+  on its `span`, as `users/_mention` does, because the editor needs it and a sanitizer drops it from a message.
+- `sounds:` names the bodies of exactly `/play NAME` the sanitizer draws instead of the cleaned text: each is its
+  text or its image (a file under the digest mount, with its width and height), the sound file is `NAME.mp3` under
+  the same mount, and `sound_partials:` names the two partials (`text` reads `url` and `text`; `image` reads `url`,
+  `src`, `width` and `height`). `{% if body|sound :message_body %}` is true for such a body, so the view can leave
+  out the wrapper it puts around text. A name the table lacks is an ordinary body.
+- A partial a sanitizer draws is compiled like any other, with `{{ }}` escaping, `{% if %}` and `{{ asset_path }}`,
+  but it takes no layout and its markers read only the arguments above. The compiler adds the `scraper` crate to
+  a crate that draws attachments.
 
 ## The boundary: a view is a page the *server* renders
 
@@ -281,7 +434,7 @@ neither of which the compiler evaluates.
 Each of these is refused by name and pinned by a fixture under `test/refusals/`:
 
 - a marker naming a local the render does not pass, and a local no marker reads;
-- an unknown directive (`{% unless x %}`), a marker that is not one of the ten forms, and a filter other than
+- an unknown directive (`{% unless x %}`), a marker that is not one of the twelve forms, and a filter other than
   `|raw` or `|sanitize`;
 - `|sanitize` on a number, bool, list or record: the sanitiser takes HTML text;
 - a `{% for %}` that is never closed, an `{% endfor %}` with no `{% for %}`, a loop variable used outside its loop,
@@ -292,6 +445,10 @@ Each of these is refused by name and pinned by a fixture under `test/refusals/`:
   nil-able value;
 - `{% raw %}` with no `{% endraw %}`, and `{% endraw %}` with no `{% raw %}`;
 - `{{ yield }}` in a view rendered with no layout, and a layout that writes no `{{ yield }}`;
+- `{{ yield :name }}` outside a layout (no layout, in the page, in a partial) or with a filter or a non-symbol;
+  `{% content_for %}` with no name, with no layout, in a layout, inside a `{% for %}`, an `{% if %}` or another
+  `{% content_for %}` (also through a partial), never closed or stray (`{% endcontent_for %}`); and a region the
+  page fills that the layout never writes;
 - a `render` naming a view that is not there, and a name whose extension is not `.html` — the escaping context
   is inferred from the extension, as Askama does, so a `.erb`, `.vue` or `.md` file is not a view and is refused
   rather than read as HTML;

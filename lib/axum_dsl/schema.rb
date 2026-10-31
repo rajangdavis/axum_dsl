@@ -7,6 +7,8 @@ module AxumDsl
   # Field types beyond the scalars: lists of strings, integers or floats. A field may also name another
   # params struct (a CamelCase symbol) to nest an object.
   FIELD_LISTS = %i[string_list i64_list f64_list].freeze
+  # A file chosen in a multipart form (docs/dsl.md, "Uploads"): `field :avatar, :upload, in: :form, name: "user[avatar]"`.
+  FIELD_UPLOADS = %i[upload].freeze
   # JSON schema string formats a field can advertise (:date_time is "date-time"). They are advice to the
   # client, as the JSON Schema standard treats `format`, not something the server checks.
   FORMATS = %i[uri email date_time date uuid hostname ipv4 ipv6].freeze
@@ -14,9 +16,9 @@ module AxumDsl
   # compiler's own, :rails is Rails' classic MessageVerifier value, and :rails7 is the JSON/metadata format a Rails 7/8 app writes. Cookies::FORMATS names the module for each.
   COOKIE_FORMATS = %i[hmac rails rails7].freeze
   # The middleware a top-level `use_layer` names. Each tower-http layer needs its own Cargo feature (see
-  # Emit::LAYER_FEATURES); `:fetch_metadata`, `:rate_limit`, `:csrf` and `:private_cache` are the
+  # Emit::LAYER_FEATURES); `:fetch_metadata`, `:rate_limit`, `:csrf`, `:private_cache` and `:method_override` are the
   # compiler's own middleware and need none (docs/sessions.md, docs/dsl.md).
-  LAYERS = %i[compression cors timeout trace fetch_metadata rate_limit csrf private_cache].freeze
+  LAYERS = %i[compression cors timeout trace fetch_metadata rate_limit csrf private_cache rack_defaults front method_override].freeze
 
   # Types a helper declares for its arguments and result. Lists are spelled out, and a trailing ? means
   # nil-able: string? is "a string or nil".
@@ -36,9 +38,11 @@ module AxumDsl
   # settings the `server` declaration carries. `set :listener, "tls::TlsListener"` names a Rust type from a
   # rust_file that the emitted main binds in place of tokio's TcpListener (the TLS hook), and
   # `set :log, :text` or `:json` picks the format of the log subscriber (see Emit#log_format), and
-  # `set :rust, :none` refuses every declaration that injects Rust of the file's own (docs/sessions.md).
+  # `set :rust, :none` refuses every declaration that injects Rust of the file's own (docs/sessions.md), and
+  # `set :trust_forwarded_for, true` makes request_ip trust X-Forwarded-For without the trace layer (docs/sessions.md).
   SETTINGS = { port: :uint, bind: :str, name: :str, version: :str, public_folder: :str,
-               views: :str, layout: :setting, listener: :str, log: :setting, rust: :setting }.freeze
+               views: :str, layout: :setting, listener: :str, log: :setting, rust: :setting,
+               trust_forwarded_for: :bool }.freeze
 
   SNAKE  = /\A[a-z][a-z0-9_]*\z/
   CAMEL  = /\A[A-Z][A-Za-z0-9]*\z/
@@ -59,7 +63,7 @@ module AxumDsl
   # method and path at run time, and a name no `before` declares is refused (docs/sessions.md).
   ROUTE_DECL = {
     in: :top, names: [:path], pos: [:str],
-    kw: { params: [:camel, false], description: [:str, false], skip: [:snakes, false] },
+    kw: { params: [:camel, false], description: [:str, false], skip: [:snakes, false], cache: [[:private], false] },
     block: :body
   }.freeze
 
@@ -118,13 +122,33 @@ module AxumDsl
     # answers an empty 404 for a missing file and for a path holding `..` or a backslash. The directory is
     # copied into the emitted crate at the same relative path, so the running service finds it beside its
     # own Cargo.toml; `set :public_folder, "public"` is the same mount at "/". With `digest: true` every file
-    # is copied under `<stem>-<sha256 prefix><ext>` and only that name is served, and a view writes the URL
+    # is copied under `<stem>-<8 hex digits><ext>`, the digits Propshaft computes (AxumDsl::Propshaft; `version:` is
+    # its assets version, "1.0" by default), a CSS file's `url(...)` names are rewritten to those names, and only that
+    # name is served without Accept-Ranges; `max_age:` adds `Cache-Control: max-age=N, public`. A view writes the URL
     # with `{{ asset_path "campfire.css" }}` (see docs/views.md). A named `before` filter covers a mount like a
     # route; `skip:` lists the filters the mount does not run, which keeps an asset directory public.
-    static: { in: :top, names: [:prefix], pos: [:str], kw: { dir: [:str, true], digest: [:bool, false], skip: [:snakes, false] }, block: nil },
+    static: { in: :top, names: [:prefix], pos: [:str], kw: { dir: [:str, true], digest: [:bool, false], version: [:str, false], max_age: [:uint, false], skip: [:snakes, false] }, block: nil },
     # serve_file "/report.txt", from: "public/report.txt" answers one route with one file (tower-http
-    # ServeFile), copied into the emitted crate the same way.
-    serve_file: { in: :top, names: [:path], pos: [:str], kw: { from: [:str, true] }, block: nil },
+    # ServeFile), copied into the emitted crate the same way. `skip:` lists the named `before` filters the route
+    # does not run, as a route's does.
+    serve_file: { in: :top, names: [:path], pos: [:str], kw: { from: [:str, true], max_age: [:uint, false], skip: [:snakes, false] }, block: nil },
+    # cable "/cable", authenticate_with: :user do channel "HeartbeatChannel" ... end declares an Action Cable endpoint
+    # (docs/cable.md): a WebSocket upgrade at the path that speaks the `actioncable-v1-json` protocol. The connection
+    # is authenticated by the named `current` (nil answers `disconnect unauthorized`), and each `channel` is a
+    # subscription the client may confirm: `signed_stream:` names the setting a Turbo signed stream name is verified
+    # with, `room_param:` the identifier key holding a room id, and `member_of:` the query that says whether the user
+    # may enter that room. A named `before` filter does not run for the path: the endpoint authenticates itself.
+    cable: { in: :top, names: [:path], pos: [:str], kw: { authenticate_with: [:snake, true] }, block: :decls },
+    # A channel's block is optional and holds its callbacks (docs/cable.md): `stream_from { ... }` and `stream_for { ... }` end
+    # in the broadcasting name the subscription listens to, `after_subscribe` and `on_unsubscribe` run when it is joined
+    # and left, and `perform :action { ... }` answers a client's `message` command of that action. Each takes the
+    # values it names as block parameters (`|user, room_id|`).
+    channel: { in: :cable, names: [:name], pos: [:str], kw: { signed_stream: [:snake, false], room_param: [:snake, false], member_of: [:snake, false], on_subscribe: [:snake, false] }, block: :decls, optional_block: true },
+    stream_from: { in: :channel, names: [], pos: [], kw: {}, block: :body },
+    stream_for: { in: :channel, names: [], pos: [], kw: {}, block: :body },
+    after_subscribe: { in: :channel, names: [], pos: [], kw: {}, block: :body },
+    on_unsubscribe: { in: :channel, names: [], pos: [], kw: {}, block: :body },
+    perform: { in: :channel, names: [:action], pos: [:snake], kw: {}, block: :body },
     # openapi "/openapi.json" makes the compiler write an OpenAPI 3.1 document of the routes below and has the
     # service answer GET at that path with it (lib/axum_dsl/openapi.rb). `title:` and `version:` default to
     # the server's name and version.
@@ -142,7 +166,8 @@ module AxumDsl
             multiple_of: [:num, false], min_length: [:uint, false], max_length: [:uint, false],
             pattern: [:str, false], enum: [:strs, false], format: [FORMATS, false],
             min_items: [:uint, false], max_items: [:uint, false],
-            in: [[:path, :query, :body, :form], false], name: [:str, false] },
+            in: [[:path, :query, :body, :form], false], name: [:str, false],
+            from: [:snake, false] }, # a record's list field: the query that fills it (docs/database.md)
       block: nil
     },
     # use_layer :compression (or :cors, :timeout, :trace) names a tower-http middleware the whole router
@@ -155,9 +180,18 @@ module AxumDsl
     # takes `per:`, `burst:` and an optional `path:` (the compiler's own limiter, see docs/dsl.md), and
     # `:private_cache` appends `Cache-Control: private, no-cache` and `Vary: Cookie`; its `except:` lists
     # path prefixes served by a `static` mount that leave the layer off (only public files may be named).
+    # `:rack_defaults` is Rails' default response headers for rendered HTML, one keyword per part
+    # (`security_headers:`, `version:`/`revision:` setting names, `etag:`, `vary_accept:`, `preload:`,
+    # `refresh_cookies:`, `session_cookie:`, `except:`; see docs/dsl.md). `:front` is what Rack::Deflater and
+    # Thruster do in front of a Rails app (gzip, `Vary: Accept-Encoding`, `X-Cache`, a response cache); `cache_mb:`
+    # sizes the cache, 0 turns it off. `:method_override` is Rack::MethodOverride: a POST whose `_method` form field
+    # (or X-HTTP-Method-Override header) names PATCH, DELETE, ... is routed as that method; it takes no keywords.
     use_layer: { in: :top, names: [:name], pos: [LAYERS],
                  kw: { origins: [:strs, false], secs: [:uint, false], forwarded: [:bool, false],
-                       per: [:uint, false], burst: [:uint, false], path: [:str, false], except: [:strs, false] }, block: nil },
+                       per: [:uint, false], burst: [:uint, false], path: [:str, false], except: [:strs, false],
+                       security_headers: [:bool, false], version: [:snake, false], revision: [:snake, false],
+                       etag: [:bool, false], vary_accept: [:bool, false], preload: [:strs, false],
+                       refresh_cookies: [:strs, false], session_cookie: [:str, false], cache_mb: [:uint, false] }, block: nil },
     get: ROUTE_DECL,
     post: ROUTE_DECL,
     put: ROUTE_DECL,
@@ -195,6 +229,15 @@ module AxumDsl
     # one with set_cookie / delete_cookie; a cookie call may override the format, and signed: false is a plain
     # cookie. One declaration per file.
     cookies: { in: :top, names: [], pos: [], kw: { secret: [:snake, true], format: [COOKIE_FORMATS, false] }, block: nil },
+    # A named HTML allowlist for a view's `{{ body|sanitize :name }}` (docs/views.md): `sanitizer :message_body, tags: %w[p a ...],
+    # attributes: %w[href class]` allows exactly those tags and those attributes (on any tag), `link_rel: false` keeps
+    # ammonia from adding `rel="noopener noreferrer"` to links, and `autolink_target: "_blank"` links bare URLs and
+    # e-mail addresses afterwards as Rails' auto_link does. `attachments: { "<content-type>" => :partial }` renders an
+    # <action-text-attachment> of that type with the named view partial; `sounds:` and `sound_partials:` render a body
+    # that is only `/play NAME` (docs/views.md, "Declared sanitizers").
+    sanitizer: { in: :top, names: [:name], pos: [:snake],
+                 kw: { tags: [:strs, true], attributes: [:strs, true], link_rel: [:bool, false], autolink_target: [:str, false],
+                      attachments: [:hash, false], sounds: [:hash, false], sound_partials: [:hash, false] }, block: nil },
     # A per-request value, computed at most once on its first use: `current :user, returns: :User? do ... end`.
     # The block is a body that may call queries, cookie(:name), request_ip, helpers and the currents above it;
     # a route or a filter reads it with current(:user). `returns:` is what a query's `returns:` is.
@@ -232,7 +275,7 @@ module AxumDsl
     # file "python/x.py", as: :x loads any file beside the DSL file; the service reads it from disk on each
     # call. `entries:` names the Python functions it calls, checked against the file.
     file: { in: :top, names: [:path], pos: [:str],
-            kw: { as: [:snake, true], env: [:str, false], entries: [:snakes, false], unchecked: [:file_checks, false] }, block: nil },
+            kw: { as: [:snake, true], env: [:str, false], entries: [:snakes, false], unchecked: [:file_checks, false], binary: [:bool, false] }, block: nil },
     # Subprocess escape hatches (any language). Arguments are separate argv entries or stdin,
     # never shell text. Called from bodies as rust(:name, ...) like any rust_fn.
     cmd_fn: { in: :top, names: [:name], pos: [:snake],

@@ -20,8 +20,9 @@ module AxumDsl
       }
     RS
 
-    # request_ip: the peer's address; with `use_layer :trace, forwarded: true` the first X-Forwarded-For entry
-    # first, which is the trust that layer already declares (see Emit::CLIENT_SPAN).
+    # request_ip: the peer's address; with `use_layer :trace, forwarded: true` or `set :trust_forwarded_for, true`
+    # the first X-Forwarded-For entry first. Rails' ActionDispatch::RemoteIp trusts the header from a private or
+    # loopback proxy, so request.remote_ip is the visitor's address rather than the proxy's.
     REQUEST_IP_FORWARDED = <<~'RS'
       fn axum_dsl_request_ip(headers: &::axum::http::HeaderMap, peer: Option<::std::net::SocketAddr>) -> String {
           let forwarded = headers
@@ -49,6 +50,44 @@ module AxumDsl
               .and_then(|value| value.to_str().ok())
               .unwrap_or_default()
               .to_string()
+      }
+    RS
+
+    TURBO_FRAME_REQUEST = <<~'RS'
+      fn axum_dsl_turbo_frame_request(headers: &::axum::http::HeaderMap) -> bool {
+          headers
+              .get("turbo-frame")
+              .and_then(|value| value.to_str().ok())
+              .map_or(false, |value| !value.trim().is_empty())
+      }
+    RS
+
+    # request_base_url: Rails' request.base_url, the scheme and host the client asked for: the Host header and http,
+    # or no host at all (an empty string). With `use_layer :trace, forwarded: true` the last X-Forwarded-Host entry
+    # comes first and the first X-Forwarded-Proto entry may make the scheme https; `set :trust_forwarded_for` does
+    # not widen this trust, which would let a client choose the host.
+    REQUEST_BASE_URL_PLAIN = <<~'RS'
+      fn axum_dsl_request_base_url(headers: &::axum::http::HeaderMap) -> String {
+          match headers.get("host").and_then(|value| value.to_str().ok()).map(|entry| entry.trim()).filter(|entry| !entry.is_empty()) {
+              Some(host) => format!("http://{}", host),
+              None => String::new(),
+          }
+      }
+    RS
+
+    REQUEST_BASE_URL_FORWARDED = <<~'RS'
+      fn axum_dsl_request_base_url(headers: &::axum::http::HeaderMap) -> String {
+          let header = |name: &str| headers.get(name).and_then(|value| value.to_str().ok());
+          let host = header("x-forwarded-host")
+              .and_then(|value| value.split(',').last())
+              .map(|entry| entry.trim())
+              .filter(|entry| !entry.is_empty())
+              .or_else(|| header("host").map(|entry| entry.trim()).filter(|entry| !entry.is_empty()));
+          let Some(host) = host else { return String::new() };
+          let https = header("x-forwarded-proto")
+              .and_then(|value| value.split(',').next())
+              .is_some_and(|entry| entry.trim().eq_ignore_ascii_case("https"));
+          format!("{}://{}", if https { "https" } else { "http" }, host)
       }
     RS
 
@@ -99,7 +138,9 @@ module AxumDsl
     RS
 
     # A route pattern (`/rooms/{id}`) against the concrete path of a request, for a named filter's `skip:` list:
-    # a `{name}` segment matches a non-empty segment, a `{*name}` tail matches the rest, a literal is equal. The
+    # a `{name}` segment matches a non-empty segment, a `{*name}` tail matches the rest, a literal is equal, and a
+    # segment with text around its capture (`@{id}`, `{id}.json`) matches a part that has that prefix and suffix
+    # and something between them. (Without that, a cached `@{id}` route never found its ticket: a 500.) The
     # compiler refuses a skip that could also match a route which does not skip it (Reader#check_filter_skips).
     SKIP_MATCH = <<~'RS'
       fn axum_dsl_skip_match(pattern: &str, path: &str) -> bool {
@@ -112,8 +153,9 @@ module AxumDsl
                       if segment.starts_with("{*") {
                           return true;
                       }
-                      if segment.starts_with('{') && segment.ends_with('}') {
-                          if part.is_empty() {
+                      if let (Some(open), Some(close)) = (segment.find('{'), segment.rfind('}')) {
+                          let (prefix, suffix) = (&segment[..open], &segment[close + 1..]);
+                          if part.len() <= prefix.len() + suffix.len() || !part.starts_with(prefix) || !part.ends_with(suffix) {
                               return false;
                           }
                       } else if segment != part {
@@ -146,6 +188,11 @@ module AxumDsl
 
     def forwarded?(ir) = ir["layers"].to_a.any? { |l| l["name"] == "trace" && l["forwarded"] }
 
+    # request_ip reads X-Forwarded-For under the trace layer's trust or `set :trust_forwarded_for, true`, the service
+    # option that trusts the header without turning logging on or trusting X-Forwarded-Host/Proto (which stay the
+    # trace layer's alone, as ActionDispatch::RemoteIp only makes request.remote_ip the visitor's address).
+    def request_ip_forwarded?(ir) = forwarded?(ir) || ir["trust_forwarded_for"] == true
+
     # The Cargo.toml dependency lines, each led by a newline: rand for random_token, bcrypt for Bcrypt.
     def deps(ir)
       out = []
@@ -164,14 +211,16 @@ module AxumDsl
       out = []
       add = ->(text) { out.concat(lines(text)) << "" }
       add.call(RANDOM_TOKEN) if builtin?(ir, "random_token")
-      add.call(forwarded?(ir) ? REQUEST_IP_FORWARDED : REQUEST_IP_PEER) if builtin?(ir, "request_ip")
+      add.call(request_ip_forwarded?(ir) ? REQUEST_IP_FORWARDED : REQUEST_IP_PEER) if builtin?(ir, "request_ip")
+      add.call(forwarded?(ir) ? REQUEST_BASE_URL_FORWARDED : REQUEST_BASE_URL_PLAIN) if builtin?(ir, "request_base_url")
       add.call(USER_AGENT) if builtin?(ir, "user_agent")
+      add.call(TURBO_FRAME_REQUEST) if builtin?(ir, "turbo_frame_request?")
       add.call(BCRYPT_VERIFY) if builtin?(ir, "bcrypt_verify")
       add.call(BCRYPT_HASH) if builtin?(ir, "bcrypt_hash")
       add.call(FETCH_METADATA) if ir["layers"].to_a.any? { |l| l["name"] == "fetch_metadata" }
       add.call(REQUIRED_CURRENT) if ir["required_current"]
       add.call(SKIP_MATCH) if ir["filter_skips"]
-      out.empty? ? out : ["// sessions runtime (random_token, request_ip, user_agent, Bcrypt, the current and filter helpers): written by the compiler", *out]
+      out.empty? ? out : ["// sessions runtime (random_token, request_ip, request_base_url, user_agent, Bcrypt, the current and filter helpers): written by the compiler", *out]
     end
 
     def current_rust(c)
@@ -186,7 +235,11 @@ module AxumDsl
     # A request holds it in its extensions as an Arc, so a `before` filter and the route read the same one.
     def currents_lines(ir)
       cells = ir["currents"].map { |c| "    #{c['name']}: ::tokio::sync::OnceCell<#{current_rust(c)}>," }
+      # The cable endpoint reads its `authenticate_with:` current outside these cells, so a current only the cable reads
+      # leaves its cell unread.
+      unread = Cable.used?(ir) ? ["#[allow(dead_code)]"] : []
       ["// the per-request values of `current`: each is computed on its first read and kept for the request: written by the compiler",
+       *unread,
        "#[derive(Default)]",
        "struct AxumDslCurrents {",
        *cells,

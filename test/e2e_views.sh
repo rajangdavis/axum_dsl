@@ -294,10 +294,10 @@ if [ -d "$dir/views" ]; then
 else
 	ok "the crate carries no views/ directory"
 fi
-if grep -F -q '{{{{ client_side }}}}' "$dir/src/main.rs"; then
-	ok "the view's text is in the emitted Rust, with format!'s braces doubled"
+if grep -F -q '{{ client_side }}' "$dir/src/main.rs"; then
+	ok "the view's text is in the emitted Rust, pushed into the render buffer as written"
 else
-	no "src/main.rs holds no doubled-brace copy of the raw region, so a view was not compiled in"
+	no "src/main.rs holds no copy of the raw region, so a view was not compiled in"
 fi
 
 if [ "$failed" -ne 0 ]; then

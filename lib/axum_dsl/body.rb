@@ -30,8 +30,10 @@ module AxumDsl
     # calls on a value (ALLOWED_METHODS, above) are the other half of the surface: Sorbet's own String, Array
     # and Hash rbis declare those, together with the Rust::Str section of the generated rbi.
     BODY_CALLS = %i[params errors text json html halt redirect status content_type headers etag setting rust
-                    file_text file_path entry entry_args h raw render send_file rails_signed_id
-                    cookie set_cookie delete_cookie random_token request_ip user_agent current transaction].freeze
+                    file_text file_path entry entry_args h raw render send_file rails_signed_id rails_signed_id_for
+                    turbo_signed_stream_name global_id_param rails_signed_global_id json_object json_array urlsafe_base64 urlsafe_decode64 qr_code_svg active_storage_disk_path active_storage_verified_id active_storage_verified_key inline_disposition crc32 url_encode plain_text request_body
+                    cookie set_cookie delete_cookie random_token request_ip request_base_url request_path request_method user_agent turbo_frame_request? current transaction
+                    broadcast broadcast_to broadcast_turbo close_remote_connections render_string].freeze
 
     # The response helpers and the statuses and types they name (Sinatra's spelling, axum's semantics). A
     # route body, and the filters around it, is a body that answers an HTTP request: the reader passes
@@ -50,12 +52,20 @@ module AxumDsl
     # The statuses `redirect(path, status: N)` accepts: the ones HTTP defines for a redirect.
     REDIRECT_STATUSES = [301, 302, 303, 307, 308].freeze
     # What a redirect path may interpolate: `format!` writes an integer, a float or a bool as digits, a
-    # sign or true/false, and no header value rejects those; a string could carry a control byte.
+    # sign or true/false, and no header value rejects those; any other string could carry a control byte,
+    # except url_encode(...), whose output is ASCII by construction (interp allows exactly that call).
     HEADER_SCALARS = %i[i32 i64 f64 bool int].freeze
     # The Rust local the emitted handler binds the generated check()'s messages in, and what a body's
     # `errors[:field]` reads (emit.rb: check_impl, errors_binding). Dunder-named so no field of a params
     # group can shadow it in the destructuring that follows the extractors.
     ERRORS_MAP = "__errors"
+    # The value of an `:upload` field (docs/dsl.md, "Uploads"): read like a nested object (`avatar.filename`, `avatar&.size`),
+    # and Rust's AxumDslUpload (multipart.rb) has exactly these fields. `avatar.store(root)` is the one method.
+    UPLOAD_STRUCT = { "name" => "Upload", "fields" => [{ "name" => "filename", "type" => "string" },
+                                                      { "name" => "content_type", "type" => "string" },
+                                                      { "name" => "size", "type" => "i64" },
+                                                      { "name" => "checksum", "type" => "string" },
+                                                      { "name" => "metadata", "type" => "string" }] }.freeze
     # Sinatra's status symbols, mapped to axum's StatusCode variants. An integer status is built from it.
     STATUS_CODES = {
       ok: "OK", created: "CREATED", accepted: "ACCEPTED", no_content: "NO_CONTENT",
@@ -111,7 +121,7 @@ module AxumDsl
     def initialize(path, params, regexes = [], externs = {}, flags = {}, tool = nil, bindings = {}, helpers = {}, structs = [], outputs = [], mime_type: nil, kind: nil, skip: [])
       @path = path
       @outputs = outputs # structured results a tool may build with Name.new(...)
-      @structs = structs # every params struct, so a nested object's fields can be read
+      @structs = structs + [UPLOAD_STRUCT] # every params struct (and the :upload value), so a nested object's fields can be read
       # A query record derives Clone (db/sqlite.rb), so a record local is cloned where Rust would move it.
       @record_types = structs.filter_map { |s| :"struct:#{s['name']}" if s["kind"] == "record" }
       @helpers = helpers # helpers declared above this body: name -> record (see Reader#helper_decl)
@@ -138,7 +148,8 @@ module AxumDsl
       @content_type = nil   # a `content_type(...)` statement's type, the response default the emitter sets
       @headers = nil        # a `headers(...)` statement's response headers, as [name, value] pairs
       @etag = nil           # an `etag(value)` statement's value (a Rust String expression), applied by the emitter
-      @needs = {}           # what the body reads of the request: :headers, :peer, :currents (the emitter binds exactly these)
+      @computed_headers = [] # a `headers(...)` statement's computed values, as [name, Rust String expression] pairs
+      @needs = {}           # what the body reads of the request: :headers, :method, :path, :peer, :currents (the emitter binds exactly these)
       @cookies_written = false # a `set_cookie` / `delete_cookie` statement: the emitter keeps the Set-Cookie lines
 
       @read = {}       # names of locals / block parameters that are read somewhere
@@ -196,6 +207,7 @@ module AxumDsl
       body = { "args" => names, "locals" => lets, "expr" => e, "type" => type, "fallible" => @fallible,
                "uses_async" => @uses_async, "async_reason" => @async_reason, "uses_uri" => @used_read_uri,
                "content_type" => @content_type&.to_s, "status" => @status, "headers" => @headers, "etag" => @etag }
+      body["computed_headers"] = @computed_headers unless @computed_headers.empty?
       # The emitter binds the check's own messages for a route whose body read errors (emit.rb: route_fn,
       # response_expr); a body that never reads them leaves this out, so every other route emits exactly
       # what it emitted before.
@@ -218,6 +230,7 @@ module AxumDsl
 
       hint = if what == "local" then "remove it, or use it"
              elsif @helper then "remove it from the helper's `args:` and its |...| list"
+             elsif @kind == :cable then "remove it from the |...| list"
              else "remove it from the |...| list (callers still send that field)"
              end
       bad(node, "#{what} `#{name}` is never read; #{hint}")
@@ -262,13 +275,15 @@ module AxumDsl
     def statement(n, env)
       return status_stmt(n, args_of(n)) if route_stmt?(n, :status)
       return content_type_stmt(n, args_of(n)) if route_stmt?(n, :content_type)
-      return headers_stmt(n, args_of(n)) if route_stmt?(n, :headers)
+      return headers_stmt(n, args_of(n), env) if route_stmt?(n, :headers)
       return etag_stmt(n, args_of(n), env) if route_stmt?(n, :etag)
       return set_cookie_stmt(n, args_of(n), env) if cookie_stmt?(n, :set_cookie)
       return delete_cookie_stmt(n, args_of(n)) if cookie_stmt?(n, :delete_cookie)
+      return [conditional(n, env)] if conditional_statement?(n)
       return [guard(n, env)] if n.is_a?(Prism::IfNode) || n.is_a?(Prism::UnlessNode)
       return each_stmt(n, env) if each_call?(n)
       return query_stmt(n, env) if bare_query_call?(n)
+      return query_stmt(n, env) if cable_call?(n)
 
       let_stmt(n, env)
     end
@@ -382,6 +397,30 @@ module AxumDsl
     def guard_clause?(n)
       (n.is_a?(Prism::IfNode) && n.subsequent.nil?) || (n.is_a?(Prism::UnlessNode) && n.else_clause.nil?)
     end
+
+
+
+    # A non-guard conditional in statement position: an `if`/`unless` with no else whose body is only
+    # effectful statements (queries, executes, another conditional or a local assignment). The body is
+    # emitted as a Rust block and the route continues after it.
+    def conditional_statement?(n)
+      return false unless guard_clause?(n)
+
+      st = n.statements
+      st.is_a?(Prism::StatementsNode) && !st.body.empty? &&
+        st.body.all? { |s| bare_query_call?(s) || s.is_a?(Prism::LocalVariableWriteNode) || conditional_statement?(s) }
+    end
+
+    def conditional(n, env)
+      c = expr(n.predicate, env)
+      bad(n.predicate, "condition must be bool, got #{c[1]}") unless c[1] == :bool
+      st = n.statements
+      bad(n, "a conditional statement needs a body") unless st.is_a?(Prism::StatementsNode) && !st.body.empty?
+      lines = st.body.flat_map { |s| statement(s, env) }
+      test = n.is_a?(Prism::UnlessNode) ? "!#{wrap(c)}" : c[0]
+      "if #{test} { #{lines.join(' ')} }"
+    end
+
     # The one place every expression is typed; with --types each typed node is also reported.
     def expr(n, env, header: false)
       r = expr_node(n, env, header)
@@ -625,8 +664,13 @@ module AxumDsl
           bad(part, "an object cannot go inside a string; read one of its fields") if object_type?(v[1])
           bad(part, "a content block cannot go inside a string; return it from the body") if %i[block blocks].include?(v[1])
           bad(part, "a secret cannot go inside text, where it could be returned or logged; pass it to a binding or rust_fn function") if v[1] == :secret
-          if header && !HEADER_SCALARS.include?(v[1])
-            bad(st.body[0], "a redirect path can interpolate only a number (i32, i64 or f64) or a bool, because the path becomes the Location header and a string value could carry a byte the header rejects; write redirect(\"/rooms/\#{room_id}\") with an integer, or a literal path")
+          # url_encode(...) is the one string a redirect path may carry: its result is ASCII by construction
+          # (the kept characters, '+', and %XX), so no byte of it can be one a header value rejects.
+          # Rails builds such a query the same way, e.g. new_session_url(email_address: "david@37signals.com")
+          # writes ?email_address=david%4037signals.com.
+          encoded = st.body[0].is_a?(Prism::CallNode) && st.body[0].name == :url_encode && st.body[0].receiver.nil?
+          if header && !HEADER_SCALARS.include?(v[1]) && !encoded
+            bad(st.body[0], "a redirect path can interpolate only a number (i32, i64 or f64), a bool, or a url_encode(...) call, because the path becomes the Location header and any other string value could carry a byte the header rejects; write redirect(\"/rooms/\#{room_id}\") with an integer, redirect(\"/x?q=\#{url_encode(text)}\") with an encoded query value, or a literal path")
           end
           vals << (v[1] == :f64 ? f64_str(v[0]) : v[0])
         else bad(part, "unsupported #{nodename(part)} in string")
@@ -679,6 +723,26 @@ module AxumDsl
       return output_new(n, args, env) if name == :result && n.receiver.nil?
       return setting_call(n, args) if name == :setting && n.receiver.nil?
       return rails_signed_id_call(n, args, env) if name == :rails_signed_id && n.receiver.nil?
+      return rails_signed_id_for_call(n, args, env) if name == :rails_signed_id_for && n.receiver.nil?
+      return turbo_signed_stream_name_call(n, args, env) if name == :turbo_signed_stream_name && n.receiver.nil?
+      return global_id_param_call(n, args, env) if name == :global_id_param && n.receiver.nil?
+      return rails_signed_global_id_call(n, args, env) if name == :rails_signed_global_id && n.receiver.nil?
+      return json_object_call(n, args, env) if name == :json_object && n.receiver.nil?
+      return json_array_call(n, args, env) if name == :json_array && n.receiver.nil?
+      return broadcast_call(n, args, env) if name == :broadcast && n.receiver.nil?
+      return broadcast_to_call(n, args, env) if name == :broadcast_to && n.receiver.nil?
+      return broadcast_turbo_call(n, args, env) if name == :broadcast_turbo && n.receiver.nil?
+      return close_remote_connections_call(n, args, env) if name == :close_remote_connections && n.receiver.nil?
+      return render_string_call(n, args, env) if name == :render_string && n.receiver.nil?
+      return urlsafe_base64_call(n, args, env) if name == :urlsafe_base64 && n.receiver.nil?
+      return active_storage_call(n, name, args, env) if STORAGE_CALLS.key?(name) && n.receiver.nil?
+      return inline_disposition_call(n, args, env) if name == :inline_disposition && n.receiver.nil?
+      return urlsafe_decode64_call(n, args, env) if name == :urlsafe_decode64 && n.receiver.nil?
+      return qr_code_svg_call(n, args, env) if name == :qr_code_svg && n.receiver.nil?
+      return crc32_call(n, args, env) if name == :crc32 && n.receiver.nil?
+      return url_encode_call(n, args, env) if name == :url_encode && n.receiver.nil?
+      return plain_text_call(n, args, env) if name == :plain_text && n.receiver.nil?
+      return request_body_call(n, args) if name == :request_body && n.receiver.nil?
       return cookie_call(n, args) if name == :cookie && n.receiver.nil?
       return current_call(n, args) if name == :current && n.receiver.nil?
       return request_value_call(n, args) if REQUEST_VALUES.include?(name) && n.receiver.nil?
@@ -708,6 +772,7 @@ module AxumDsl
       recv = expr(n.receiver, env)
       bad(n, "a secret has no methods (not `#{name}`): it can only be passed to a binding or rust_fn function") if recv[1] == :secret
       return rust_str_call(n, name, args, recv, env) if recv[1] == :r_str
+      return upload_store_call(n, args, recv, env) if recv[1] == :"struct:Upload" && name == :store
       return struct_field(n, name, recv) if recv[1].to_s.start_with?("struct:") && args.empty?
       if record?(recv[1])
         bad(n, "#{opaque_name(recv[1])} is read-only here; a binding function creates records") if name.to_s.end_with?("=")
@@ -1023,6 +1088,9 @@ module AxumDsl
     # inside a list block. A body cannot end in `return`: end it in the value itself.
     def return_expr(node, env)
       args = node.arguments ? node.arguments.arguments : []
+      # A channel callback that does not answer a value leaves with a bare `return`, as a guard clause does.
+      return ["return Ok(())", :never, false] if @kind == :cable && @ret == :unit && args.empty?
+
       bad(node, "`return` needs exactly one string value") unless args.size == 1
       v = expr(args[0], env)
       # A route answers with a response: `return halt(404) if note.nil?` leaves with it.
@@ -1309,7 +1377,7 @@ module AxumDsl
     def query_call(node, args, env)
       q = @flags["queries"].fetch(node.name.to_s)
       what = "#{q['kind']} `#{q['name']}`"
-      bad(node, "#{what} runs in a route, a filter or a `current` body, not in a helper or a binding") unless @route || @kind == :current
+      bad(node, "#{what} runs in a route, a filter or a `current` body, not in a helper or a binding") unless @route || %i[current cable].include?(@kind)
       bad(node, "#{what} cannot run in the `error` filter: it answers a request that already failed") if @kind == :error
       shape = "#{q['name']}(#{q['args'].map { |n, _| "#{n}: ..." }.join(', ')})"
       kwn = args.size == 1 && args[0].is_a?(Prism::KeywordHashNode) ? args[0] : nil
@@ -1378,6 +1446,8 @@ module AxumDsl
     # One statement before the final expression of a `transaction` block: `name = query/execute call`, or a
     # bare call. Everything else is refused here rather than lowering to Rust that has no rollback.
     def transaction_statement(n, env)
+      return [transaction_conditional(n, env)] if conditional_statement?(n)
+
       refusal = transaction_refusal(n)
       bad(n, refusal) if refusal
       if n.is_a?(Prism::LocalVariableWriteNode)
@@ -1390,6 +1460,20 @@ module AxumDsl
       return query_stmt(n, env) if transaction_call?(n)
 
       bad(n, transaction_non_sql(n, "stand"))
+    end
+
+
+
+    # A conditional statement inside a transaction: its body must be transaction statements (sync
+    # query/execute calls on the transaction connection), not the async pooled calls a route uses.
+    def transaction_conditional(n, env)
+      c = expr(n.predicate, env)
+      bad(n.predicate, "condition must be bool, got #{c[1]}") unless c[1] == :bool
+      st = n.statements
+      bad(n, "a conditional statement needs a body") unless st.is_a?(Prism::StatementsNode) && !st.body.empty?
+      lines = st.body.flat_map { |s| transaction_statement(s, env) }
+      test = n.is_a?(Prism::UnlessNode) ? "!#{wrap(c)}" : c[0]
+      "if #{test} { #{lines.join(' ')} }"
     end
 
     # The final expression of a `transaction` block: a statement call, or a local (the block's value).
@@ -2436,10 +2520,12 @@ module AxumDsl
       ["settings().#{name}.clone()", type, true]
     end
 
-    # rails_signed_id(token, purpose: "user/avatar", secret: :secret_key): the integer id inside a Rails 8
-    # signed ID, or nil when the token is not one this secret signed for this purpose. The secret names a
-    # required string setting (usually SECRET_KEY_BASE); the purpose is the full `"<model>/<purpose>"` Rails
-    # composes, because the compiler cannot infer a model from a token.
+    # rails_signed_id(token, purpose: "user/avatar", secret: :secret_key, check_expiry: false): the integer id
+    # inside a Rails 8 signed ID, or nil when the token is not one this secret signed for this purpose. The secret
+    # names a required string setting (usually SECRET_KEY_BASE); the purpose is the full `"<model>/<purpose>"`
+    # Rails composes, because the compiler cannot infer a model from a token. By default an `exp` in the envelope
+    # is refused; `check_expiry: true` is Rails' `verified(token, purpose:)`, which accepts a token with no exp
+    # and one whose exp is still in the future, and answers nil once it has passed.
     def rails_signed_id_call(node, args, env)
       rest = args.dup
       hash = rest.last.is_a?(Prism::KeywordHashNode) ? rest.pop : nil
@@ -2448,14 +2534,15 @@ module AxumDsl
       bad(rest[0], "rails_signed_id takes a token string, got #{TypeNames.display(token[1])}") unless %i[str string].include?(token[1])
       purpose = nil
       secret = nil
+      check_expiry = false
       seen = {}
       hash&.elements&.each do |el|
         unless el.is_a?(Prism::AssocNode) && el.key.is_a?(Prism::SymbolNode)
           bad(el, "unsupported #{nodename(el)} in rails_signed_id (write `purpose: \"user/avatar\", secret: :secret_key`)")
         end
         key = el.key.unescaped.to_sym
-        unless %i[purpose secret].include?(key)
-          bad(el, "unknown keyword `#{key}:` for rails_signed_id (allowed: purpose, secret)", word: key, from: %i[purpose secret])
+        unless %i[purpose secret check_expiry].include?(key)
+          bad(el, "unknown keyword `#{key}:` for rails_signed_id (allowed: purpose, secret, check_expiry)", word: key, from: %i[purpose secret check_expiry])
         end
         bad(el, "duplicate keyword `#{key}:`") if seen[key]
         seen[key] = true
@@ -2463,28 +2550,560 @@ module AxumDsl
           bad(el.value, "rails_signed_id's `purpose:` is a string literal, such as \"user/avatar\"") unless el.value.is_a?(Prism::StringNode)
           purpose = el.value.unescaped
           bad(el.value, "rails_signed_id's `purpose:` must not be empty") if purpose.empty?
+        elsif key == :check_expiry
+          unless el.value.is_a?(Prism::TrueNode) || el.value.is_a?(Prism::FalseNode)
+            bad(el.value, "rails_signed_id's `check_expiry:` is true or false, written out")
+          end
+          check_expiry = el.value.is_a?(Prism::TrueNode)
         else
           bad(el.value, "rails_signed_id's `secret:` is a setting name, such as :secret_key") unless el.value.is_a?(Prism::SymbolNode)
           secret = el.value.unescaped
         end
       end
       bad(node, "rails_signed_id needs `purpose:` and `secret:`") if purpose.nil? || secret.nil?
+      signed_secret!(node, "rails_signed_id", secret, "rails_signed_id")
+      token_arg = token[1] == :str ? token[0] : "&#{wrap(token)}"
+      ["axum_dsl_rails_signed_id(settings().#{secret}.as_bytes(), #{token_arg}, #{AxumDsl.rstr(purpose)}, #{check_expiry})", :oi64, true]
+    end
+
+    # The `secret:` of every signing call (rails_signed_id, rails_signed_id_for, turbo_signed_stream_name): a
+    # required string setting that holds SECRET_KEY_BASE, the one secret a service derives its keys from. Marks
+    # the setting used and the builtin's runtime needed. `who` is the call's name in a message.
+    def signed_secret!(node, who, secret, builtin)
       declared = @flags["settings"] || {}
       entry = declared[secret] or
         bad(node, "no setting `#{secret}` is declared#{declared.empty? ? '' : " (declared: #{declared.keys.join(', ')})"}; " \
-                  "rails_signed_id's `secret:` names the required string setting that holds SECRET_KEY_BASE",
+                  "#{who}'s `secret:` names the required string setting that holds SECRET_KEY_BASE",
             word: secret, from: declared.keys)
       if entry["type"] || entry["optional"]
-        bad(node, "rails_signed_id's `secret:` must name a required string setting, not #{entry['type'] ? "a `type: :#{entry['type']}`" : 'an optional'} one")
+        bad(node, "#{who}'s `secret:` must name a required string setting, not #{entry['type'] ? "a `type: :#{entry['type']}`" : 'an optional'} one")
       end
       if (earlier = @flags["signed_id_secret"]) && earlier != secret
-        bad(node, "rails_signed_id already uses setting `#{earlier}`; a service derives one signed-ID key per process, so every call must name the same `secret:`")
+        bad(node, "#{who} already uses setting `#{earlier}`; a service derives one signed-ID key per process, so every call must name the same `secret:`")
       end
       @flags["signed_id_secret"] = secret
       (@flags["used_settings"] ||= {})[secret] = true
-      (@flags["builtins"] ||= {})["rails_signed_id"] = true
-      token_arg = token[1] == :str ? token[0] : "&#{wrap(token)}"
-      ["axum_dsl_rails_signed_id(settings().#{secret}.as_bytes(), #{token_arg}, #{AxumDsl.rstr(purpose)})", :oi64, true]
+      (@flags["builtins"] ||= {})[builtin] = true
+    end
+
+    # The keyword hash of a signing call, as { key => value node }: only the allowed keys, each once, each
+    # written `key: value`. The caller checks the value nodes.
+    def signing_keywords(who, hash, allowed, example)
+      found = {}
+      hash&.elements&.each do |el|
+        unless el.is_a?(Prism::AssocNode) && el.key.is_a?(Prism::SymbolNode)
+          bad(el, "unsupported #{nodename(el)} in #{who} (write `#{example}`)")
+        end
+        key = el.key.unescaped.to_sym
+        bad(el, "unknown keyword `#{key}:` for #{who} (allowed: #{allowed.join(', ')})", word: key, from: allowed) unless allowed.include?(key)
+        bad(el, "duplicate keyword `#{key}:`") if found.key?(key)
+        found[key] = el.value
+      end
+      found
+    end
+
+    # A signing call's `secret:` as a setting name (a symbol literal), or a refusal.
+    def signing_secret(who, found, node)
+      bad(node, "#{who} needs `secret:`") unless found.key?(:secret)
+      bad(found[:secret], "#{who}'s `secret:` is a setting name, such as :secret_key") unless found[:secret].is_a?(Prism::SymbolNode)
+      found[:secret].unescaped
+    end
+
+    # A string literal argument or keyword of a signing call (no interpolation): its text, or a refusal.
+    def signing_literal(who, what, node)
+      bad(node, "#{who}'s #{what} is a string literal, such as \"user/avatar\"") unless node.is_a?(Prism::StringNode)
+      bad(node, "#{who}'s #{what} must not be empty") if node.unescaped.empty?
+      node.unescaped
+    end
+
+    # rails_signed_id_for(id, purpose: "user/avatar", secret: :secret_key): the token Rails' `signed_id(purpose:)`
+    # writes for an integer id, which rails_signed_id and Rails verify. Its secret and purpose follow
+    # rails_signed_id's rules.
+    def rails_signed_id_for_call(node, args, env)
+      rest = args.dup
+      hash = rest.last.is_a?(Prism::KeywordHashNode) ? rest.pop : nil
+      bad(node, "rails_signed_id_for takes exactly one id") unless rest.size == 1
+      id = expr(rest[0], env)
+      bad(rest[0], "rails_signed_id_for takes an integer id, got #{TypeNames.display(id[1])}") unless %i[i64 i32].include?(id[1])
+      found = signing_keywords("rails_signed_id_for", hash, %i[purpose secret expires_in], 'purpose: "user/avatar", secret: :secret_key')
+      bad(node, "rails_signed_id_for needs `purpose:` and `secret:`") unless found.key?(:purpose) && found.key?(:secret)
+      purpose = signing_literal("rails_signed_id_for", "`purpose:`", found[:purpose])
+      secret = signing_secret("rails_signed_id_for", found, node)
+      id_arg = id[1] == :i32 ? "i64::from(#{id[0]})" : wrap(id)
+      if found.key?(:expires_in)
+        seconds = found[:expires_in]
+        bad(seconds, "rails_signed_id_for's `expires_in:` is a positive integer literal of seconds, such as 14400 (4.hours)") unless seconds.is_a?(Prism::IntegerNode) && seconds.value.positive?
+        signed_secret!(node, "rails_signed_id_for", secret, "rails_signed_id_for_expiring")
+        return ["axum_dsl_rails_signed_id_for_expiring(settings().#{secret}.as_bytes(), #{id_arg}, #{AxumDsl.rstr(purpose)}, #{seconds.value})", :string, true]
+      end
+      signed_secret!(node, "rails_signed_id_for", secret, "rails_signed_id_for")
+      ["axum_dsl_rails_signed_id_for(settings().#{secret}.as_bytes(), #{id_arg}, #{AxumDsl.rstr(purpose)})", :string, true]
+    end
+
+    # rails_signed_global_id("User", user.id, app: "campfire", purpose: "attachable", secret: :secret_key):
+    # `record.attachable_sgid`, the SignedGlobalID token over "gid://<app>/<model>/<id>?expires_in", which
+    # Action Text's mention attachments and autocomplete prompt items carry. The app and purpose are string
+    # literals; the purpose defaults to "attachable", the only one Action Text uses.
+    def rails_signed_global_id_call(node, args, env)
+      rest = args.dup
+      hash = rest.last.is_a?(Prism::KeywordHashNode) ? rest.pop : nil
+      bad(node, "rails_signed_global_id takes a model name and an integer id") unless rest.size == 2
+      model = expr(rest[0], env)
+      bad(rest[0], "rails_signed_global_id's model is a string, got #{TypeNames.display(model[1])}") unless %i[str string].include?(model[1])
+      id = expr(rest[1], env)
+      bad(rest[1], "rails_signed_global_id's id is an integer, got #{TypeNames.display(id[1])}") unless %i[int i64 i32].include?(id[1])
+      found = signing_keywords("rails_signed_global_id", hash, %i[app purpose secret], 'app: "campfire", secret: :secret_key')
+      bad(node, "rails_signed_global_id needs `app:` and `secret:`") unless found.key?(:app) && found.key?(:secret)
+      app = signing_literal("rails_signed_global_id", "`app:`", found[:app])
+      purpose = found.key?(:purpose) ? signing_literal("rails_signed_global_id", "`purpose:`", found[:purpose]) : "attachable"
+      secret = signing_secret("rails_signed_global_id", found, node)
+      signed_secret!(node, "rails_signed_global_id", secret, "rails_signed_global_id")
+      model_arg = model[1] == :str ? model[0] : "&#{wrap(model)}"
+      id_arg = id[1] == :i32 ? "i64::from(#{id[0]})" : wrap(id)
+      ["axum_dsl_rails_signed_global_id(settings().#{secret}.as_bytes(), #{model_arg}, #{id_arg}, #{AxumDsl.rstr(app)}, #{AxumDsl.rstr(purpose)})", :string, true]
+    end
+
+    # json_object("name" => value, ...): one JSON object as a string, with keys written out and values of
+    # different types (a string, integer, float or bool). It is for a JSON response built from query records,
+    # where a map literal's keys would have to share one value type.
+    def json_object_call(node, args, env)
+      ["#{json_object_value(node, args, env)}.to_string()", :string, true]
+    end
+
+    # The serde_json value a json_object is; a json_object that is another's value is nested as an object, not a string.
+    def json_object_value(node, args, env)
+      hash = args[0]
+      elements = (hash.is_a?(Prism::HashNode) || hash.is_a?(Prism::KeywordHashNode)) ? hash.elements : args
+      bad(node, "json_object takes `\"key\" => value` pairs") unless elements.all? { |el| el.is_a?(Prism::AssocNode) }
+      pairs = elements.map do |el|
+        bad(el, "json_object is `\"key\" => value` pairs") unless el.is_a?(Prism::AssocNode)
+        bad(el.key, "a json_object key is a string literal") unless el.key.is_a?(Prism::StringNode)
+        if el.value.is_a?(Prism::CallNode) && el.value.name == :json_object && el.value.receiver.nil?
+          next [el.key.unescaped, json_object_value(el.value, args_of(el.value), env)]
+        end
+        v = expr(el.value, env)
+        bad(el.value, "a json_object value cannot be nil; use `|| default`") if OPT.key?(v[1])
+        bad(el.value, "a json_object value is a string, number or bool, got #{TypeNames.display(v[1])}") unless %i[str string int i32 i64 f64 bool].include?(v[1])
+        code = v[1] == :str ? "#{v[0]}.to_string()" : (v[1] == :i32 ? "(#{v[0]} as i64)" : v[0])
+        [el.key.unescaped, code]
+      end
+      fields = pairs.map { |k, code| "#{AxumDsl.rstr(k)}: #{code}" }.join(", ")
+      "::serde_json::json!({ #{fields} })"
+    end
+
+    # json_array(["{\"a\":1}", ...]): a JSON array of already-serialized objects; the caller builds each
+    # element with json_object.
+    def json_array_call(node, args, env)
+      bad(node, "json_array takes one list of JSON strings") unless args.size == 1
+      v = expr(args[0], env)
+      bad(args[0], "json_array takes a list of strings, got #{TypeNames.display(v[1])}") unless v[1] == :strs || LISTS[v[1]] == :string
+      ["format!(\"[{}]\", #{wrap(v)}.join(\",\"))", :string, true]
+    end
+
+    # ---- Action Cable broadcasts (docs/cable.md) ---------------------------------------------------------------
+    # `close_remote_connections` closes one user's connections. `broadcast`, `broadcast_to` and `broadcast_turbo` hand one message to the in-process hub the `cable`
+    # declaration writes into the crate; every live subscription on that broadcasting name gets a frame, and the
+    # call never waits for a socket. `render_string` is the Turbo payload's markup: a view rendered to a String.
+
+    CABLE_CALLS = %i[broadcast broadcast_to broadcast_turbo close_remote_connections].freeze
+    # The Turbo Stream actions `broadcast_turbo` writes (turbo-rails' broadcast_<action>_to); only `remove` has no template.
+    TURBO_ACTIONS = %i[append prepend replace update remove before after].freeze
+
+    def cable_call?(node)
+      node.is_a?(Prism::CallNode) && node.receiver.nil? && CABLE_CALLS.include?(node.name)
+    end
+
+    # Where a broadcast may be written: a route, a filter, or a channel's callback. The reader refuses the file when
+    # no `cable` is declared (Reader#check_broadcast_sites), because the hub is part of that declaration.
+    def broadcast_site!(node, what)
+      unless @route || @kind == :cable
+        bad(node, "`#{what}` sends to the Action Cable subscribers: write it in a route, a filter or a channel's block, not in a helper, a `current` or a binding")
+      end
+      (@flags["broadcast_sites"] ||= []) << node
+    end
+
+    # A Rust &str for a string value: a literal is one already, an owned String borrows.
+    def str_ref(r) = r[1] == :str ? r[0] : "#{wrap(r)}.as_str()"
+
+    # broadcast "user_#{user.id}_reads", "room_id" => room.id: `ActionCable.server.broadcast name, { room_id: ... }`.
+    # The message is a JSON object whose keys keep the order they are written in, as a Ruby hash does.
+    def broadcast_call(node, args, env)
+      broadcast_site!(node, "broadcast")
+      rest = args.dup
+      hash = rest.last.is_a?(Prism::KeywordHashNode) || rest.last.is_a?(Prism::HashNode) ? rest.pop : nil
+      bad(node, 'broadcast takes the broadcasting name and the message\'s pairs, as in `broadcast "reads", "room_id" => room_id`') unless rest.size == 1 && hash
+      name = expr(rest[0], env)
+      bad(rest[0], "broadcast's name is a string, got #{TypeNames.display(name[1])}") unless %i[str string].include?(name[1])
+      ["axum_dsl_cable_broadcast(#{str_ref(name)}, #{broadcast_object(hash, env)})", :unit, true]
+    end
+
+    # broadcast_to "action" => "start", "user" => json_object("id" => user.id, "name" => user.name): `broadcast_to @room, ...`
+    # in a channel: the message goes to the subscription's own `stream_for` name.
+    def broadcast_to_call(node, args, env)
+      bad(node, "`broadcast_to` sends to the channel's own `stream_for` stream, so it is written inside a `channel` block") unless @kind == :cable
+      bad(node, "`broadcast_to` sends to the channel's `stream_for` stream, and this channel declares none (or this callback runs before it is known); use `broadcast` with a name") unless @cable_stream_for
+      hash = args.size == 1 && (args[0].is_a?(Prism::KeywordHashNode) || args[0].is_a?(Prism::HashNode)) ? args[0] : nil
+      bad(node, 'broadcast_to takes the message\'s pairs, as in `broadcast_to "action" => "start"`') unless hash
+      broadcast_site!(node, "broadcast_to")
+      @cable_uses_stream_for = true
+      ["axum_dsl_cable_broadcast(__stream_for, #{broadcast_object(hash, env)})", :unit, true]
+    end
+
+    # The JSON text of a message's `"key" => value` pairs, as a Rust String expression. Values are strings, numbers
+    # and bools, or a `json_object("key" => value)` that nests; the keys stay in the order written.
+    def broadcast_object(hash, env)
+      bad(hash, 'a message is `"key" => value` pairs') unless hash.is_a?(Prism::KeywordHashNode) || hash.is_a?(Prism::HashNode)
+      bad(hash, "a message needs at least one pair") if hash.elements.empty?
+      pairs = hash.elements.map do |el|
+        bad(el, 'a message is `"key" => value` pairs') unless el.is_a?(Prism::AssocNode)
+        bad(el.key, "a message key is a string literal") unless el.key.is_a?(Prism::StringNode)
+        key = AxumDsl.rstr(JSON.generate(el.key.unescaped))
+        v = el.value
+        value =
+          if v.is_a?(Prism::CallNode) && v.name == :json_object && v.receiver.nil?
+            inner = args_of(v)
+            unless inner.size == 1 && (inner[0].is_a?(Prism::KeywordHashNode) || inner[0].is_a?(Prism::HashNode))
+              bad(v, 'json_object takes `"key" => value` pairs')
+            end
+            broadcast_object(inner[0], env)
+          else
+            broadcast_value(v, env)
+          end
+        "format!(\"{}:{}\", #{key}, #{value})"
+      end
+      "format!(\"{{{}}}\", [#{pairs.join(', ')}].join(\",\"))"
+    end
+
+    # One message value as JSON text (a Rust String expression).
+    def broadcast_value(node, env)
+      v = expr(node, env)
+      bad(node, "a message value cannot be nil; use `|| default`") if OPT.key?(v[1])
+      code =
+        case v[1]
+        when :str then "::serde_json::Value::from(#{v[0]})"
+        when :string then "::serde_json::Value::from(#{wrap(v)}.clone())"
+        when :int, :i64 then "::serde_json::Value::from(#{wrap(v)} as i64)"
+        when :i32 then "::serde_json::Value::from(i64::from(#{wrap(v)}))"
+        when :f64, :bool then "::serde_json::Value::from(#{wrap(v)})"
+        else bad(node, "a message value is a string, number or bool, got #{TypeNames.display(v[1])}")
+        end
+      "#{code}.to_string()"
+    end
+
+    # broadcast_turbo :rooms, action: :append, target: "messages", html: render_string(:message, locals: {...}):
+    # turbo-rails' `Turbo::StreamsChannel.broadcast_append_to`. The positional parts are the stream's name, joined with
+    # ":" as turbo-rails' stream_name_from does (a record is spelled with global_id_param). The subscribers get the
+    # `<turbo-stream>` tag as a JSON string; `remove` carries no template.
+    def broadcast_turbo_call(node, args, env)
+      broadcast_site!(node, "broadcast_turbo")
+      rest = args.dup
+      hash = rest.last.is_a?(Prism::KeywordHashNode) ? rest.pop : nil
+      example = 'broadcast_turbo(:rooms, action: :append, target: "messages", html: render_string(:message, locals: { ... }))'
+      bad(node, "broadcast_turbo takes the stream name's parts and `action:`, `target:` and `html:`, as in `#{example}`") if rest.empty? || hash.nil?
+      parts = rest.map do |part|
+        if part.is_a?(Prism::SymbolNode)
+          AxumDsl.rstr(part.unescaped)
+        else
+          value = expr(part, env)
+          bad(part, "a broadcast_turbo stream part is a string or a symbol, got #{TypeNames.display(value[1])}") unless %i[str string].include?(value[1])
+          str_ref(value)
+        end
+      end
+      found = signing_keywords("broadcast_turbo", hash, %i[action target html maintain_scroll], example)
+      bad(node, "broadcast_turbo needs `action:` and `target:`") unless found.key?(:action) && found.key?(:target)
+      action = found[:action]
+      unless action.is_a?(Prism::SymbolNode) && TURBO_ACTIONS.include?(action.unescaped.to_sym)
+        bad(action, "broadcast_turbo's `action:` is one of #{TURBO_ACTIONS.map { |a| ":#{a}" }.join(', ')}")
+      end
+      action = action.unescaped
+      target = expr(found[:target], env)
+      bad(found[:target], "broadcast_turbo's `target:` is a string, got #{TypeNames.display(target[1])}") unless %i[str string].include?(target[1])
+      if action == "remove"
+        bad(found[:html], "a `remove` action carries no template, so it takes no `html:`") if found.key?(:html)
+        html = "None"
+      else
+        bad(node, "broadcast_turbo `action: :#{action}` needs `html:`, the template's markup (`render_string(:view, locals: { ... })`)") unless found.key?(:html)
+        markup = expr(found[:html], env)
+        bad(found[:html], "broadcast_turbo's `html:` is a string, got #{TypeNames.display(markup[1])}") unless %i[str string].include?(markup[1])
+        html = "Some(#{str_ref(markup)})"
+      end
+      scroll = found[:maintain_scroll]
+      if scroll && !(scroll.is_a?(Prism::TrueNode) || scroll.is_a?(Prism::FalseNode))
+        bad(scroll, "broadcast_turbo's `maintain_scroll:` is true or false")
+      end
+      call = "axum_dsl_cable_broadcast_turbo(&[#{parts.join(', ')}], #{AxumDsl.rstr(action)}, #{str_ref(target)}, #{html}, #{scroll.is_a?(Prism::TrueNode)})"
+      # A template rendered only for subscribers: with no listeners the message is not built at all. This is
+      # the common case for a POST from a benchmark or a client with no open socket.
+      if found[:html].is_a?(Prism::CallNode) && found[:html].name == :render_string
+        call = "if axum_dsl_cable_listening(&[#{parts.join(', ')}]) { #{call}; }"
+      end
+      [call, :unit, true]
+    end
+
+    # close_remote_connections(user.id, reconnect: true): `User#close_remote_connections`, Rails'
+    # `ActionCable.server.remote_connections.where(current_user: user).disconnect(reconnect:)`. Every open connection whose
+    # signed-in user has that id sends `{"type":"disconnect","reason":"remote","reconnect":true}` and closes; the call never
+    # waits for a socket. `reconnect:` is a literal true (the default, as in Rails) or false.
+    def close_remote_connections_call(node, args, env)
+      broadcast_site!(node, "close_remote_connections")
+      rest = args.dup
+      hash = rest.last.is_a?(Prism::KeywordHashNode) ? rest.pop : nil
+      example = "close_remote_connections(user.id, reconnect: true)"
+      bad(node, "close_remote_connections takes the user's id and, optionally, `reconnect:`, as in `#{example}`") unless rest.size == 1
+      found = signing_keywords("close_remote_connections", hash, %i[reconnect], example)
+      reconnect = found[:reconnect]
+      if reconnect && !(reconnect.is_a?(Prism::TrueNode) || reconnect.is_a?(Prism::FalseNode))
+        bad(reconnect, "close_remote_connections's `reconnect:` is true or false")
+      end
+      id = expr(rest[0], env)
+      bad(rest[0], "close_remote_connections takes the user's id (an :i64) or, for a string current, its name, got #{TypeNames.display(id[1])}") unless %i[int i64 i32 str string].include?(id[1])
+      (@flags["close_sites"] ||= []) << [node, id[1]] # the reader checks the type against the cable's current
+      ["axum_dsl_cable_close_remote(&format!(\"{}\", #{wrap(id)}), #{!reconnect.is_a?(Prism::FalseNode)})", :unit, true]
+    end
+
+    # render_string(:message, locals: { message: message }): a view rendered to a String and not answered, with no layout:
+    # `ApplicationController.render(partial:, locals:)`, the markup a Turbo broadcast carries. The view is read at
+    # compile time and compiled into the crate, as `render`'s is, and its locals follow the same rule.
+    def render_string_call(node, args, env)
+      unless @route || @kind == :cable
+        bad(node, "`render_string` renders a view to a string in a route, a filter or a channel's block, not in a helper, a `current` or a binding")
+      end
+      name, kw = render_args(node, args)
+      if (extra = kw.keys - [:locals]).any?
+        bad(node, "render_string takes `locals:` only, not `#{extra.first}:` (a string has no status, content type or layout)")
+      end
+      dir = @flags["views"] || Views::DEFAULT_DIR
+      folder = Views.folder(@path)
+      report = ->(message) { bad(node, message) }
+      view = view_file(name, dir, folder, report)
+      locals = render_locals(node, kw[:locals], env)
+      check_view_locals(node, view, nil, locals)
+      check_view_yield(node, view, nil)
+      [view_expr(node, view, nil, locals, dir, folder, report), :string, false]
+    end
+
+    # The body of a `stream_from`, `stream_for`, `after_subscribe`, `on_unsubscribe` or `perform` block of a channel
+    # (docs/cable.md). `vars` is what the callback may take as block parameters, { name => [type, Rust type] } in the
+    # order they are offered; the block names the ones it wants (`{ |user, room_id| ... }`) and the emitter passes
+    # exactly those. A `stream_*` callback ends in the string it names; the others end in anything and answer
+    # nothing, and may leave early with a bare `return` in a guard clause. `stream_for` says whether `broadcast_to` has
+    # a stream of its own to send to.
+    def lower_cable(blk, vars, ret, stream_for)
+      @body_line = blk.location.start_line
+      @ret = ret
+      @cable_stream_for = stream_for
+      env = {}
+      params = []
+      ps = blk.parameters
+      reqs = []
+      if ps
+        bad(ps, "unsupported #{nodename(ps)} as a channel callback's parameters") unless ps.is_a?(Prism::BlockParametersNode)
+        bad(ps, "block-local variables are not allowed") unless ps.locals.empty?
+        pn = ps.parameters
+        if pn
+          extra = [pn.optionals, pn.posts, pn.keywords].any? { |x| !x.empty? } || pn.rest || pn.keyword_rest || pn.block
+          bad(pn, "only plain parameters are allowed in a channel callback") if extra
+          reqs = pn.requireds
+        end
+      end
+      reqs.each do |r|
+        bad(r, "unsupported #{nodename(r)} as a channel callback's parameter") unless r.is_a?(Prism::RequiredParameterNode)
+        name = r.name.to_s
+        var = vars[name] or
+          bad(r, "`#{name}` is not available to this callback (it can take: #{vars.keys.join(', ')})", word: name, from: vars.keys)
+        bad(r, "duplicate parameter `#{name}`") if env.key?(name.to_sym)
+        env[name.to_sym] = var[0]
+        params << [name, var[1]]
+        @declared << [name.to_sym, r, "parameter"]
+        note_decl(r.location, name.to_sym, "parameter", var[0])
+      end
+      st = blk.body
+      bad(blk, "empty channel callback") unless st.is_a?(Prism::StatementsNode)
+      lets, e, t, = stmts(st, env)
+      bad(st, "a channel callback cannot end in `raise` or `return`; end it in a value or a call") if t == :never
+      if ret == :string
+        code = coerce(unparen(e), t, :string) or
+          bad(st, "this callback names a stream, so it ends in a string, got #{TypeNames.display(t)}")
+      else
+        code = unparen(e)
+      end
+      reject_unused
+      { "params" => params, "locals" => lets, "expr" => code, "ret" => ret.to_s, "stream_for" => @cable_uses_stream_for ? true : false }
+    end
+    public :lower_cable
+
+    # turbo_signed_stream_name("<global_id_param>", :messages, secret: :secret_key): turbo-rails'
+    # `Turbo::StreamsChannel.signed_stream_name`. The parts are strings or symbols, joined with ":" as
+    # turbo-rails' stream_name_from does; a record is spelled with global_id_param.
+    def turbo_signed_stream_name_call(node, args, env)
+      rest = args.dup
+      hash = rest.last.is_a?(Prism::KeywordHashNode) ? rest.pop : nil
+      bad(node, "turbo_signed_stream_name takes the stream name's parts, such as `turbo_signed_stream_name(global_id_param(\"Rooms::Open\", room.id, app: \"campfire\"), :messages, secret: :secret_key)`") if rest.empty?
+      parts = rest.map do |part|
+        if part.is_a?(Prism::SymbolNode)
+          AxumDsl.rstr(part.unescaped)
+        else
+          value = expr(part, env)
+          bad(part, "a turbo_signed_stream_name part is a string or a symbol, got #{TypeNames.display(value[1])}") unless %i[str string].include?(value[1])
+          value[1] == :str ? value[0] : "#{wrap(value)}.as_str()"
+        end
+      end
+      found = signing_keywords("turbo_signed_stream_name", hash, %i[secret], "secret: :secret_key")
+      secret = signing_secret("turbo_signed_stream_name", found, node)
+      signed_secret!(node, "turbo_signed_stream_name", secret, "turbo_signed_stream_name")
+      ["axum_dsl_turbo_signed_stream_name(settings().#{secret}.as_bytes(), &[#{parts.join(', ')}].join(\":\"))", :string, true]
+    end
+
+    # global_id_param("Rooms::Open", room.id, app: "campfire"): `record.to_gid_param`, the url-safe base64
+    # (unpadded) of "gid://<app>/<Model>/<id>". The model name is a string (it is the class name Rails writes,
+    # `Rooms::Open` for an STI subclass), the id an integer and the app the GlobalID app name.
+    def global_id_param_call(node, args, env)
+      rest = args.dup
+      hash = rest.last.is_a?(Prism::KeywordHashNode) ? rest.pop : nil
+      bad(node, "global_id_param takes a model name and an id") unless rest.size == 2
+      model = expr(rest[0], env)
+      bad(rest[0], "global_id_param's model is a string, got #{TypeNames.display(model[1])}") unless %i[str string].include?(model[1])
+      id = expr(rest[1], env)
+      bad(rest[1], "global_id_param's id is an integer, got #{TypeNames.display(id[1])}") unless %i[i64 i32].include?(id[1])
+      found = signing_keywords("global_id_param", hash, %i[app], 'app: "campfire"')
+      bad(node, "global_id_param needs `app:`, the GlobalID app name (Rails.application's `app` in `gid://<app>/...`)") unless found.key?(:app)
+      app = signing_literal("global_id_param", "`app:`", found[:app])
+      (@flags["builtins"] ||= {})["global_id_param"] = true
+      model_arg = model[1] == :str ? model[0] : "#{wrap(model)}.as_str()"
+      id_arg = id[1] == :i32 ? "i64::from(#{id[0]})" : wrap(id)
+      ["axum_dsl_global_id_param(#{AxumDsl.rstr(app)}, #{model_arg}, #{id_arg})", :string, true]
+    end
+
+    # urlsafe_base64(text): Ruby's `Base64.urlsafe_encode64(text)`, the url-safe alphabet padded with `=`.
+    def urlsafe_base64_call(node, args, env)
+      bad(node, "urlsafe_base64 takes exactly one string") unless args.size == 1
+      text = expr(args[0], env)
+      bad(args[0], "urlsafe_base64 takes a string, got #{TypeNames.display(text[1])}") unless %i[str string].include?(text[1])
+      (@flags["builtins"] ||= {})["urlsafe_base64"] = true
+      text_arg = text[1] == :str ? text[0] : "#{wrap(text)}.as_str()"
+      ["axum_dsl_urlsafe_base64(#{text_arg})", :string, true]
+    end
+
+    # url_encode(text): Ruby's `URI.encode_www_form_component(text)` (Rack::Utils.escape), the escaping Rails
+    # uses when it appends a query parameter: `new_session_url(email_address:)` writes `%40` for the @. The kept set
+    # is Ruby's form encoding, not RFC 3986's: `*` stays and `~` is written %7E.
+    def url_encode_call(node, args, env)
+      bad(node, "url_encode takes exactly one string") unless args.size == 1
+      text = expr(args[0], env)
+      bad(args[0], "url_encode takes a string, got #{TypeNames.display(text[1])}") unless %i[str string].include?(text[1])
+      (@flags["builtins"] ||= {})["url_encode"] = true
+      text_arg = text[1] == :str ? text[0] : "#{wrap(text)}.as_str()"
+      ["axum_dsl_url_encode(#{text_arg})", :string, true]
+    end
+
+    # The Active Storage disk service calls, and how many strings each takes before `secret:`.
+    STORAGE_CALLS = { active_storage_disk_path: 3, active_storage_verified_id: 1, active_storage_verified_key: 1 }.freeze
+
+    # active_storage_disk_path(key, filename, content_type, secret: :secret_key): `blob.url` on the disk service, the
+    # path `/rails/active_storage/disk/<signed blob_key>/<filename>` (inline, expiring in five minutes).
+    # active_storage_verified_id(token, secret:): the id inside `blob.signed_id`, or nil.
+    # active_storage_verified_key(token, secret:): the blob key inside a disk URL's signed key, or nil (bad
+    # signature, wrong purpose, expired). `secret:` names the one SECRET_KEY_BASE setting, as every signing call does.
+    def active_storage_call(node, name, args, env)
+      rest = args.dup
+      hash = rest.last.is_a?(Prism::KeywordHashNode) ? rest.pop : nil
+      want = STORAGE_CALLS.fetch(name)
+      bad(node, "#{name} takes #{want} string#{want > 1 ? 's' : ''} and `secret: :secret_key`") unless rest.size == want
+      strings = rest.map do |arg|
+        v = expr(arg, env)
+        bad(arg, "#{name} takes strings, got #{TypeNames.display(v[1])}") unless %i[str string].include?(v[1])
+        v[1] == :str ? v[0] : "&#{wrap(v)}"
+      end
+      found = signing_keywords(name.to_s, hash, %i[secret], "secret: :secret_key")
+      secret = signing_secret(name.to_s, found, node)
+      signed_secret!(node, name.to_s, secret, name.to_s)
+      key = "settings().#{secret}.as_bytes()"
+      case name
+      when :active_storage_disk_path then ["axum_dsl_active_storage_disk_path(#{key}, #{strings.join(', ')})", :string, true]
+      when :active_storage_verified_id then ["axum_dsl_active_storage_verified_id(#{key}, #{strings[0]})", :oi64, true]
+      else ["axum_dsl_active_storage_verified_key(#{key}, #{strings[0]})", :ostr, true]
+      end
+    end
+
+    # inline_disposition(filename): the `Content-Disposition` Active Storage's disk service serves a blob with,
+    # `inline; filename="moon.jpg"; filename*=UTF-8''moon.jpg` (ActionDispatch::Http::ContentDisposition).
+    def inline_disposition_call(node, args, env)
+      bad(node, "inline_disposition takes exactly one filename") unless args.size == 1
+      name = expr(args[0], env)
+      bad(args[0], "inline_disposition takes a string, got #{TypeNames.display(name[1])}") unless %i[str string].include?(name[1])
+      (@flags["builtins"] ||= {})["inline_disposition"] = true
+      name_arg = name[1] == :str ? name[0] : "&#{wrap(name)}"
+      ["axum_dsl_content_disposition(\"inline\", #{name_arg})", :string, true]
+    end
+
+    # urlsafe_decode64(text): Ruby's `Base64.urlsafe_decode64(text)` as UTF-8 text, or nil where Ruby raises
+    # ArgumentError (malformed Base64) or the bytes are not UTF-8.
+    def urlsafe_decode64_call(node, args, env)
+      bad(node, "urlsafe_decode64 takes exactly one string") unless args.size == 1
+      text = expr(args[0], env)
+      bad(args[0], "urlsafe_decode64 takes a string, got #{TypeNames.display(text[1])}") unless %i[str string].include?(text[1])
+      (@flags["builtins"] ||= {})["urlsafe_decode64"] = true
+      text_arg = text[1] == :str ? text[0] : "#{wrap(text)}.as_str()"
+      ["axum_dsl_urlsafe_decode64(#{text_arg})", :ostr, true]
+    end
+
+    # qr_code_svg(text): `RQRCode::QRCode.new(text).as_svg(viewbox: true, fill: :white, color: :black)`, byte for byte,
+    # or nil where the text does not fit a version 40 code (rqrcode raises).
+    def qr_code_svg_call(node, args, env)
+      bad(node, "qr_code_svg takes exactly one string") unless args.size == 1
+      text = expr(args[0], env)
+      bad(args[0], "qr_code_svg takes a string, got #{TypeNames.display(text[1])}") unless %i[str string].include?(text[1])
+      (@flags["builtins"] ||= {})["qr_code_svg"] = true
+      text_arg = text[1] == :str ? text[0] : "#{wrap(text)}.as_str()"
+      ["axum_dsl_qr_code_svg(#{text_arg})", :ostr, true]
+    end
+
+    # upload.store(root): the Disk service's upload of an `:upload` field's file (multipart.rb): a fresh key, the file at
+    # <root>/<key[0,2]>/<key[2,2]>/<key>, and the key as the value. The root is a string, such as setting(:storage). It
+    # writes a file, so it runs in a route body and fails the request (the `error` filter, or a 500) when the write fails.
+    def upload_store_call(node, args, recv, env)
+      bad(node, "store takes the storage root, a string such as setting(:storage)") unless args.size == 1
+      bad(node, "store writes a file, so it is for a route body, not #{@helper ? 'a helper' : "a #{@kind} body"}") unless @route && !@helper && @kind != :error
+      root = expr(args[0], env)
+      bad(args[0], "store takes the storage root as a string, got #{TypeNames.display(root[1])}") unless %i[str string].include?(root[1])
+      (@flags["builtins"] ||= {})["upload_store"] = true
+      @fallible = true
+      @uses_async = true
+      @async_reason ||= "stores an upload (line #{node.location.start_line})"
+      root_arg = root[1] == :str ? root[0] : "&#{wrap(root)}"
+      ["axum_dsl_upload_store(&#{wrap(recv)}, #{root_arg}).await?", :string, true]
+    end
+
+    # crc32(text): Ruby's `Zlib.crc32(text)`, the unsigned 32-bit CRC-32 the avatar palette indexes with.
+    def crc32_call(node, args, env)
+      bad(node, "crc32 takes exactly one string") unless args.size == 1
+      text = expr(args[0], env)
+      bad(args[0], "crc32 takes a string, got #{TypeNames.display(text[1])}") unless %i[str string].include?(text[1])
+      (@flags["builtins"] ||= {})["crc32"] = true
+      text_arg = text[1] == :str ? text[0] : "#{wrap(text)}.as_str()"
+      ["axum_dsl_crc32(#{text_arg})", :i64, true]
+    end
+
+    # plain_text(html): Action Text's `to_plain_text` of a stored body (ActionText::PlainTextConversion, the
+    # trailing newlines removed): the same conversion a sanitizer's `attachments:` uses.
+    def plain_text_call(node, args, env)
+      bad(node, "plain_text takes exactly one string, the Action Text HTML") unless args.size == 1
+      html = expr(args[0], env)
+      bad(args[0], "plain_text takes a string, got #{TypeNames.display(html[1])}") unless %i[str string].include?(html[1])
+      (@flags["builtins"] ||= {})["plain_text"] = true
+      html_arg = html[1] == :str ? html[0] : "#{wrap(html)}.as_str()"
+      ["axum_dsl_action_text_plain_text(#{html_arg})", :string, true]
+    end
+
+    # request_body: Rails' `request.body.read.force_encoding("UTF-8")`, the whole request body as text (bytes that are
+    # not UTF-8 become U+FFFD). Route bodies only; the emitter takes the body as the handler's last extractor, so
+    # the reader refuses a route that also reads its params from a JSON or form body (Reader#route_decl).
+    def request_body_call(node, args)
+      bad(node, "request_body takes no arguments") unless args.empty?
+      bad(node, "request_body reads the request body, so it is for a route body, not #{@helper ? 'a helper' : "a #{@kind} body"}") unless @kind == :route && !@helper
+      (@flags["builtins"] ||= {})["request_body"] = true
+      need(:body)
+      ["::std::string::String::from_utf8_lossy(&__body).into_owned()", :string, true]
     end
 
     # h(value) escapes a value for HTML; raw(value) gives the same value with no escaping, the XSS door a
@@ -2495,22 +3114,16 @@ module AxumDsl
       [html_value(args[0], expr(args[0], env), name), :string, true]
     end
 
-    # The Rust text of one value written into HTML: the escaped form `h(value)` uses, the unescaped one
-    # `raw(value)` uses, or the cleaned one `sanitize` uses; `what` is the name a refusal reads. A view's
-    # `{{ x }}`, `{{ x|raw }}` and `{{ x|sanitize }}` are these three forms, so a marker and its equivalent
-    # helper call cannot escape differently.
+    # The Rust text of one value written into HTML by a body: the escaped form `h(value)` uses or the
+    # unescaped one `raw(value)` uses; `what` is the name a refusal reads. A view writes the same two forms
+    # (and `sanitize`) straight into its buffer instead (view_value), by the same rules.
     def html_value(node, v, what)
       bad(node, "a secret cannot be written into HTML; pass it to a binding or rust_fn function") if v[1] == :secret
-      if what == :sanitize
-        # The emitter writes the sanitiser and its dependency only into a crate whose views clean a value.
-        @flags["sanitize"] = true
-        return "axum_dsl_sanitize(#{v[1] == :str ? wrap(v) : "&#{wrap(v)}"})"
-      end
-      bad(node, "#{what} takes a string or a number, got #{TypeNames.display(v[1])}") unless %i[str string i32 i64 f64 bool int].include?(v[1])
+      bad(node, "#{what} takes a string or a number, got #{TypeNames.display(v[1])}") unless HTML_VALUE_TYPES.include?(v[1])
       # raw is the value as it is; a stored string is copied so the local stays readable afterwards.
       return "#{wrap(v)}.to_string()" if what == :raw
 
-      @flags["html_escape"] = true # the emitter writes the escaper only into a crate whose bodies use h -- or a view
+      @flags["html_escape"] = true # the emitter writes the escaper only into a crate whose bodies use h
       borrowed =
         case v[1]
         when :str then v[0]             # a string literal is already a &str
@@ -2522,6 +3135,77 @@ module AxumDsl
       "axum_dsl_html_escape(#{borrowed}).into_owned()"
     end
 
+    # What `h`, `raw` and a view's markers write: a string or a number.
+    HTML_VALUE_TYPES = %i[str string i32 i64 f64 bool int].freeze
+    HTML_ESCAPES = { "&" => "&amp;", "<" => "&lt;", ">" => "&gt;", "\"" => "&quot;", "'" => "&#39;" }.freeze
+    RUST_STR_LITERAL = /\A"((?:[^"\\]|\\.)*)"\z/m
+    RUST_STR_ESCAPES = { "\\\\" => "\\", "\\\"" => "\"", "\\n" => "\n", "\\r" => "\r", "\\t" => "\t", "\\0" => "\0" }.freeze
+
+    # The text of a value known when the compiler runs -- a string literal (as AxumDsl.rstr writes one), an
+    # integer or true/false -- or nil for a value only the running service has.
+    def view_literal_text(v)
+      return v[0] if %i[i32 i64 int bool].include?(v[1]) && v[0].match?(/\A(?:-?(?:0|[1-9]\d*)|true|false)\z/)
+      return nil unless v[1] == :str && (m = RUST_STR_LITERAL.match(v[0]))
+
+      known = true
+      text = m[1].gsub(/\\./m) { |e| RUST_STR_ESCAPES.fetch(e) { known = false; e } }
+      known ? text : nil
+    end
+
+    # One value a view's marker writes, as a piece (see view_parts): the escaped form of `{{ x }}`, the
+    # unescaped one of `{{ x|raw }}`, or the cleaned one of `{{ x|sanitize }}`, each appended to the render's
+    # buffer `__out` rather than built as a String first. A value known at compile time is written as literal
+    # text, escaped here with the five replacements axum_dsl_html_escape_into makes; a string is escaped
+    # straight into the buffer, and a number is written with its Display (it has nothing to escape).
+    def view_value(node, v, what, profile = nil, host = nil, mentions = nil)
+      bad(node, "a secret cannot be written into HTML; pass it to a binding or rust_fn function") if v[1] == :secret
+      if %i[sanitize editable].include?(what) && profile
+        # `{{ x|sanitize :profile }}`: the file's `sanitizer :profile` allowlist; its builder is emitted with the crate.
+        # `{{ x|editable :profile, ... }}` reads the same sanitizer's attachment partials, to draw the editor's value.
+        declared = (@flags["sanitizers"] || {}).keys
+        unless declared.include?(profile)
+          known = declared.empty? ? "the file declares no sanitizer" : "declared: #{declared.join(", ")}"
+          bad(node, "`|#{what} :#{profile}` names no `sanitizer :#{profile}` (#{known}); declare it at the top of the file")
+        end
+        (@flags["sanitize_profiles"] ||= {})[profile] = true
+        attachments = @flags["sanitizers"][profile]["attachments"]
+        if what == :editable
+          unless attachments&.key?(Sanitize::MENTION_TYPE) && attachments.key?("application/vnd.actiontext.opengraph-embed")
+            bad(node, "`|editable :#{profile}` rebuilds the attachments of a body, so sanitizer `#{profile}` must list both `attachments:` partials (the opengraph embed and #{Sanitize::MENTION_TYPE})")
+          end
+          (@flags["editable_profiles"] ||= {})[profile] = true
+        end
+        if attachments && host.nil?
+          bad(node, "sanitizer `#{profile}` renders attachments, which need the request host to keep a preview off this server; write `{{ x|#{what} :#{profile}, host: base_url }}`")
+        end
+        bad(node, "`host:` is for a sanitizer that renders `attachments:`; `#{profile}` has none") if host && !attachments
+        draws_mentions = attachments&.key?(Sanitize::MENTION_TYPE)
+        if draws_mentions && mentions.nil?
+          bad(node, "sanitizer `#{profile}` draws mentions, which need the users they name; write `{{ x|#{what} :#{profile}, host: base_url, mentions: users }}`, with `users` a list of records with the fields id, name, title and version")
+        end
+        bad(node, "`mentions:` is for a sanitizer whose `attachments:` draw #{Sanitize::MENTION_TYPE}; `#{profile}` has none") if mentions && !draws_mentions
+        fn_name = what == :editable ? Sanitize.editable_fn_name(profile) : Sanitize.fn_name(profile)
+        return [:code, "#{fn_name}(&mut __out, #{v[1] == :str ? wrap(v) : "&#{wrap(v)}"}#{host ? ", #{host}" : ""}#{mentions ? ", #{mentions}" : ""});", 0, 1]
+      end
+      if what == :sanitize
+        # The emitter writes the sanitiser and its dependency only into a crate whose views clean a value.
+        @flags["sanitize"] = true
+        return [:code, "axum_dsl_sanitize_into(&mut __out, #{v[1] == :str ? wrap(v) : "&#{wrap(v)}"});", 0, 1]
+      end
+      bad(node, "#{what} takes a string or a number, got #{TypeNames.display(v[1])}") unless HTML_VALUE_TYPES.include?(v[1])
+      text = view_literal_text(v)
+      return [:lit, what == :raw || v[1] != :str ? text : text.gsub(/[&<>"']/, HTML_ESCAPES)] if text
+
+      if %i[str string].include?(v[1])
+        source = v[1] == :str ? v[0] : "&#{wrap(v)}"
+        return [:code, "__out.push_str(#{source});", 0, 1] if what == :raw
+
+        @flags["html_escape_into"] = true # the emitter writes the buffer escaper only into a crate whose views use it
+        return [:code, "axum_dsl_html_escape_into(&mut __out, #{source});", 0, 1]
+      end
+      [:code, "let _ = ::std::fmt::Write::write_fmt(&mut __out, format_args!(\"{}\", #{wrap(v)}));", 0, 1]
+    end
+
     # file_text(:name): the text of a file declared with `file "path", as: :name`, read from disk on this call, so
     # an edit to the file needs no rebuild. The read can fail, so the call is fallible. A helper may use it.
     def file_text_call(node, args)
@@ -2529,6 +3213,7 @@ module AxumDsl
         bad(node, "file_text(:name) takes the `as:` name of a file declared with `file \"path\", as: :name`")
       end
       f = declared_file(args[0], "file_text")
+      bad(node, "`#{f["name"]}` is a `binary: true` file: send it by its path with file_path(:#{f["name"]}), it has no text") if f["binary"]
       (@flags["used_files"] ||= {})[f["name"]] = true
       (@flags["file_texts"] ||= {})[f["name"]] = true # the emitter writes file_text_<name> only for these
       @fallible = true
@@ -2691,7 +3376,9 @@ module AxumDsl
     # without the keyword hash, the StatusCode expression and the Content-Type literal (nil when the
     # keyword is absent). A status is an integer literal and a content type a string literal, so both are
     # known here, and both ride on the value the helper returns.
-    def response_args(node, what, args)
+    # `extra` names keywords one helper takes beyond those two (send_file's `disposition:`): a hash the
+    # caller passes, filled with each such keyword's value node.
+    def response_args(node, what, args, extra = {})
       rest = args.dup
       hash = rest.last.is_a?(Prism::KeywordHashNode) ? rest.pop : nil
       return [rest, nil, nil] unless hash
@@ -2704,13 +3391,16 @@ module AxumDsl
           bad(el, "unsupported #{nodename(el)} in #{what} (write `status: 401` or `content_type: \"text/html\"`)")
         end
         key = el.key.unescaped.to_sym
-        unless RESPONSE_KEYWORDS.include?(key)
-          bad(el, "unknown keyword `#{key}:` for #{what} (allowed: #{RESPONSE_KEYWORDS.join(', ')})",
-              word: key, from: RESPONSE_KEYWORDS)
+        allowed = RESPONSE_KEYWORDS + extra.keys
+        unless allowed.include?(key)
+          bad(el, "unknown keyword `#{key}:` for #{what} (allowed: #{allowed.join(', ')})",
+              word: key, from: allowed)
         end
         bad(el, "duplicate keyword `#{key}:`") if seen[key]
         seen[key] = true
-        if key == :status
+        if extra.key?(key)
+          extra[key] = el.value
+        elsif key == :status
           status = status_literal(el.value, "#{what}'s status")
           helper_status(el.value, what)
         else
@@ -2846,9 +3536,20 @@ module AxumDsl
     # while the request runs. The read is tokio's async fs, so the path need not be declared beside the DSL
     # file and the bytes are not copied into the crate. `content_type:` is required: a path's extension is
     # not a MIME type the compiler can trust. A read failure is a plain 500; a caller that wants a 404 checks
-    # that the row exists first.
+    # that the row exists first. `disposition: :inline` (or `:attachment`) is Rails' send_file: the response
+    # also carries `Content-Disposition: inline; filename="<name>"; filename*=UTF-8''<name>` for the path's
+    # last segment (ActionDispatch::Http::ContentDisposition.format: ASCII `filename=` with anything else
+    # non-ASCII as `?`, the full name percent-encoded in `filename*=`) and `Content-Transfer-Encoding: binary`.
     def send_file_response(node, args, env)
-      args, status, content_type = response_args(node, "send_file", args)
+      given = { disposition: nil }
+      args, status, content_type = response_args(node, "send_file", args, given)
+      disposition = given[:disposition]
+      if disposition
+        unless disposition.is_a?(Prism::SymbolNode) && %w[inline attachment].include?(disposition.unescaped)
+          bad(disposition, "send_file's disposition: is :inline or :attachment")
+        end
+        disposition = disposition.unescaped
+      end
       bad(node, "send_file takes exactly one path") unless args.size == 1
       bad(node, "send_file needs `content_type:` with a MIME type, such as `content_type: \"image/webp\"`") if content_type.nil?
       v = expr(args[0], env)
@@ -2856,6 +3557,32 @@ module AxumDsl
       (@flags["builtins"] ||= {})["send_file"] = true
       path = v[1] == :str ? "#{v[0]}.to_string()" : "#{wrap(v)}.clone()"
       status_code = status || "::axum::http::StatusCode::OK"
+      disposition_code = disposition ? <<~RS.chomp : ""
+
+                    let __name = ::std::path::Path::new(&__path).file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+                    let (mut __plain, mut __star) = (String::new(), String::new());
+                    for __c in __name.chars() {
+                        if __c.is_ascii_alphanumeric() || " !#$+.^_`|~-".contains(__c) {
+                            __plain.push(__c);
+                        } else if !__c.is_ascii() {
+                            __plain.push('?');
+                        } else {
+                            __plain.push_str(&format!("%{:02X}", __c as u32));
+                        }
+                        let mut __buf = [0u8; 4];
+                        for __b in __c.encode_utf8(&mut __buf).bytes() {
+                            if __b.is_ascii_alphanumeric() || b"!#$&+.^_`|~-".contains(&__b) {
+                                __star.push(__b as char);
+                            } else {
+                                __star.push_str(&format!("%{:02X}", __b));
+                            }
+                        }
+                    }
+                    if let Ok(__value) = ::axum::http::HeaderValue::from_str(&format!("#{disposition}; filename=\\"{}\\"; filename*=UTF-8''{}", __plain, __star)) {
+                        __response.headers_mut().insert(::axum::http::header::CONTENT_DISPOSITION, __value);
+                    }
+                    __response.headers_mut().insert(::axum::http::header::HeaderName::from_static("content-transfer-encoding"), ::axum::http::HeaderValue::from_static("binary"));
+        RS
       code = <<~RS
         {
             let __path = #{path};
@@ -2863,7 +3590,7 @@ module AxumDsl
                 Ok(__bytes) => {
                     let mut __response = ::axum::response::Response::new(::axum::body::Body::from(__bytes));
                     *__response.status_mut() = #{status_code};
-                    __response.headers_mut().insert(::axum::http::header::CONTENT_TYPE, ::axum::http::HeaderValue::from_static(#{content_type}));
+                    __response.headers_mut().insert(::axum::http::header::CONTENT_TYPE, ::axum::http::HeaderValue::from_static(#{content_type}));#{disposition_code}
                     __response
                 }
                 Err(_) => ::axum::response::IntoResponse::into_response((::axum::http::StatusCode::INTERNAL_SERVER_ERROR, "")),
@@ -2873,10 +3600,13 @@ module AxumDsl
       [code.strip, :response, false]
     end
 
+    # Rails' redirect_to answers with an empty body that is still text/html.
+    REDIRECT_CONTENT_TYPE = "__redirect.headers_mut().insert(::axum::http::header::CONTENT_TYPE, ::axum::http::HeaderValue::from_static(\"text/html; charset=utf-8\"));"
+
     # `redirect("/path")`: a 302 to that path, as Rails and Sinatra answer. `status:` names another
     # redirect status (301, 302, 303, 307 or 308). The path becomes the Location header, so it is written
-    # in the source: a string literal, or a literal with only numbers and bools interpolated. The value is
-    # still the body's own :response and can be returned.
+    # in the source: a string literal, or a literal with only numbers, bools or a url_encode(...) call
+    # interpolated. The value is still the body's own :response and can be returned.
     def redirect_response(node, args, env)
       args, status = redirect_args(node, args)
       bad(node, "redirect takes exactly one path") unless args.size == 1
@@ -2884,15 +3614,27 @@ module AxumDsl
       v = expr(arg, env, header: true)
       bad(arg, "a redirect path must be a string, got #{TypeNames.display(v[1])}") unless %i[str string].include?(v[1])
       unless arg.is_a?(Prism::StringNode) || arg.is_a?(Prism::InterpolatedStringNode)
-        bad(arg, "a redirect path is written in the source, because it becomes the Location header: write a string literal (redirect(\"/rooms\")) or interpolate numbers only (redirect(\"/rooms/\#{room_id}\")); a bare local, a params read, a method call or any other expression could carry a byte the header rejects")
+        bad(arg, "a redirect path is written in the source, because it becomes the Location header: write a string literal (redirect(\"/rooms\")), interpolate a number or a bool (redirect(\"/rooms/\#{room_id}\")), or interpolate url_encode(text) (redirect(\"/x?q=\#{url_encode(text)}\")); a bare local, a params read, a method call or any other expression could carry a byte the header rejects")
       end
       redirect_literal_text(arg)
       path = v[1] == :str ? v[0] : "&#{wrap(v)}"
       code = status || "::axum::http::StatusCode::FOUND"
+      # Rails' redirect_to writes an absolute URL: the request's scheme and host in front of a path. A literal
+      # that is not a path (a full URL) is left as written, and a body with no request (a helper) has no host.
+      first = arg.is_a?(Prism::InterpolatedStringNode) ? arg.parts.first : arg
+      if first.is_a?(Prism::StringNode) && first.unescaped.start_with?("/") && REQUEST_KINDS.include?(@kind) && !@helper
+        (@flags["builtins"] ||= {})["request_base_url"] = true
+        need(:headers)
+        return ["{ let mut __redirect = #{INTO}((#{code}, ())); " \
+                "let __location = format!(\"{}{}\", axum_dsl_request_base_url(&__headers), #{path}); " \
+                "__redirect.headers_mut().insert(::axum::http::header::LOCATION, " \
+                "::axum::http::HeaderValue::from_str(&__location).expect(\"a redirect path must be a valid header value\")); " \
+                "#{REDIRECT_CONTENT_TYPE} __redirect }", :response, false]
+      end
       ["{ let mut __redirect = #{INTO}((#{code}, ())); " \
        "__redirect.headers_mut().insert(::axum::http::header::LOCATION, " \
        "::axum::http::HeaderValue::from_str(#{path}).expect(\"a redirect path must be a valid header value\")); " \
-       "__redirect }", :response, false]
+       "#{REDIRECT_CONTENT_TYPE} __redirect }", :response, false]
     end
 
     # The literal text of a redirect path: every byte is visible ASCII (0x20-0x7E) or a tab, because the path
@@ -2964,6 +3706,12 @@ module AxumDsl
     def halt_response(node, args, env)
       bad(node, "halt takes a status, and optionally a body") unless args.size.between?(1, 2)
       code = status_code(args[0])
+      # Rails' `head :no_content` (and 205/304) writes no Content-Type: an empty body with one of these
+      # statuses is a bare status, not an empty text/plain.
+      empty = args.size == 1 || (args[1].is_a?(Prism::StringNode) && args[1].unescaped.empty?)
+      if empty && args[0].is_a?(Prism::IntegerNode) && [204, 205, 304].include?(args[0].value)
+        return ["#{INTO}((#{code}, ()))", :response, false]
+      end
       body =
         if args.size == 2
           v = expr(args[1], env)
@@ -3136,13 +3884,34 @@ module AxumDsl
     # `{{ yield }}` is the layout's child output, already-built markup that is never re-escaped: a view
     # rendered directly has no child, so a yield in one is refused. A layout that never yields would drop the
     # view it wraps, which is refused too rather than silently answering a page without it.
+    #
+    # The named regions follow the same rule from both sides: `{{ yield :nav }}` and `{% content_for :nav %}`
+    # need a layout, a layout fills no region (the page does), and a page's region the layout never writes
+    # would be dropped, which view_expr refuses once the partials have been expanded.
     def check_view_yield(node, view, layout)
       if layout.nil?
-        return unless view.yields
-
-        line = view.segments.find { |s| s["kind"] == "yield" }["line"]
-        bad(node, "#{view.rel}:#{line}: `{{ yield }}` is a layout's child output, and this render has no " \
-                  "layout to put it in; name one (`set :layout, :app` or `layout: :app`), or drop the marker")
+        if view.yields
+          line = view.segments.find { |s| s["kind"] == "yield" }["line"]
+          bad(node, "#{view.rel}:#{line}: `{{ yield }}` is a layout's child output, and this render has no " \
+                    "layout to put it in; name one (`set :layout, :app` or `layout: :app`), or drop the marker")
+        end
+        if (seg = view.region_yields.first)
+          bad(node, "#{view.rel}:#{seg['line']}: `{{ yield :#{seg['name']} }}` is a layout's region, and this render has no " \
+                    "layout to hold it; name one (`set :layout, :app` or `layout: :app`), or drop the marker")
+        end
+        if (seg = view.fills.first)
+          bad(node, "#{view.rel}:#{seg['line']}: `{% content_for :#{seg['name']} %}` fills a region of a layout, and this " \
+                    "render has no layout to put it in; name one (`set :layout, :app` or `layout: :app`), or drop the region")
+        end
+        return
+      end
+      if (seg = view.region_yields.first)
+        bad(node, "#{view.rel}:#{seg['line']}: `{{ yield :#{seg['name']} }}` writes a region, and a region is written by " \
+                  "the layout around a page, not by the page itself; the page fills it with `{% content_for :#{seg['name']} %}`")
+      end
+      if (seg = layout.fills.first)
+        bad(node, "#{layout.rel}:#{seg['line']}: `{% content_for :#{seg['name']} %}` is in a layout, and a layout writes regions " \
+                  "(`{{ yield :#{seg['name']} }}`) that the page fills; put the `{% content_for %}` in the page")
       end
       return if layout.yields
 
@@ -3150,56 +3919,135 @@ module AxumDsl
                 "writes the view where its `{{ yield }}` is")
     end
 
-    # The Rust text of a render: a format! whose literal runs are the view's own bytes and whose arguments are
-    # the markers' values, in marker order. A layout is compiled around the view: the child is built first,
-    # bound to `__yield`, and written where the layout's `{{ yield }}` is. A partial is inlined into its
-    # caller's format! (view_parts), so rendering one is not a call. Every literal `{`/`}` is doubled, as in an
-    # interpolated string (Body#interp), because format! reads them.
+    # The Rust text of a render: one pre-sized `String` every part of the view writes into, as Askama's
+    # generated code does. A layout is compiled around the view: the view's pieces are built first and are
+    # written where the layout's `{{ yield }}` is, straight into the same buffer, so the child is no `String`
+    # of its own. A partial is inlined into its caller (view_parts), so rendering one is not a call. The size
+    # hint is the compiler-known literal bytes plus VIEW_VALUE_BYTES for each value a marker writes.
     def view_expr(node, view, layout, locals, dir, folder, report)
-      child = view_format(node, view, locals, dir, folder, report)
-      return child unless layout
+      # The page is built first, and a `{% content_for %}` in it (or in a partial it calls) collects its pieces
+      # into @view_regions; the layout then writes them where its `{{ yield :name }}` is, as it does the page.
+      @view_regions = {}
+      @view_nest = 0
+      @view_regions_open = true
+      pieces = view_parts(node, view, locals, nil, [], dir, folder, report)
+      @view_regions_open = false
+      check_view_regions(view, layout, report)
+      pieces = view_parts(node, layout, locals, pieces, [], dir, folder, report) if layout
+      code, bytes, vals = view_flatten(pieces)
+      return "String::new()" if code.empty?
 
-      outer = view_format(node, layout, locals, dir, folder, report, child: "__yield")
-      "{ let __yield = #{child}; #{outer} }"
+      "{ let mut __out = String::with_capacity(#{bytes + VIEW_VALUE_BYTES * vals}); #{code} __out }"
     end
 
-    # One view's format!: the pieces view_parts writes, wrapped in the call. `yield` takes the child
-    # expression, the one marker that is not a local; every other marker (and a partial's every marker) is
-    # written by html_value, so `{{ x }}` and `{{ x|raw }}` are exactly `h(x)` and `raw(x)`.
-    def view_format(node, view, locals, dir, folder, report, child: nil, chain: [])
-      fmt, vals = view_parts(node, view, locals, child, chain, dir, folder, report)
-      "format!(#{AxumDsl.rstr(fmt)}#{vals.map { |v| ", #{v}" }.join})"
+    # A region the page filled and the layout never writes would be silently dropped (Rails drops it), which is
+    # refused here, where partials are expanded and every region the page fills is known. `where` points at the
+    # `{% content_for %}` when the page itself writes it, and at the view otherwise (a partial filled it).
+    def check_view_regions(view, layout, report)
+      written = layout ? layout.region_yields.map { |s| s["name"] } : []
+      @view_regions.each_key do |name|
+        next if written.include?(name)
+
+        seg = view.fills.find { |s| s["name"] == name }
+        where = seg ? "#{view.rel}:#{seg['line']}" : view.rel
+        if layout.nil?
+          report.call("#{where}: `{% content_for :#{name} %}` fills a region of a layout, and this render has no " \
+                      "layout to put it in; name one (`set :layout, :app` or `layout: :app`), or drop the region")
+        end
+        regions = written.empty? ? "writes no region" : "writes #{written.uniq.map { |n| "`{{ yield :#{n} }}`" }.join(", ")}"
+        report.call("#{where}: `{% content_for :#{name} %}` fills a region that #{layout.rel} never writes, so the " \
+                    "markup would be dropped; #{layout.rel} #{regions}. Add `{{ yield :#{name} }}` to the layout")
+      end
     end
 
-    # The literal runs and argument expressions of one view's format!, before the call is written around them.
-    # A partial's own parts are spliced in place: its text becomes part of the caller's literal and its markers
-    # become more of the caller's arguments, resolved against the call's arguments. `chain` is the partials
-    # being expanded above this one, so a partial that reaches itself is refused instead of expanded.
+    # Runs the block with one more open `{% for %}`, `{% if %}` or `{% content_for %}` around it. A region is
+    # filled once at the top of the page, which the parser checks within one file; this counts the blocks a
+    # partial is inlined into, which only the expansion can see.
+    def nested
+      @view_nest += 1
+      yield
+    ensure
+      @view_nest -= 1
+    end
+
+    # The room one written value is given in a render's size hint: a modest guess, since only the literal
+    # bytes are known when the compiler runs.
+    VIEW_VALUE_BYTES = 16
+
+    # A run of pieces as Rust statements: adjacent literal text is one `__out.push_str("...")`, every other
+    # piece is its own statement. Returns the statements, the literal bytes they write (a piece that holds
+    # statements of its own, a loop or an `{% if %}`, reports its body's) and the number of values written.
+    def view_flatten(pieces)
+      code = +""
+      lit = +""
+      bytes = 0
+      vals = 0
+      flush = lambda do
+        next if lit.empty?
+
+        code << "__out.push_str(#{AxumDsl.rstr(lit)}); "
+        bytes += lit.bytesize
+        lit = +""
+      end
+      pieces.each do |kind, text, b, n|
+        if kind == :lit
+          lit << text
+        else
+          flush.call
+          code << text << " "
+          bytes += b
+          vals += n
+        end
+      end
+      flush.call
+      [code.rstrip, bytes, vals]
+    end
+
+    # The pieces of one view, before they are written as statements. A piece is `[:lit, text]` (bytes the view
+    # writes as they are, already escaped where the value was known at compile time) or
+    # `[:code, statement, literal bytes, values written]`. A partial's own pieces are spliced in place, its
+    # markers resolved against the call's arguments. `chain` is the partials being expanded above this one,
+    # so a partial that reaches itself is refused instead of expanded. `child` is the page's pieces when this
+    # view is the layout around it.
     def view_parts(node, view, locals, child, chain, dir, folder, report)
       segment_parts(node, view, view.segments, locals, child, chain, dir, folder, report)
     end
 
     # The pieces of a run of segments: a view's own, or the body of one of its loops.
     def segment_parts(node, view, segments, locals, child, chain, dir, folder, report)
-      fmt = +""
-      vals = []
+      pieces = []
       segments.each do |seg|
         case seg["kind"]
         when "text"
-          fmt << seg["text"].gsub("{", "{{").gsub("}", "}}")
+          pieces << [:lit, seg["text"]]
         when "yield"
-          fmt << "{}"
-          vals << child
+          pieces.concat(child)
+        when "yield_region"
+          if @view_regions_open
+            report.call("#{view.rel}:#{seg['line']}: `{{ yield :#{seg['name']} }}` is a layout's region, and this file is a page or a " \
+                        "partial, not the layout; the page fills a region with `{% content_for :#{seg['name']} %}`")
+          end
+          pieces.concat(@view_regions.fetch(seg["name"], []))
+        when "content_for"
+          where = "#{view.rel}:#{seg['line']}"
+          unless @view_regions_open
+            report.call("#{where}: `{% content_for :#{seg['name']} %}` is in a layout, and a layout writes regions " \
+                        "(`{{ yield :#{seg['name']} }}`) that the page fills; put the `{% content_for %}` in the page")
+          end
+          if @view_nest.positive?
+            report.call("#{where}: `{% content_for :#{seg['name']} %}` is inlined inside a `{% for %}`, an `{% if %}` or another " \
+                        "`{% content_for %}` of its caller; a region is filled once, so call the partial at the top level of the page")
+          end
+          body = nested { segment_parts(node, view, seg["body"], locals, nil, chain, dir, folder, report) }
+          (@view_regions[seg["name"]] ||= []).concat(body)
         when "partial"
-          p_fmt, p_vals = expand_partial(node, view, seg, locals, chain, dir, folder, report)
-          fmt << p_fmt
-          vals.concat(p_vals)
+          pieces.concat(expand_partial(node, view, seg, locals, chain, dir, folder, report))
         when "for"
-          fmt << "{}"
-          vals << view_loop(node, view, seg, locals, chain, dir, folder, report)
+          piece = view_loop(node, view, seg, locals, chain, dir, folder, report)
+          pieces << piece if piece
         when "if"
-          fmt << "{}"
-          vals << view_if(node, view, seg, locals, chain, dir, folder, report)
+          piece = view_if(node, view, seg, locals, chain, dir, folder, report)
+          pieces << piece if piece
         when "csrf"
           unless @flags["csrf"]
             report.call("#{view.rel}:#{seg['line']}: `{{ csrf_token }}` needs `use_layer :csrf` at the top " \
@@ -3210,8 +4058,7 @@ module AxumDsl
                         "`#{@kind}` filter runs without one; render it from a route or a `before` filter")
           end
           need(:csrf)
-          fmt << "{}"
-          vals << "__csrf.0.as_str()"
+          pieces << [:code, "__out.push_str(__csrf.0.as_str());", 0, 1]
         when "asset"
           mounts = @flags["asset_mounts"].to_a
           if mounts.empty?
@@ -3231,26 +4078,170 @@ module AxumDsl
                         "under the #{mounts[0].inspect} mount (files: #{known.join(', ')}); only a copied file " \
                         "has a fingerprinted path")
           end
-          fmt << "{}"
-          vals << AxumDsl.rstr(url)
+          pieces << [:lit, url]
+        when "signed_id"
+          value_node, v = seg["var"] ? loop_marker(view, seg, locals, report) : locals.fetch(seg["name"])
+          spelling = seg["field"] ? "#{seg['name']}.#{seg['field']}" : seg["name"]
+          unless %i[i64 i32].include?(v[1])
+            report.call("#{view.rel}:#{seg['line']}: `{{ rails_signed_id #{spelling} }}` needs an integer, got " \
+                        "#{TypeNames.display(v[1])}; a signed id names a record by its integer id")
+          end
+          signed_secret!(value_node, "rails_signed_id", seg["secret"], "rails_signed_id_for")
+          id_arg = v[1] == :i32 ? "i64::from(#{v[0]})" : wrap(v)
+          pieces << [:code, "__out.push_str(&axum_dsl_rails_signed_id_for(settings().#{seg['secret']}.as_bytes(), #{id_arg}, #{AxumDsl.rstr(seg['purpose'])}));", 0, 1]
+        when "signed_global_id"
+          value_node, v = seg["var"] ? loop_marker(view, seg, locals, report) : locals.fetch(seg["name"])
+          spelling = seg["field"] ? "#{seg['name']}.#{seg['field']}" : seg["name"]
+          unless %i[int i64 i32].include?(v[1])
+            report.call("#{view.rel}:#{seg['line']}: `{{ rails_signed_global_id #{spelling} }}` needs an integer, got #{TypeNames.display(v[1])}")
+          end
+          signed_secret!(value_node, "rails_signed_global_id", seg["secret"], "rails_signed_global_id")
+          id_arg = v[1] == :i32 ? "i64::from(#{v[0]})" : wrap(v)
+          pieces << [:code, "__out.push_str(&axum_dsl_rails_signed_global_id(settings().#{seg['secret']}.as_bytes(), #{AxumDsl.rstr(seg['model'])}, #{id_arg}, #{AxumDsl.rstr(seg['app'])}, #{AxumDsl.rstr(seg['purpose'])}));", 0, 1]
+        when "blob_id"
+          value_node, v = seg["var"] ? loop_marker(view, seg, locals, report) : locals.fetch(seg["name"])
+          spelling = seg["field"] ? "#{seg['name']}.#{seg['field']}" : seg["name"]
+          unless %i[i64 i32].include?(v[1])
+            report.call("#{view.rel}:#{seg['line']}: `{{ active_storage_blob_id #{spelling} }}` needs an integer, got #{TypeNames.display(v[1])}")
+          end
+          signed_secret!(value_node, "active_storage_blob_id", seg["secret"], "active_storage_variation")
+          id_arg = v[1] == :i32 ? "i64::from(#{v[0]})" : wrap(v)
+          pieces << [:code, "__out.push_str(&axum_dsl_active_storage_blob_id(settings().#{seg['secret']}.as_bytes(), #{id_arg}));", 0, 1]
+        when "variation"
+          value_node, v = seg["var"] ? loop_marker(view, seg, locals, report) : locals.fetch(seg["name"])
+          spelling = seg["field"] ? "#{seg['name']}.#{seg['field']}" : seg["name"]
+          unless %i[str string].include?(v[1])
+            report.call("#{view.rel}:#{seg['line']}: `{{ active_storage_variation #{spelling} }}` needs a string, got " \
+                        "#{TypeNames.display(v[1])}; a variation names the format of the representation")
+          end
+          signed_secret!(value_node, "active_storage_variation", seg["secret"], "active_storage_variation")
+          format_arg = v[1] == :str ? wrap(v) : "&#{wrap(v)}"
+          pieces << [:code, "__out.push_str(&axum_dsl_active_storage_variation(settings().#{seg['secret']}.as_bytes(), #{format_arg}, #{seg['limit'][0]}, #{seg['limit'][1]}));", 0, 1]
         else
           value_node, v = seg["var"] ? loop_marker(view, seg, locals, report) : locals.fetch(seg["name"])
           spelling = seg["var"] ? (seg["field"] ? "#{seg['name']}.#{seg['field']}" : seg["name"]) : seg["name"]
-          if seg["kind"] == "sanitize" && !%i[str string].include?(v[1])
-            report.call("#{view.rel}:#{seg['line']}: `{{ #{spelling}|sanitize }}` needs a string, got " \
-                        "#{TypeNames.display(v[1])}; |sanitize cleans an HTML string (an Action Text body), and " \
+          if %w[sanitize editable].include?(seg["kind"]) && !%i[str string].include?(v[1])
+            report.call("#{view.rel}:#{seg['line']}: `{{ #{spelling}|#{seg['kind']} }}` needs a string, got " \
+                        "#{TypeNames.display(v[1])}; |#{seg['kind']} reads an HTML string (an Action Text body), and " \
                         "`{{ #{spelling} }}` or `{{ #{spelling}|raw }}` writes any other value")
           end
-          fmt << "{}"
-          what = { "raw" => :raw, "sanitize" => :sanitize }.fetch(seg["kind"], :h)
-          vals << html_value(value_node, v, what)
+          what = { "raw" => :raw, "sanitize" => :sanitize, "editable" => :editable }.fetch(seg["kind"], :h)
+          host = nil
+          if seg["host"]
+            host_v = locals.fetch(seg["host"])[1]
+            unless %i[str string].include?(host_v[1])
+              report.call("#{view.rel}:#{seg['line']}: `host: #{seg['host']}` is #{TypeNames.display(host_v[1])}; the request host is a string")
+            end
+            host = host_v[1] == :str ? wrap(host_v) : "&#{wrap(host_v)}"
+          end
+          mentions = nil
+          if seg["mentions"]
+            mentions_v = locals.fetch(seg["mentions"])[1]
+            unless struct_list?(mentions_v[1])
+              report.call("#{view.rel}:#{seg['line']}: `mentions: #{seg['mentions']}` is #{TypeNames.display(mentions_v[1])}; the mentioned users are a list of records with the fields id, name, title and version")
+            end
+            mentions = "&#{wrap(mentions_v)}.iter().map(|m| AxumDslMention { id: m.id, name: m.name.clone(), title: m.title.clone(), version: m.version.clone() }).collect::<Vec<_>>()"
+          end
+          sanitizer_renderers(value_node, seg["profile"], report) if seg["profile"]
+          pieces << view_value(value_node, v, what, seg["profile"], host, mentions)
         end
       end
-      [fmt, vals]
+      pieces
     end
 
-    # One `{% for x in xs %}`: a block that builds the loop's text and is spliced into the caller's format! as
-    # one argument, `{ let mut __s = String::new(); for __it_x in &xs { __s.push_str(&format!(...)); } __s }`.
+    # The arguments the compiler gives a sanitizer's partials, as [name, type]: what an `attachments:` partial and a
+    # `sound_partials:` partial read (the partial's markers must name exactly these). A bool is a Rust `bool`, the rest `&str`.
+    SANITIZER_PARTIALS = {
+      "attachment" => [%w[href str], %w[title str], %w[description str], %w[image str], %w[twitter_avatar bool], %w[has_href bool], %w[has_image bool]],
+      "mention" => [%w[id i64], %w[name str], %w[title str], %w[version str]],
+      "text" => [%w[url str], %w[text str]],
+      "image" => [%w[url str], %w[src str], %w[width str], %w[height str]]
+    }.freeze
+
+    # The Rust a declared `sanitizer`'s partials compile to, once per sanitizer: each `attachments:` and
+    # `sound_partials:` view partial becomes a function over the arguments SANITIZER_PARTIALS lists (the partial is
+    # read and compiled like any other, so its `{{ asset_path }}`, `{% if %}` and escaping are the view language's),
+    # and `sounds:` becomes one `match` from a sound's name to its drawn markup, with the sound file and image
+    # resolved to their fingerprinted paths here. The result is `{ "fns" => [...], "attachment" => bool, "sounds" => bool }`.
+    # `need: :sounds` is a `{% if x|sound :profile %}`, which is refused for a sanitizer that declares none.
+    def sanitizer_renderers(node, profile, report, need: nil)
+      entry = (@flags["sanitizers"] || {})[profile]
+      return unless entry # view_value refuses a sanitizer that is not declared
+
+      report.call("`|sound :#{profile}` needs sanitizer `#{profile}` to declare `sounds:`") if need == :sounds && !entry["sounds"]
+      done = (@flags["sanitize_renderers"] ||= {})
+      return done[profile] if done.key?(profile)
+
+      dir = @flags["views"] || Views::DEFAULT_DIR
+      folder = Views.folder(@path)
+      fns = []
+      out = { "fns" => fns }
+      if (partial = entry["attachments"]&.[]("application/vnd.actiontext.opengraph-embed"))
+        fns << sanitizer_partial_fn(node, "axum_dsl_render_#{profile}_#{partial}", partial, SANITIZER_PARTIALS["attachment"], dir, folder, report)
+        out["attachment"] = "axum_dsl_render_#{profile}_#{partial}"
+      end
+      if (partial = entry["attachments"]&.[](Sanitize::MENTION_TYPE))
+        fns << sanitizer_partial_fn(node, "axum_dsl_render_#{profile}_#{partial}", partial, SANITIZER_PARTIALS["mention"], dir, folder, report)
+        out["mention"] = "axum_dsl_render_#{profile}_#{partial}"
+      end
+      if entry["sounds"]
+        text_fn = "axum_dsl_render_#{profile}_#{entry['sound_partials']['text']}"
+        image_fn = "axum_dsl_render_#{profile}_#{entry['sound_partials']['image']}"
+        fns << sanitizer_partial_fn(node, text_fn, entry["sound_partials"]["text"], SANITIZER_PARTIALS["text"], dir, folder, report)
+        fns << sanitizer_partial_fn(node, image_fn, entry["sound_partials"]["image"], SANITIZER_PARTIALS["image"], dir, folder, report)
+        arms = entry["sounds"].map do |sound|
+          mp3 = sanitizer_asset(report, profile, "#{sound['name']}.mp3")
+          call =
+            if sound["image"]
+              "#{image_fn}(#{AxumDsl.rstr(mp3)}, #{AxumDsl.rstr(sanitizer_asset(report, profile, sound['image']))}, #{AxumDsl.rstr(sound['width'].to_s)}, #{AxumDsl.rstr(sound['height'].to_s)})"
+            else
+              "#{text_fn}(#{AxumDsl.rstr(mp3)}, #{AxumDsl.rstr(sound['text'])})"
+            end
+          "        #{AxumDsl.rstr(sound['name'])} => Some(#{call}),"
+        end
+        fns << "fn axum_dsl_sound_#{profile}_render(name: &str) -> Option<String> {\n    match name {\n#{arms.join("\n")}\n        _ => None,\n    }\n}"
+        out["sounds"] = true
+      end
+      done[profile] = out
+    end
+
+    # The fingerprinted URL of `file` under the one digest mount, for a sanitizer's sound (asset_path, resolved here).
+    def sanitizer_asset(report, profile, file)
+      mounts = @flags["asset_mounts"].to_a
+      unless mounts.size == 1
+        report.call("sanitizer `#{profile}` names the file #{file.inspect}, which needs one `static \"/assets\", dir: \"public\", digest: true` mount; the file has #{mounts.size}")
+      end
+      url = (@flags["asset_urls"] || {}).dig(mounts[0], file)
+      return url if url
+
+      known = ((@flags["asset_urls"] || {})[mounts[0]] || {}).keys.sort
+      report.call("sanitizer `#{profile}` names #{file.inspect}, which is no file under the #{mounts[0].inspect} mount (files: #{known.join(', ')}); only a copied file has a fingerprinted path")
+    end
+
+    # One partial of a sanitizer as a Rust function: `fn name(_a: &str, _b: bool) -> String`, the partial's pieces flattened.
+    def sanitizer_partial_fn(node, fname, partial_name, params, dir, folder, report)
+      partial = view_file(partial_name, dir, folder, report)
+      if partial.yields || partial.region_yields.any? || partial.fills.any?
+        report.call("#{partial.rel} is drawn by a sanitizer, with no layout around it: it may not write `{{ yield }}` or use a region")
+      end
+      check_partial_locals(node, "sanitizer partial :#{partial_name}", partial, params.map(&:first))
+      locals = params.to_h { |n, t| [n, [node, ["_#{n}", { "bool" => :bool, "i64" => :i64 }.fetch(t, :str), true]]] }
+      saved = [@view_regions, @view_nest, @view_regions_open]
+      @view_regions = {}
+      @view_nest = 0
+      @view_regions_open = true
+      begin
+        pieces = view_parts(node, partial, locals, nil, [partial.rel], dir, folder, report)
+      ensure
+        @view_regions, @view_nest, @view_regions_open = saved
+      end
+      code, = view_flatten(pieces)
+      sig = params.map { |n, t| "_#{n}: #{{ 'bool' => 'bool', 'i64' => 'i64' }.fetch(t, '&str')}" }.join(", ")
+      "fn #{fname}(#{sig}) -> String {\n    let mut __out = String::new();\n    #{code}\n    __out\n}"
+    end
+
+    # One `{% for x in xs %}`: a `for` statement that writes the body into the render's buffer for each
+    # element, `for __it_x in &xs { ... }`; a body that writes nothing is no piece at all.
     # The loop's markers are the body's own (segment_parts), resolved against the locals plus the loop variable,
     # whose Rust name is dunder-prefixed so a body that never reads it is no unused-variable warning. The loop
     # variable is a third element on its local's pair -- the list's element type -- which is what tells a marker
@@ -3267,19 +4258,15 @@ module AxumDsl
       end
       item = "__it_#{var}"
       shown = elem == :string ? ["#{item}.as_str()", :str, true] : [item, elem, true]
-      fmt, vals = segment_parts(node, view, seg["body"], locals.merge(var => [node, shown, elem]), nil, chain, dir, folder, report)
-      text =
-        if vals.empty?
-          AxumDsl.rstr(fmt.gsub("{{", "{").gsub("}}", "}"))
-        else
-          "&format!(#{AxumDsl.rstr(fmt)}#{vals.map { |v| ", #{v}" }.join})"
-        end
-      "{ let mut __s = String::new(); for #{item} in &#{list} { __s.push_str(#{text}); } __s }"
+      body = nested { segment_parts(node, view, seg["body"], locals.merge(var => [node, shown, elem]), nil, chain, dir, folder, report) }
+      code, bytes, vals = view_flatten(body)
+      return nil if code.empty?
+
+      [:code, "for #{item} in &#{list} { #{code} }", bytes, vals]
     end
 
-    # One `{% if name %}`: a block that builds the taken branch's text and is spliced into the caller's
-    # format! as one argument, as a loop is:
-    # `{ let mut __s = String::new(); if cond { __s.push_str(&format!(...)); } else { ... } __s }`.
+    # One `{% if name %}`: an `if` statement whose branches write into the render's buffer, as a loop does;
+    # an if that writes nothing either way is no piece at all.
     # The condition is a bool, or a nil-able value with Ruby's truthiness (nil and false are false; for a
     # nil-able bool, `Some(false)` is false too). A nil-able name is narrowed inside the taken branch: the
     # branch is guarded by `if let Some(__if_name) = ...`, and the name resolves to that binding there, so a
@@ -3288,31 +4275,15 @@ module AxumDsl
     # which is sound because a field has no binding of its own to shadow.
     def view_if(node, view, seg, locals, chain, dir, folder, report)
       where = "#{view.rel}:#{seg['line']}"
+      sanitizer_renderers(node, seg["profile"], report, need: :sounds) if seg["test"] == "sound"
       cond, narrowed, key = if_condition(where, seg, locals, report)
       branch = narrowed ? locals.merge(key => [node, narrowed]) : locals
-      taken = view_branch(node, view, seg["then"], branch, chain, dir, folder, report)
-      otherwise = view_branch(node, view, seg["else"], locals, chain, dir, folder, report)
-      # An if that writes nothing either way has no accumulator to mutate (and no `mut` warning to raise).
-      return "String::new()" if taken.empty? && otherwise.empty?
+      taken, taken_bytes, taken_vals = view_flatten(nested { segment_parts(node, view, seg["then"], branch, nil, chain, dir, folder, report) })
+      otherwise, other_bytes, other_vals = view_flatten(nested { segment_parts(node, view, seg["else"], locals, nil, chain, dir, folder, report) })
+      return nil if taken.empty? && otherwise.empty?
 
-      else_text = seg["else"].empty? ? "" : " else { #{otherwise} }"
-      "{ let mut __s = String::new(); if #{cond} { #{taken} }#{else_text} __s }"
-    end
-
-    # One branch of an `{% if %}`: the pushes that build its text, or the empty string when it writes none.
-    # It is built as a loop's body is (segment_parts), so a nested marker, partial, loop or `{% if %}` is
-    # just more of it.
-    def view_branch(node, view, segments, locals, chain, dir, folder, report)
-      fmt, vals = segment_parts(node, view, segments, locals, nil, chain, dir, folder, report)
-      return "" if fmt.empty?
-
-      text =
-        if vals.empty?
-          AxumDsl.rstr(fmt.gsub("{{", "{").gsub("}}", "}"))
-        else
-          "&format!(#{AxumDsl.rstr(fmt)}#{vals.map { |v| ", #{v}" }.join})"
-        end
-      "__s.push_str(#{text});"
+      else_text = otherwise.empty? ? "" : " else { #{otherwise} }"
+      [:code, "if #{cond} { #{taken} }#{else_text}", [taken_bytes, other_bytes].max, [taken_vals, other_vals].max]
     end
 
     # The Rust condition of an `{% if %}`, the pair the taken branch reads the name as (or nil), and the key
@@ -3331,7 +4302,22 @@ module AxumDsl
         end
       shown = seg["field"] ? "#{name}.#{seg['field']}" : name
       value = wrap([expr, type, seg["var"] && seg["field"] ? true : pair[1][2]])
-      return [value, nil, name] if type == :bool
+      if seg["test"] == "all_emoji"
+        unless %i[str string].include?(type)
+          report.call("#{where}: `{% if #{shown}|all_emoji %}` needs an HTML string, got #{TypeNames.display(type)}")
+        end
+        @flags["all_emoji"] = true # the emitter writes the predicate (and its regex dependency) only into a crate that uses it
+        return ["axum_dsl_all_emoji(#{type == :str ? value : "&#{value}"})", nil, name]
+      end
+      if seg["test"] == "sound"
+        unless %i[str string].include?(type)
+          report.call("#{where}: `{% if #{shown}|sound :#{seg['profile']} %}` needs an HTML string, got #{TypeNames.display(type)}")
+        end
+        (@flags["sanitize_profiles"] ||= {})[seg["profile"]] = true
+        return ["#{Sanitize.sound_fn_name(seg['profile'])}(#{type == :str ? value : "&#{value}"})", nil, name]
+      end
+      # The condition stands alone after `if`, so a comparison local keeps no parens (rustc: unused_parens).
+      return [unparen(value), nil, name] if type == :bool
 
       inner = OPT[type]
       unless inner
@@ -3437,7 +4423,7 @@ module AxumDsl
 
     # Inline one `{{ partial :name, ... }}`: read the partial (a compile-time input, like a view), check the
     # call against the names its markers read, resolve each argument's value in the caller's locals, then
-    # splice the partial's own pieces into the caller's format!. `chain` catches a partial that reaches itself
+    # splice the partial's own pieces into the caller's. `chain` catches a partial that reaches itself
     # directly or through a chain before the recursion can run away.
     def expand_partial(node, caller, seg, locals, chain, dir, folder, report)
       partial = view_file(seg["name"], dir, folder, report)
@@ -3450,6 +4436,10 @@ module AxumDsl
         line = partial.segments.find { |s| s["kind"] == "yield" }["line"]
         report.call("#{where}: #{partial.rel}:#{line} writes `{{ yield }}`, but a partial is inlined into its " \
                     "caller and has no child of its own; `{{ yield }}` belongs only in a layout")
+      end
+      if (region = partial.region_yields.first)
+        report.call("#{where}: #{partial.rel}:#{region['line']} writes `{{ yield :#{region['name']} }}`, but a partial is inlined into its " \
+                    "caller and has no regions of its own; `{{ yield :name }}` belongs only in a layout")
       end
       args = seg["args"]
       arg_locals = {}
@@ -3483,7 +4473,17 @@ module AxumDsl
                       "reads a local the render does not pass")
         end
 
-        value["var"] ? loop_scalar(node, "#{caller.rel}:#{seg['line']}", value["text"], pair, value["field"], report) : pair
+        return pair unless value["var"]
+
+        where = "#{caller.rel}:#{seg['line']}"
+        # A list field of a loop variable (a record's `field :boosts, list(:Boost), from: ...`) is passed on as a list,
+        # which the partial may loop over; any other field is a scalar the partial writes.
+        if value["field"] && (type = loop_field_type(where, value["text"], pair[2], value["field"], report)) &&
+           (LISTS[type] || struct_list?(type))
+          return [node, ["#{pair[1][0]}.#{value['field']}", type, false]]
+        end
+
+        loop_scalar(node, where, value["text"], pair, value["field"], report)
       end
     end
 
@@ -3600,8 +4600,10 @@ module AxumDsl
     # the generated crate carries them as static text (HeaderName::from_static and HeaderValue::from_static)
     # and inserting one cannot fail while the service runs; a name or a value that no HTTP header may carry
     # is refused here instead. In a `before` filter that passes the request on, the headers go on the
-    # response the route (or the file service mounted beside it) answers with.
-    def headers_stmt(node, args)
+    # response the route (or the file service mounted beside it) answers with. A route body may also write a
+    # header's value as a string expression (`headers "Link" => "<#{url}>; rel=\"next\""`): it is computed before
+    # the response is built, as `etag(value)` is, and a value no header may carry is dropped at run time.
+    def headers_stmt(node, args, env)
       unless args.size == 1
         bad(node, "headers takes one hash of header names and values, such as `headers \"Cache-Control\" => \"no-store\"`")
       end
@@ -3612,32 +4614,44 @@ module AxumDsl
       end
       bad(node, "headers takes at least one header") if hash.elements.empty?
       given = []
+      found_computed = []
       hash.elements.each do |el|
         bad(el, "unsupported #{nodename(el)} in headers (use `\"Name\" => \"value\"`)") unless el.is_a?(Prism::AssocNode)
         name = el.key
         value = el.value
         bad(name, "a header name is a string literal, such as \"Cache-Control\"") unless name.is_a?(Prism::StringNode)
-        bad(value, "the value of header #{name.unescaped.inspect} is a string literal") unless value.is_a?(Prism::StringNode)
+        unless value.is_a?(Prism::StringNode) || @kind == :route
+          bad(value, "the value of header #{name.unescaped.inspect} is a string literal")
+        end
         n = name.unescaped
         unless n.match?(HEADER_NAME)
           bad(name, "#{n.inspect} is not a header name; a name is letters, digits and !#$%&'*+-.^_`|~")
+        end
+        unless value.is_a?(Prism::StringNode)
+          # A route's header may be computed, like `etag(value)`: a string expression evaluated before the response is built.
+          computed = expr(value, env)
+          bad(value, "the value of header #{n.inspect} is a string, got #{TypeNames.display(computed[1])}") unless %i[str string].include?(computed[1])
+          bad(el, "duplicate header #{n.inspect}") if (given + found_computed).any? { |g| g[0].casecmp?(n) }
+          found_computed << [n, "#{computed[0]}.to_string()"]
+          next
         end
         v = value.unescaped
         bad(value, "the value of header #{n.inspect} cannot carry a control character") unless v.match?(HEADER_VALUE)
         if v.start_with?(" ", "\t") || v.end_with?(" ", "\t")
           bad(value, "the value of header #{n.inspect} cannot start or end with a space or a tab")
         end
-        bad(el, "duplicate header #{n.inspect}") if given.any? { |g| g[0].casecmp?(n) }
+        bad(el, "duplicate header #{n.inspect}") if (given + found_computed).any? { |g| g[0].casecmp?(n) }
         given << [n, v]
       end
       @headers = given
+      @computed_headers = found_computed
       []
     end
 
     # --- sessions: cookies, current, request values and Bcrypt (docs/sessions.md) -------------------------------
 
     # The calls that make a value from no arguments.
-    REQUEST_VALUES = %i[random_token request_ip user_agent].freeze
+    REQUEST_VALUES = %i[random_token request_ip request_base_url request_path request_method user_agent turbo_frame_request?].freeze
     # The bodies that see the request: a route, a `before` filter and a `current`. `not_found` and `error` run
     # without it, and a helper or a binding computes a value from its arguments.
     REQUEST_KINDS = %i[route before current].freeze
@@ -3672,10 +4686,13 @@ module AxumDsl
       bad(node, "#{what} needs `cookies secret: :setting_name` at the top level of the file: it names the key the cookies are signed with")
     end
 
+    # A cookie name may start with one underscore, as Rails' own `_campfire_session` does.
+    UNDERSCORE_COOKIE = /\A_[a-z][a-z0-9_]*\z/
+
     def cookie_name(arg, what)
       bad(arg, "#{what} names the cookie with a symbol, such as :session_token") unless arg.is_a?(Prism::SymbolNode)
       name = arg.unescaped
-      bad(arg, "#{what}: the cookie name `#{name}` must be snake_case") unless name.match?(SNAKE)
+      bad(arg, "#{what}: the cookie name `#{name}` must be snake_case") unless name.match?(SNAKE) || name.match?(UNDERSCORE_COOKIE)
       name
     end
 
@@ -3837,19 +4854,41 @@ module AxumDsl
       ["__cookies.push(axum_dsl_delete_cookie(#{AxumDsl.rstr(name)}));"]
     end
 
-    # random_token, request_ip and user_agent: values with no arguments. A token is 24 base58 characters from the
+    # random_token, request_ip, request_base_url and user_agent: values with no arguments. request_base_url is
+    # Rails' request.base_url: the scheme and host (with any port) the client asked for, no trailing slash. A token is 24 base58 characters from the
     # system's random source; the address is the peer's (the first X-Forwarded-For entry when `use_layer :trace,
     # forwarded: true` says a proxy is trusted) and the agent is the User-Agent header, empty when it is absent.
+    # request_path is the URI path (no query string), for a `before` filter: the one place that has no params, yet must tell which
+    # request it is running for (a bot key in the path, Authentication#bot_authentication). request_method is the
+    # method in upper case ("GET", "POST", ...), for a route or a `before` filter (Rails' request.get?/request.head?);
+    # a `use_layer :method_override` has already rewritten it.
+    # turbo_frame_request? is Rails' (turbo-rails) turbo_frame_request?: whether the request has a non-blank Turbo-Frame header.
     def request_value_call(node, args)
       name = node.name
       bad(node, "#{name} takes no arguments") unless args.empty?
       request_only!(node, name) unless name == :random_token
+      bad(node, "request_path is the path a `before` filter is running for; a route reads its path through `params`") if name == :request_path && @kind != :before
+      if name == :request_method && !%i[route before].include?(@kind)
+        bad(node, "request_method reads the request: use it in a route or a `before` filter")
+      end
       (@flags["builtins"] ||= {})[name.to_s] = true
       case name
       when :random_token then ["axum_dsl_random_token()", :string, true]
       when :request_ip
         need(:headers, :peer)
         ["axum_dsl_request_ip(&__headers, __peer)", :string, true]
+      when :request_base_url
+        need(:headers)
+        ["axum_dsl_request_base_url(&__headers)", :string, true]
+      when :request_path
+        need(:path)
+        ["__path.clone()", :string, true]
+      when :request_method
+        need(:method)
+        ["__method.as_str().to_string()", :string, true]
+      when :turbo_frame_request?
+        need(:headers)
+        ["axum_dsl_turbo_frame_request(&__headers)", :bool, true]
       else
         need(:headers)
         ["axum_dsl_user_agent(&__headers)", :string, true]

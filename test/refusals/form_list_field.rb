@@ -2,8 +2,12 @@
 server "refuse", version: "0.1.0"
 set :port, 8080
 
+params :Q do
+  field :a, :string
+end
+
 params :P do
-  field :tags, list(:string), in: :form
+  field :tags, list(:Q), in: :form
 end
 
 post "/x", params: :P do

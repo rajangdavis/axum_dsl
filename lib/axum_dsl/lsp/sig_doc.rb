@@ -28,7 +28,7 @@ module AxumDsl
       }.freeze
 
       # A field's scalar and list types; a field may also name a CamelCase params group.
-      FIELD_TYPE_NAMES = (TYPES.keys + FIELD_LISTS).freeze
+      FIELD_TYPE_NAMES = (TYPES.keys + FIELD_LISTS + FIELD_UPLOADS).freeze
 
       EXTRA = { fieldtype: ", or a CamelCase `params` group the file declares" }.freeze
 

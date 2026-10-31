@@ -5,9 +5,10 @@ module AxumDsl
   # the emitted Rust, so the crate carries no template and no template engine -- that is what separates a
   # view from `static`, which copies a file for the running service to serve.
   #
-  # A view holds ten markers and nothing else: `{{ name }}` (an escaped local), `{{ name|raw }}` (the same
+  # A view holds twelve markers and nothing else: `{{ name }}` (an escaped local), `{{ name|raw }}` (the same
   # value with no escaping), `{{ name|sanitize }}` (the same value cleaned as HTML; only for a string),
-  # `{{ yield }}` (a layout's child output, legal only in a layout),
+  # `{{ yield }}` (a layout's child output, legal only in a layout), `{{ yield :nav }}` (a layout's named
+  # region, filled by the page's `{% content_for :nav %}...{% endcontent_for %}`, empty when it fills none),
   # `{% raw %}...{% endraw %}` (copied byte for byte, which is also how a literal `{{` is written),
   # `{{ partial :name, key: value }}` (a partial inlined here), `{% for x in xs %}...{% endfor %}` (the
   # body repeated for each element of a list local, as Askama's `{% for x in xs %}` is),
@@ -32,14 +33,16 @@ module AxumDsl
     # negated form, so a reader is told what to write instead of only what they wrote.
     FORMS = "a marker is one of `{{ name }}` (an escaped local), `{{ name|raw }}` (the same value " \
             "unescaped), `{{ name|sanitize }}` (the same value cleaned as HTML by the compiler's sanitiser), " \
-            "`{{ yield }}` (a layout's child output), `{% raw %}...{% endraw %}` (copied byte " \
+            "`{{ yield }}` (a layout's child output), `{{ yield :nav }}` (a layout's named region, filled by the " \
+            "view's `{% content_for :nav %}...{% endcontent_for %}`), `{% raw %}...{% endraw %}` (copied byte " \
             "for byte, which is also how a literal `{{` is written), `{{ partial :name, key: value }}` " \
             "(a partial inlined here, whose markers read the arguments), `{% for x in xs %}...{% endfor %}` " \
             "(the body repeated for each element of the list `xs`) or `{% if name %}...{% else %}...{% endif %}` " \
             "(one of two branches, taken when the bool or nil-able `name` is true), `{{ csrf_token }}` " \
             "(the token of `use_layer :csrf`, written into a form's `authenticity_token`) or " \
             "`{{ asset_path \"campfire.css\" }}` (the fingerprinted path of a file under a `static ... " \
-            "digest: true` mount)"
+            "digest: true` mount) or `{{ rails_signed_id user_id, purpose: \"user/avatar\", secret: :secret_key }}` " \
+            "(the Rails signed id of an integer local)"
     # No loop variable in sight: the scope a marker is read in when it is not inside a `{% for %}`.
     NO_SCOPE = { open: [], closed: [] }.freeze
     # A loop variable: a new snake_case name.
@@ -56,7 +59,8 @@ module AxumDsl
     # caller's locals its argument values name), and whether it writes `yield`.
     # `args` is the partial's `{% args %}` declaration -- [{ "name", "default" }] with a nil default for a
     # required argument -- or nil when the file declares none.
-    Loaded = Struct.new(:rel, :real, :segments, :names, :yields, :args, keyword_init: true)
+    # `fills` is the `{% content_for %}` segments it writes and `region_yields` the `{{ yield :name }}` ones.
+    Loaded = Struct.new(:rel, :real, :segments, :names, :yields, :args, :fills, :region_yields, keyword_init: true)
 
     # The folder a `render` reads its views from: the server file's folder. `set :views` is a server setting,
     # so a route in a `use_dsl` fragment (controllers/rooms.axum.rb) still reads views/ beside the file being
@@ -110,7 +114,9 @@ module AxumDsl
       args = decls.first && decls.first["args"]
       check_args(args, names, segments, rel, decls.first["line"], bad: bad) if args
       Loaded.new(rel: rel, real: real, segments: segments, names: names,
-                 yields: segments.any? { |s| s["kind"] == "yield" }, args: args)
+                 yields: segments.any? { |s| s["kind"] == "yield" }, args: args,
+                 fills: segments.select { |s| s["kind"] == "content_for" },
+                 region_yields: flat(segments).select { |s| s["kind"] == "yield_region" })
     end
 
     # `{% args %}` against the markers: a partial that declares its arguments declares exactly the names its
@@ -172,7 +178,7 @@ module AxumDsl
     def self.flat(segments)
       segments.flat_map do |s|
         case s["kind"]
-        when "for" then [s] + flat(s["body"])
+        when "for", "content_for" then [s] + flat(s["body"])
         when "if" then [s] + flat(s["then"]) + flat(s["else"])
         else [s]
         end
@@ -185,8 +191,8 @@ module AxumDsl
       when "partial" then seg["names"]
       when "for" then seg["over_field"] ? [] : [seg["over"]]
       when "if" then seg["var"] ? [] : [seg["name"]]
-      when "text", "yield", "args", "csrf", "asset" then []
-      else seg["var"] ? [] : [seg["name"]]
+      when "text", "yield", "yield_region", "content_for", "args", "csrf", "asset" then []
+      else [(seg["var"] ? nil : seg["name"]), seg["host"], seg["mentions"]].compact
       end
     end
 
@@ -237,6 +243,9 @@ module AxumDsl
           if seg["kind"] == "yield" && !frames.empty?
             bad.call("#{rel}:#{line}: `{{ yield }}` is a layout's child output, written once; it cannot sit inside a `{% for %}` or a `{% if %}`")
           end
+          if seg["kind"] == "yield_region" && !frames.empty?
+            bad.call("#{rel}:#{line}: `{{ yield :#{seg['name']} }}` is a layout's region, written once; it cannot sit inside a `{% for %}`, a `{% if %}` or a `{% content_for %}`")
+          end
           out << seg
           i = close + 2
         else
@@ -265,6 +274,25 @@ module AxumDsl
             out << seg
             frames << { kind: "if", out: out, seg: seg, else: false }
             out = seg["then"]
+            i = close + 2
+          elsif directive.match?(/\Acontent_for(\s|\z)/)
+            seg = content_for_directive(directive, rel, line, frames, bad: bad)
+            flush.call
+            out << seg
+            frames << { kind: "content_for", out: out, seg: seg }
+            out = seg["body"]
+            i = close + 2
+          elsif directive == "endcontent_for"
+            frame = frames.last
+            unless frame && frame[:kind] == "content_for"
+              if frame
+                bad.call("#{rel}:#{line}: `{% endcontent_for %}` here closes a `{% content_for %}` that is outside the open `{% #{frame[:kind]} %}`; close the `{% #{frame[:kind]} %}` with `{% end#{frame[:kind]} %}` first")
+              end
+              bad.call("#{rel}:#{line}: `{% endcontent_for %}` here has no `{% content_for %}` before it; a region is `{% content_for :nav %}...{% endcontent_for %}`")
+            end
+            flush.call
+            frames.pop
+            out = frame[:out]
             i = close + 2
           elsif directive.match?(/\Aelse(\s|\z)/)
             frame = frames.last
@@ -297,7 +325,7 @@ module AxumDsl
             frame = frames.last
             unless frame && frame[:kind] == "for"
               if frame
-                bad.call("#{rel}:#{line}: `{% endfor %}` here closes a `{% for %}` that is outside the open `{% if %}`; close the `{% if %}` with `{% endif %}` first")
+                bad.call("#{rel}:#{line}: `{% endfor %}` here closes a `{% for %}` that is outside the open `{% #{frame[:kind]} %}`; close the `{% #{frame[:kind]} %}` with `{% end#{frame[:kind]} %}` first")
               end
               bad.call("#{rel}:#{line}: `{% endfor %}` here has no `{% for %}` before it; a loop is `{% for x in xs %}...{% endfor %}`")
             end
@@ -312,13 +340,18 @@ module AxumDsl
             flush.call
             segments << { "kind" => "args", "line" => line, "args" => args_decl(directive.delete_prefix("args"), rel, line, bad: bad) }
             i = close + 2
+            # A declaration alone on its line emits nothing, newline included, as an ERB comment line does under
+            # Erubi's trim mode (a line holding only `<%# %>` leaves no blank line behind).
+            if (open.zero? || text[open - 1] == "\n") && (nl = text[i..].match(/\A\r?\n/))
+              i += nl[0].length
+            end
           elsif directive == "endraw"
             bad.call("#{rel}:#{line}: `{% endraw %}` here has no `{% raw %}` before it; a raw region is " \
                      "`{% raw %}...{% endraw %}`")
           else
             bad.call("#{rel}:#{line}: `{% #{directive} %}` is not a directive: the only directives are " \
                      "`{% raw %}`, `{% endraw %}`, `{% args %}`, `{% for %}`, `{% endfor %}`, `{% if %}`, " \
-                     "`{% else %}` and `{% endif %}`. #{FORMS}")
+                     "`{% else %}`, `{% endif %}`, `{% content_for %}` and `{% endcontent_for %}`. #{FORMS}")
           end
         end
       end
@@ -327,7 +360,9 @@ module AxumDsl
       unless frames.empty?
         frame = frames.last
         seg = frame[:seg]
-        if frame[:kind] == "if"
+        if frame[:kind] == "content_for"
+          bad.call("#{rel}:#{seg['line']}: this `{% content_for :#{seg['name']} %}` is never closed; a region ends with `{% endcontent_for %}`")
+        elsif frame[:kind] == "if"
           shown = seg["field"] ? "#{seg['name']}.#{seg['field']}" : seg["name"]
           bad.call("#{rel}:#{seg['line']}: this `{% if #{shown} %}` is never closed; a conditional ends with `{% endif %}`")
         else
@@ -335,6 +370,23 @@ module AxumDsl
         end
       end
       segments
+    end
+
+    # One `{% content_for :name %}`: an empty region segment whose body parse fills in. A region is written
+    # once at the top level of a view (the layout writes it where its `{{ yield :name }}` is), so it cannot sit
+    # inside a `{% for %}`, an `{% if %}` or another `{% content_for %}`.
+    def self.content_for_directive(directive, rel, line, frames, bad:)
+      m = directive.match(/\Acontent_for\s+:([A-Za-z_][A-Za-z0-9_]*)\z/)
+      unless m
+        bad.call("#{rel}:#{line}: `{% #{directive} %}` is not a region; a region is `{% content_for :nav %}` " \
+                 "... `{% endcontent_for %}`, named by a symbol")
+      end
+      unless frames.empty?
+        inside = frames.last[:kind] == "content_for" ? "another `{% content_for %}`" : "a `{% #{frames.last[:kind]} %}`"
+        bad.call("#{rel}:#{line}: `{% content_for :#{m[1]} %}` cannot sit inside #{inside}; a region is filled once, " \
+                 "at the top level of the view")
+      end
+      { "kind" => "content_for", "name" => m[1], "line" => line, "body" => [] }
     end
 
     # One `{% for x in name %}` (or `{% for x in y.field %}` over a field of an enclosing loop variable `y`):
@@ -385,6 +437,18 @@ module AxumDsl
         bad.call("#{rel}:#{line}: `{% #{directive} %}` has no condition; a conditional is `{% if name %}` " \
                  "... `{% endif %}`, over one bool or nil-able name")
       end
+      test = nil
+      if form.include?("|")
+        form, _, test = form.partition("|")
+        form = form.strip
+        test = test.strip
+        profile = test[/\Asound\s+:([A-Za-z_][A-Za-z0-9_]*)\z/, 1]
+        unless test == "all_emoji" || profile
+          bad.call("#{rel}:#{line}: `{% if #{form}|#{test} %}`: `|all_emoji` (true when the HTML string `#{form}` has plain text that is only emoji) " \
+                   "and `|sound :profile` (true when it is `/play NAME` for a sound the sanitizer declares) are the only condition filters")
+        end
+        test = "sound" if profile
+      end
       base, dot, field = form.partition(".")
       if form == "yield"
         bad.call("#{rel}:#{line}: `{% if yield %}` is not a condition; `yield` is a layout's child output, not a local")
@@ -392,9 +456,13 @@ module AxumDsl
       outside = ->(name) { bad.call("#{rel}:#{line}: `#{name}` is a loop variable used outside its `{% for %}`; it exists only between `{% for %}` and `{% endfor %}`") }
       if form.match?(NAME)
         outside.call(form) if scope[:closed].include?(form)
-        return { "kind" => "if", "name" => form, "field" => nil, "var" => scope[:open].include?(form),
-                 "line" => line, "then" => [], "else" => [] }
+        seg = { "kind" => "if", "name" => form, "field" => nil, "var" => scope[:open].include?(form),
+                "line" => line, "then" => [], "else" => [] }
+        seg["test"] = test if test
+        seg["profile"] = profile if profile
+        return seg
       end
+      bad.call("#{rel}:#{line}: `|#{test}` reads a plain local, not a loop variable's field") if test
       if base.match?(NAME) && !dot.empty? && field.match?(NAME) && scope[:open].include?(base)
         return { "kind" => "if", "name" => base, "field" => field, "var" => true,
                  "line" => line, "then" => [], "else" => [] }
@@ -424,7 +492,9 @@ module AxumDsl
     # The 1-based line of an offset in the view's own text, for a message that points into the view.
     def self.line_at(text, at) = text[0...at].count("\n") + 1
 
-    # One `{{ ... }}` marker: `name` (escaped), `name|raw` (unescaped), `name|sanitize` (cleaned HTML),
+    # One `{{ ... }}` marker: `name` (escaped), `name|raw` (unescaped), `name|sanitize` (cleaned HTML; `name|sanitize :profile`
+    # with the allowlist a top-level `sanitizer :profile` declares), `name|editable :profile, host: h, mentions: m` (the
+    # editor's `value="..."` attribute for a body, drawn with that sanitizer's attachment partials),
     # `yield` or `partial`. The body holds no expression -- a name is a local, `|raw` and `|sanitize` are the
     # only filters and a partial takes literals and bare names -- so anything else is refused with the forms
     # rather than parsed as Ruby.
@@ -433,20 +503,51 @@ module AxumDsl
       return partial(form, rel, line, scope, bad: bad) if form.match?(/\Apartial\s*:/)
       return { "kind" => "csrf", "line" => line } if form == "csrf_token"
       return asset_path_marker(form, rel, line, bad: bad) if form.match?(/\Aasset_path(\s|\z)/)
+      return signed_global_id_marker(form, rel, line, scope, bad: bad) if form.match?(/\Arails_signed_global_id(\s|\z)/)
+      return signed_id_marker(form, rel, line, scope, bad: bad) if form.match?(/\Arails_signed_id(\s|\z)/)
+      return variation_marker(form, rel, line, scope, bad: bad) if form.match?(/\Aactive_storage_variation(\s|\z)/)
+      return blob_id_marker(form, rel, line, scope, bad: bad) if form.match?(/\Aactive_storage_blob_id(\s|\z)/)
+
+      return yield_region(form, rel, line, bad: bad) if form.match?(/\Ayield[\s:]/)
 
       if form.include?("|")
         name, _, filter = form.partition("|")
         name = name.strip
         filter = filter.strip
-        unless %w[raw sanitize].include?(filter)
-          bad.call("#{rel}:#{line}: `|#{filter}` is not a filter; `|raw` and `|sanitize` are the only ones " \
-                   "(`{{ #{name}|raw }}` writes the value with no escaping, `{{ #{name}|sanitize }}` cleans it as HTML). #{FORMS}")
+        profile = nil
+        host = nil
+        mentions = nil
+        if (m = filter.match(/\A(sanitize|editable)\s+:([A-Za-z_][A-Za-z0-9_]*)(?:\s*,\s*host:\s*([A-Za-z_][A-Za-z0-9_]*))?(?:\s*,\s*mentions:\s*([A-Za-z_][A-Za-z0-9_]*))?\z/))
+          filter = m[1]
+          profile = m[2]
+          host = m[3]
+          mentions = m[4]
         end
-        return named(name, filter, rel, line, scope, bad: bad)
+        unless %w[raw sanitize editable].include?(filter)
+          bad.call("#{rel}:#{line}: `|#{filter}` is not a filter; `|raw`, `|sanitize` and `|editable` are the only ones " \
+                   "(`{{ #{name}|raw }}` writes the value with no escaping, `{{ #{name}|sanitize }}` cleans it as HTML, " \
+                   "`{{ #{name}|sanitize :profile }}` cleans it with a declared `sanitizer :profile`, " \
+                   "`{{ #{name}|editable :profile, host: base_url, mentions: users }}` writes the editor's `value=\"...\"` attribute for a body). #{FORMS}")
+        end
+        seg = named(name, filter, rel, line, scope, bad: bad)
+        seg["profile"] = profile if profile
+        seg["host"] = host if host # the local holding the request host (a sanitizer that renders attachments needs it)
+        seg["mentions"] = mentions if mentions # the local holding the users a sanitizer that draws mentions looks up
+        return seg
       end
       return { "kind" => "yield", "line" => line } if form == "yield"
 
       named(form, "escaped", rel, line, scope, bad: bad)
+    end
+
+    # One `{{ yield :nav }}`: the markup the page filled with `{% content_for :nav %}`, empty when it filled none.
+    def self.yield_region(form, rel, line, bad:)
+      m = form.match(/\Ayield\s+:([A-Za-z_][A-Za-z0-9_]*)\z/)
+      unless m
+        bad.call("#{rel}:#{line}: `{{ #{form} }}` is not a marker; a layout writes the page with `{{ yield }}` and " \
+                 "one of its named regions with `{{ yield :nav }}`, a symbol with no filter")
+      end
+      { "kind" => "yield_region", "name" => m[1], "line" => line }
     end
 
     # One `{{ asset_path "campfire.css" }}`: a file under the one `static ... digest: true` mount. The path
@@ -466,6 +567,109 @@ module AxumDsl
                  "is relative, without a leading / and without ..")
       end
       { "kind" => "asset", "name" => name, "line" => line }
+    end
+
+    # One `{{ rails_signed_id user_id, purpose: "user/avatar", secret: :secret_key }}`: the Rails 8 signed id
+    # (`record.signed_id(purpose:)`) of an integer local, written as its token. The same token the body call
+    # `rails_signed_id_for` makes, for a value that is only known where a view is written (an avatar partial
+    # inside a loop). The purpose is a string with no quotes in it, the secret a setting name; whether the
+    # local is an integer and the setting is a required string is checked where the render is compiled.
+    def self.signed_id_marker(form, rel, line, scope, bad:)
+      rest = form.delete_prefix("rails_signed_id").strip
+      m = rest.match(/\A([A-Za-z_][A-Za-z0-9_]*(?:\.[A-Za-z_][A-Za-z0-9_]*)?)\s*,\s*purpose:\s*"([^"]+)"\s*,\s*secret:\s*:([A-Za-z_][A-Za-z0-9_]*)\z/)
+      unless m
+        bad.call("#{rel}:#{line}: `rails_signed_id` takes an integer local (or a loop variable's field), a purpose and a " \
+                 "secret setting, as in `{{ rails_signed_id user_id, purpose: \"user/avatar\", secret: :secret_key }}`")
+      end
+      base, dot, field = m[1].partition(".")
+      if dot.empty?
+        if scope[:closed].include?(base)
+          bad.call("#{rel}:#{line}: `#{base}` is a loop variable used outside its `{% for %}`; it exists only between `{% for %}` and `{% endfor %}`")
+        end
+        if scope[:open].include?(base)
+          bad.call("#{rel}:#{line}: `#{base}` is a loop variable, not an integer; sign one of its fields (`{{ rails_signed_id #{base}.id, ... }}`)")
+        end
+        return { "kind" => "signed_id", "name" => base, "field" => nil, "purpose" => m[2], "secret" => m[3], "line" => line }
+      end
+      unless scope[:open].include?(base)
+        bad.call("#{rel}:#{line}: `#{m[1]}` is not an integer to sign: `#{base}` is not a loop variable, and only a field of one is read with a dot")
+      end
+      { "kind" => "signed_id", "name" => base, "field" => field, "var" => true, "purpose" => m[2], "secret" => m[3], "line" => line }
+    end
+
+    # One `{{ rails_signed_global_id "User", user.id, app: "campfire", purpose: "attachable", secret: :secret_key }}`:
+    # `record.attachable_sgid`, the signed GlobalID an Action Text mention attachment and an autocomplete
+    # prompt item carry. The model and app are string literals, the purpose optional ("attachable"); the id is
+    # an integer local or a loop variable's field, checked where the render is compiled.
+    def self.signed_global_id_marker(form, rel, line, scope, bad:)
+      rest = form.delete_prefix("rails_signed_global_id").strip
+      m = rest.match(/\A"([^"]+)"\s*,\s*([A-Za-z_][A-Za-z0-9_]*(?:\.[A-Za-z_][A-Za-z0-9_]*)?)\s*,\s*app:\s*"([^"]+)"(?:\s*,\s*purpose:\s*"([^"]+)")?\s*,\s*secret:\s*:([A-Za-z_][A-Za-z0-9_]*)\z/)
+      unless m
+        bad.call("#{rel}:#{line}: `rails_signed_global_id` takes a model, an integer local or loop field, `app:`, an optional `purpose:` and a secret setting, as in " \
+                 "`{{ rails_signed_global_id \"User\", user.id, app: \"campfire\", secret: :secret_key }}`")
+      end
+      base, dot, field = m[2].partition(".")
+      if dot.empty?
+        if scope[:closed].include?(base)
+          bad.call("#{rel}:#{line}: `#{base}` is a loop variable used outside its `{% for %}`; it exists only between `{% for %}` and `{% endfor %}`")
+        end
+        if scope[:open].include?(base)
+          bad.call("#{rel}:#{line}: `#{base}` is a loop variable, not an integer; sign one of its fields (`{{ rails_signed_global_id \"#{m[1]}\", #{base}.id, ... }}`)")
+        end
+        return { "kind" => "signed_global_id", "model" => m[1], "name" => base, "field" => nil, "app" => m[3], "purpose" => m[4] || "attachable", "secret" => m[5], "line" => line }
+      end
+      unless scope[:open].include?(base)
+        bad.call("#{rel}:#{line}: `#{m[2]}` is not an integer to sign: `#{base}` is not a loop variable, and only a field of one is read with a dot")
+      end
+      { "kind" => "signed_global_id", "model" => m[1], "name" => base, "field" => field, "var" => true, "app" => m[3], "purpose" => m[4] || "attachable", "secret" => m[5], "line" => line }
+    end
+
+    # One `{{ active_storage_variation format, resize_to_limit: [1200, 800], secret: :secret_key }}`: the signed
+    # variation key Active Storage puts in a representation URL (`ActiveStorage::Variation#key`), for the string
+    # local (or loop variable field) `format` and the two integer limits. Whether the local is a string and the
+    # setting is a required string is checked where the render is compiled.
+    def self.variation_marker(form, rel, line, scope, bad:)
+      rest = form.delete_prefix("active_storage_variation").strip
+      m = rest.match(/\A([A-Za-z_][A-Za-z0-9_]*(?:\.[A-Za-z_][A-Za-z0-9_]*)?)\s*,\s*resize_to_limit:\s*\[\s*(\d+)\s*,\s*(\d+)\s*\]\s*,\s*secret:\s*:([A-Za-z_][A-Za-z0-9_]*)\z/)
+      unless m
+        bad.call("#{rel}:#{line}: `active_storage_variation` takes a string local (or a loop variable's field), the " \
+                 "limits and a secret setting, as in `{{ active_storage_variation format, resize_to_limit: [1200, 800], secret: :secret_key }}`")
+      end
+      base, dot, field = m[1].partition(".")
+      limit = [m[2].to_i, m[3].to_i]
+      if dot.empty?
+        if scope[:closed].include?(base)
+          bad.call("#{rel}:#{line}: `#{base}` is a loop variable used outside its `{% for %}`; it exists only between `{% for %}` and `{% endfor %}`")
+        end
+        if scope[:open].include?(base)
+          bad.call("#{rel}:#{line}: `#{base}` is a loop variable, not a string; use one of its fields (`{{ active_storage_variation #{base}.format, ... }}`)")
+        end
+        return { "kind" => "variation", "name" => base, "field" => nil, "limit" => limit, "secret" => m[4], "line" => line }
+      end
+      unless scope[:open].include?(base)
+        bad.call("#{rel}:#{line}: `#{m[1]}` is not a string: `#{base}` is not a loop variable, and only a field of one is read with a dot")
+      end
+      { "kind" => "variation", "name" => base, "field" => field, "var" => true, "limit" => limit, "secret" => m[4], "line" => line }
+    end
+
+    # One `{{ active_storage_blob_id blob.id, secret: :secret_key }}`: `blob.signed_id`, the token of a blob in an
+    # Active Storage URL (signed by ActiveStorage.verifier, so not a record `rails_signed_id`). The integer local or
+    # loop variable field is checked where the render is compiled.
+    def self.blob_id_marker(form, rel, line, scope, bad:)
+      rest = form.delete_prefix("active_storage_blob_id").strip
+      m = rest.match(/\A([A-Za-z_][A-Za-z0-9_]*(?:\.[A-Za-z_][A-Za-z0-9_]*)?)\s*,\s*secret:\s*:([A-Za-z_][A-Za-z0-9_]*)\z/)
+      unless m
+        bad.call("#{rel}:#{line}: `active_storage_blob_id` takes an integer local (or a loop variable's field) and a secret " \
+                 "setting, as in `{{ active_storage_blob_id blob_id, secret: :secret_key }}`")
+      end
+      base, dot, field = m[1].partition(".")
+      if dot.empty?
+        bad.call("#{rel}:#{line}: `#{base}` is a loop variable used outside its `{% for %}`") if scope[:closed].include?(base)
+        bad.call("#{rel}:#{line}: `#{base}` is a loop variable, not an integer; use one of its fields") if scope[:open].include?(base)
+        return { "kind" => "blob_id", "name" => base, "field" => nil, "secret" => m[2], "line" => line }
+      end
+      bad.call("#{rel}:#{line}: `#{m[1]}` is not an integer: `#{base}` is not a loop variable") unless scope[:open].include?(base)
+      { "kind" => "blob_id", "name" => base, "field" => field, "var" => true, "secret" => m[2], "line" => line }
     end
 
     # One `{{ partial :name, key: value, ... }}`: the partial to inline and its flat arguments. An argument

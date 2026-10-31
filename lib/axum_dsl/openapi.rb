@@ -67,7 +67,8 @@ module AxumDsl
       parameters = %w[path query].flat_map { |loc| by_source.fetch(loc, []).map { |f| parameter(f, loc, groups, used) } }
       op["parameters"] = parameters unless parameters.empty?
       media, fields = if by_source.key?("body") then ["application/json", by_source["body"]]
-                      elsif by_source.key?("form") then ["application/x-www-form-urlencoded", by_source["form"]]
+                      elsif by_source.key?("form")
+                        [by_source["form"].any? { |f| f["type"] == "upload" } ? "multipart/form-data" : "application/x-www-form-urlencoded", by_source["form"]]
                       end
       if fields
         body = { "content" => { media => { "schema" => object_schema(fields, groups, used) } } }
@@ -137,6 +138,7 @@ module AxumDsl
       when "i32", "i64" then { "type" => "integer", "format" => INTEGER_FORMAT.fetch(type) }
       when "f64" then { "type" => "number", "format" => "double" }
       when "bool" then { "type" => "boolean" }
+      when "upload" then { "type" => "string", "format" => "binary" }
       when *LIST_ITEMS.keys then { "type" => "array", "items" => type_schema(LIST_ITEMS.fetch(type), groups, used) }
       when CompositeTypes::OBJECT_LIST_FIELD then { "type" => "array", "items" => ref(Regexp.last_match(1), used) }
       when CompositeTypes::OPAQUE_LIST_FIELD then { "type" => "array", "items" => {} }

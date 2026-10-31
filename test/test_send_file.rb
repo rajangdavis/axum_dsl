@@ -50,6 +50,21 @@ class TestSendFile < Minitest::Test
     assert_includes main, "let __path ="
   end
 
+  def test_disposition_adds_rails_send_file_headers_only_when_named
+    plain = files(route).fetch("src/main.rs")
+    refute_includes plain, "CONTENT_DISPOSITION"
+    refute_includes plain, "content-transfer-encoding"
+    inline = files(route('send_file("#{setting(:files)}/#{params[:name]}", content_type: "image/webp", disposition: :inline)')).fetch("src/main.rs")
+    assert_includes inline, "CONTENT_DISPOSITION"
+    assert_includes inline, "inline; filename="
+    assert_includes inline, "content-transfer-encoding"
+  end
+
+  def test_an_unknown_disposition_is_refused
+    message = refusal(route('send_file("#{setting(:files)}/#{params[:name]}", content_type: "image/webp", disposition: :sideways)'))
+    assert_includes message, "disposition: is :inline or :attachment"
+  end
+
   def test_the_tokio_fs_feature_is_added_only_for_send_file
     files = files(route)
     assert_match(/tokio = \{ version = "1", features = \[.*"fs".*\] \}/, files.fetch("Cargo.toml"))

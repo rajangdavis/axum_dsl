@@ -9,7 +9,16 @@ tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "signal
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 anyhow = "1"
+tikv-jemallocator = "0.6"
 regex = "1"
 tower-http = { version = "0.6", features = ["compression-gzip", "cors", "timeout", "trace"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+libc = "0.2"
+
+# One codegen unit with fat LTO; not `panic = "abort"`, so a panicking request still answers 500.
+[profile.release]
+lto = "fat"
+codegen-units = 1

@@ -62,16 +62,65 @@ fn axum_dsl_html_escape(input: &str) -> std::borrow::Cow<'_, str> {
     }
 }
 
+// HTML escaping for a view's `{{ name }}`, written into the render's buffer: written by the compiler
+fn axum_dsl_html_escape_into(out: &mut String, input: &str) {
+    let mut copied = 0;
+    for (i, c) in input.char_indices() {
+        let replacement = match c {
+            '&' => "&amp;",
+            '<' => "&lt;",
+            '>' => "&gt;",
+            '"' => "&quot;",
+            '\'' => "&#39;",
+            _ => continue,
+        };
+        out.push_str(&input[copied..i]);
+        out.push_str(replacement);
+        copied = i + c.len_utf8();
+    }
+    out.push_str(&input[copied..]);
+}
+
 // HTML sanitising for `{{ name|sanitize }}` (ammonia): written by the compiler
-fn axum_dsl_sanitize(html: &str) -> String {
-    ::ammonia::Builder::default()
-        .add_generic_attributes(&["class"])
-        .clean(html)
-        .to_string()
+// One builder, and the output memoized because sanitize is pure: this runs once per message body on every
+// render, and skipping it made message pages 41-69% faster (WAVE-PLAN Track AP, AP4 measured).
+static AXUM_DSL_SANITIZER: std::sync::LazyLock<::ammonia::Builder<'static>> = std::sync::LazyLock::new(|| {
+    let mut builder = ::ammonia::Builder::default();
+    builder.add_generic_attributes(&["class"]);
+    builder
+});
+static AXUM_DSL_SANITIZED: std::sync::LazyLock<std::sync::RwLock<(std::collections::HashMap<String, String>, usize)>> =
+    std::sync::LazyLock::new(|| std::sync::RwLock::new((std::collections::HashMap::new(), 0)));
+const AXUM_DSL_SANITIZED_MAX: usize = 8 << 20;
+
+fn axum_dsl_sanitize_into(buf: &mut String, html: &str) {
+    let cacheable = html.len() <= 64 << 10;
+    if cacheable {
+        let cache = AXUM_DSL_SANITIZED.read().unwrap_or_else(|p| p.into_inner());
+        if let Some(out) = cache.0.get(html) {
+            buf.push_str(out);
+            return;
+        }
+    }
+    let out = AXUM_DSL_SANITIZER.clean(html).to_string();
+    buf.push_str(&out);
+    if cacheable {
+        let mut cache = AXUM_DSL_SANITIZED.write().unwrap_or_else(|p| p.into_inner());
+        let (map, bytes) = &mut *cache;
+        if !map.contains_key(html) {
+            let size = html.len() + out.len();
+            if *bytes + size > AXUM_DSL_SANITIZED_MAX {
+                map.clear();
+                *bytes = 0;
+            }
+            map.insert(html.to_owned(), out);
+            *bytes += size;
+        }
+    }
 }
 
 async fn route_1() -> ::axum::response::Response {
-    let response = ::axum::response::IntoResponse::into_response(::axum::response::Html({ let __yield = format!("<h1>Sign up</h1>\n<form method=\"post\" action=\"/signup\">\n\n  <p><label for=\"{}\">{}</label>\n     <input id=\"{}\" name=\"{}\" value=\"{}\"></p>\n  <small class=\"hint\">{}</small>\n  <p class=\"error\">{}</p>\n\n\n  <p><label for=\"{}\">{}</label>\n     <input id=\"{}\" name=\"{}\" value=\"{}\"></p>\n  <small class=\"hint\">{}</small>\n  <p class=\"error\">{}</p>\n\n  <p><button type=\"submit\">Sign up</button></p>\n</form>\n", axum_dsl_html_escape("name").into_owned(), axum_dsl_html_escape("Name").into_owned(), axum_dsl_html_escape("name").into_owned(), axum_dsl_html_escape("name").into_owned(), axum_dsl_html_escape("").into_owned(), axum_dsl_html_escape("Required").into_owned(), axum_dsl_html_escape("").into_owned(), axum_dsl_html_escape("email").into_owned(), axum_dsl_html_escape("Email").into_owned(), axum_dsl_html_escape("email").into_owned(), axum_dsl_html_escape("email").into_owned(), axum_dsl_html_escape("").into_owned(), axum_dsl_html_escape("Never shared").into_owned(), axum_dsl_html_escape("").into_owned()); format!("<!doctype html>\n<html lang=\"en\">\n<head>\n  <meta charset=\"utf-8\">\n  <title>{}</title>\n</head>\n<body>\n<main>\n{}\n</main>\n\n  <script id=\"client-template\" type=\"text/x-template\">\n    <p>Hello {{{{ client_side }}}}, you have {{{{ count }}}} new notes.</p>\n  </script>\n\n</body>\n</html>\n", axum_dsl_html_escape("Sign up").into_owned(), __yield) }));
+    let response = ::axum::response::IntoResponse::into_response(::axum::response::Html({ let mut __out = String::with_capacity(689); __out.push_str("<!doctype html>\n<html lang=\"en\">\n<head>\n  <meta charset=\"utf-8\">\n  <title>Sign up</title>\n</head>\n<body>\n<main>\n<h1>Sign up</h1>\n<form method=\"post\" action=\"/signup\">\n  <p><label for=\"name\">Name</label>\n     <input id=\"name\" name=\"name\" value=\"\"></p>\n  <small class=\"hint\">Required</small>\n  <p class=\"error\"></p>\n\n  <p><label for=\"email\">Email</label>\n     <input id=\"email\" name=\"email\" value=\"\"></p>\n  <small class=\"hint\">Never shared</small>\n  <p class=\"error\"></p>\n\n  <p><button type=\"submit\">Sign up</button></p>\n</form>\n\n</main>\n\n  <script id=\"client-template\" type=\"text/x-template\">\n    <p>Hello {{ client_side }}, you have {{ count }} new notes.</p>\n  </script>\n\n</body>\n</html>\n"); __out }));
     response
 }
 
@@ -83,19 +132,19 @@ async fn route_2(axum::extract::Form(__form): axum::extract::Form<SignupForm>) -
     };
     let SignupForm { name, email } = __form;
     let name_error = __errors.get("name").cloned().unwrap_or_default();
-    let response = { let mut __stated = if name_error == "" { ::axum::response::IntoResponse::into_response(::axum::response::Html({ let __yield = format!("<h1>Thanks, {}</h1>\n{}\n", axum_dsl_html_escape(&name).into_owned(), format!("<p>Confirmation sent to <code>{}</code>.</p>", axum_dsl_html_escape(&email).into_owned()).to_string()); format!("<!doctype html>\n<html lang=\"en\">\n<head>\n  <meta charset=\"utf-8\">\n  <title>{}</title>\n</head>\n<body>\n<main>\n{}\n</main>\n\n  <script id=\"client-template\" type=\"text/x-template\">\n    <p>Hello {{{{ client_side }}}}, you have {{{{ count }}}} new notes.</p>\n  </script>\n\n</body>\n</html>\n", axum_dsl_html_escape("Thanks").into_owned(), __yield) })) } else { ::axum::response::IntoResponse::into_response(::axum::response::Html({ let __yield = format!("<h1>Sign up</h1>\n<form method=\"post\" action=\"/signup\">\n\n  <p><label for=\"{}\">{}</label>\n     <input id=\"{}\" name=\"{}\" value=\"{}\"></p>\n  <small class=\"hint\">{}</small>\n  <p class=\"error\">{}</p>\n\n\n  <p><label for=\"{}\">{}</label>\n     <input id=\"{}\" name=\"{}\" value=\"{}\"></p>\n  <small class=\"hint\">{}</small>\n  <p class=\"error\">{}</p>\n\n  <p><button type=\"submit\">Sign up</button></p>\n</form>\n", axum_dsl_html_escape("name").into_owned(), axum_dsl_html_escape("Name").into_owned(), axum_dsl_html_escape("name").into_owned(), axum_dsl_html_escape("name").into_owned(), axum_dsl_html_escape(&name).into_owned(), axum_dsl_html_escape("Required").into_owned(), axum_dsl_html_escape(&name_error).into_owned(), axum_dsl_html_escape("email").into_owned(), axum_dsl_html_escape("Email").into_owned(), axum_dsl_html_escape("email").into_owned(), axum_dsl_html_escape("email").into_owned(), axum_dsl_html_escape(&email).into_owned(), axum_dsl_html_escape("Never shared").into_owned(), axum_dsl_html_escape("").into_owned()); format!("<!doctype html>\n<html lang=\"en\">\n<head>\n  <meta charset=\"utf-8\">\n  <title>{}</title>\n</head>\n<body>\n<main>\n{}\n</main>\n\n  <script id=\"client-template\" type=\"text/x-template\">\n    <p>Hello {{{{ client_side }}}}, you have {{{{ count }}}} new notes.</p>\n  </script>\n\n</body>\n</html>\n", axum_dsl_html_escape("Sign up").into_owned(), __yield) })) };
+    let response = { let mut __stated = if name_error == "" { ::axum::response::IntoResponse::into_response(::axum::response::Html({ let mut __out = String::with_capacity(324); __out.push_str("<!doctype html>\n<html lang=\"en\">\n<head>\n  <meta charset=\"utf-8\">\n  <title>Thanks</title>\n</head>\n<body>\n<main>\n<h1>Thanks, "); axum_dsl_html_escape_into(&mut __out, &name); __out.push_str("</h1>\n"); __out.push_str(&format!("<p>Confirmation sent to <code>{}</code>.</p>", axum_dsl_html_escape(&email).into_owned())); __out.push_str("\n\n</main>\n\n  <script id=\"client-template\" type=\"text/x-template\">\n    <p>Hello {{ client_side }}, you have {{ count }} new notes.</p>\n  </script>\n\n</body>\n</html>\n"); __out })) } else { ::axum::response::IntoResponse::into_response(::axum::response::Html({ let mut __out = String::with_capacity(737); __out.push_str("<!doctype html>\n<html lang=\"en\">\n<head>\n  <meta charset=\"utf-8\">\n  <title>Sign up</title>\n</head>\n<body>\n<main>\n<h1>Sign up</h1>\n<form method=\"post\" action=\"/signup\">\n  <p><label for=\"name\">Name</label>\n     <input id=\"name\" name=\"name\" value=\""); axum_dsl_html_escape_into(&mut __out, &name); __out.push_str("\"></p>\n  <small class=\"hint\">Required</small>\n  <p class=\"error\">"); axum_dsl_html_escape_into(&mut __out, &name_error); __out.push_str("</p>\n\n  <p><label for=\"email\">Email</label>\n     <input id=\"email\" name=\"email\" value=\""); axum_dsl_html_escape_into(&mut __out, &email); __out.push_str("\"></p>\n  <small class=\"hint\">Never shared</small>\n  <p class=\"error\"></p>\n\n  <p><button type=\"submit\">Sign up</button></p>\n</form>\n\n</main>\n\n  <script id=\"client-template\" type=\"text/x-template\">\n    <p>Hello {{ client_side }}, you have {{ count }} new notes.</p>\n  </script>\n\n</body>\n</html>\n"); __out })) };
     if !__errors.is_empty() { *__stated.status_mut() = ::axum::http::StatusCode::BAD_REQUEST; }
     __stated };
     response
 }
 
 async fn route_3() -> ::axum::response::Response {
-    let response = ::axum::response::IntoResponse::into_response(::axum::response::Html(format!("<p class=\"fragment\">Hello {}.</p>\n", axum_dsl_html_escape("").into_owned())));
+    let response = ::axum::response::IntoResponse::into_response(::axum::response::Html({ let mut __out = String::with_capacity(32); __out.push_str("<p class=\"fragment\">Hello .</p>\n"); __out }));
     response
 }
 
 async fn route_4() -> ::axum::response::Response {
-    let response = ::axum::response::IntoResponse::into_response(::axum::response::Html({ let __yield = format!("<h1>Sign up</h1>\n<form method=\"post\" action=\"/signup\">\n\n  <p><label for=\"{}\">{}</label>\n     <input id=\"{}\" name=\"{}\" value=\"{}\"></p>\n  <small class=\"hint\">{}</small>\n  <p class=\"error\">{}</p>\n\n\n  <p><label for=\"{}\">{}</label>\n     <input id=\"{}\" name=\"{}\" value=\"{}\"></p>\n  <small class=\"hint\">{}</small>\n  <p class=\"error\">{}</p>\n\n  <p><button type=\"submit\">Sign up</button></p>\n</form>\n", axum_dsl_html_escape("name").into_owned(), axum_dsl_html_escape("Name").into_owned(), axum_dsl_html_escape("name").into_owned(), axum_dsl_html_escape("name").into_owned(), axum_dsl_html_escape("").into_owned(), axum_dsl_html_escape("Required").into_owned(), axum_dsl_html_escape("").into_owned(), axum_dsl_html_escape("email").into_owned(), axum_dsl_html_escape("Email").into_owned(), axum_dsl_html_escape("email").into_owned(), axum_dsl_html_escape("email").into_owned(), axum_dsl_html_escape("").into_owned(), axum_dsl_html_escape("Never shared").into_owned(), axum_dsl_html_escape("").into_owned()); format!("<div class=\"plain\">\n{}\n</div>\n", __yield) }));
+    let response = ::axum::response::IntoResponse::into_response(::axum::response::Html({ let mut __out = String::with_capacity(443); __out.push_str("<div class=\"plain\">\n<h1>Sign up</h1>\n<form method=\"post\" action=\"/signup\">\n  <p><label for=\"name\">Name</label>\n     <input id=\"name\" name=\"name\" value=\"\"></p>\n  <small class=\"hint\">Required</small>\n  <p class=\"error\"></p>\n\n  <p><label for=\"email\">Email</label>\n     <input id=\"email\" name=\"email\" value=\"\"></p>\n  <small class=\"hint\">Never shared</small>\n  <p class=\"error\"></p>\n\n  <p><button type=\"submit\">Sign up</button></p>\n</form>\n\n</div>\n"); __out }));
     response
 }
 
@@ -103,13 +152,13 @@ async fn route_4() -> ::axum::response::Response {
 async fn route_5(axum::extract::Query(__query): axum::extract::Query<Greeting>) -> ::axum::response::Response {
     let Greeting { show } = __query;
     let show = show.unwrap_or_default() == "1";
-    let response = ::axum::response::IntoResponse::into_response(::axum::response::Html(format!("<p class=\"greeting\" data-show=\"{}\">Hello</p>\n{}", axum_dsl_html_escape(&show.to_string()).into_owned(), { let mut __s = String::new(); if show { __s.push_str("<p class=\"shown\">The condition held.</p>"); } else { __s.push_str("<p class=\"hidden\">The condition did not hold.</p>"); } __s })));
+    let response = ::axum::response::IntoResponse::into_response(::axum::response::Html({ let mut __out = String::with_capacity(108); __out.push_str("<p class=\"greeting\" data-show=\""); let _ = ::std::fmt::Write::write_fmt(&mut __out, format_args!("{}", show)); __out.push_str("\">Hello</p>\n"); if show { __out.push_str("<p class=\"shown\">The condition held.</p>"); } else { __out.push_str("<p class=\"hidden\">The condition did not hold.</p>"); } __out }));
     response
 }
 
 async fn route_6() -> ::axum::response::Response {
     let content = "<p>Hi <strong>there</strong><script>alert(1)</script><a href=\"javascript:alert(2)\">link</a></p>";
-    let response = ::axum::response::IntoResponse::into_response(::axum::response::Html(format!("<div class=\"body\">{}</div>", axum_dsl_sanitize(content))));
+    let response = ::axum::response::IntoResponse::into_response(::axum::response::Html({ let mut __out = String::with_capacity(40); __out.push_str("<div class=\"body\">"); axum_dsl_sanitize_into(&mut __out, content); __out.push_str("</div>"); __out }));
     response
 }
 
@@ -133,8 +182,37 @@ async fn shutdown_signal() {
     }
 }
 
+// jemalloc as the global allocator, and no transparent huge pages on Linux: written by the compiler
+#[global_allocator]
+static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
+
+// jemalloc reads its options from this exported symbol (tikv-jemallocator's `_rjem_` prefix) when it
+// starts, before main. It is a `const char *`, so a thin pointer to the first byte.
+#[cfg(target_os = "linux")]
+#[allow(unsafe_code)]
+#[unsafe(export_name = "_rjem_malloc_conf")]
+pub static JEMALLOC_CONF: Option<&'static std::ffi::c_char> =
+    // SAFETY: points at the first byte of a static, NUL-terminated string.
+    Some(unsafe { &*c"thp:never".as_ptr() });
+
+// With transparent huge pages set to `always`, every thread stack gets backed by whole 2 MB pages as
+// soon as it is touched; nothing here is big enough to gain from them, so the process opts out.
+#[allow(unsafe_code)]
+fn disable_transparent_huge_pages() {
+    #[cfg(target_os = "linux")]
+    {
+        let off: libc::c_ulong = 1;
+        // SAFETY: PR_SET_THP_DISABLE takes machine-width integer arguments and only changes this
+        // process's memory policy.
+        if unsafe { libc::prctl(libc::PR_SET_THP_DISABLE, off, 0 as libc::c_ulong, 0 as libc::c_ulong, 0 as libc::c_ulong) } != 0 {
+            eprintln!("couldn't disable transparent huge pages: {}", std::io::Error::last_os_error());
+        }
+    }
+}
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
+    disable_transparent_huge_pages();
     let router = axum::Router::new()
         .route("/signup", axum::routing::get(route_1))
         .route("/signup", axum::routing::post(route_2))

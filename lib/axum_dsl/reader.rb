@@ -60,12 +60,13 @@ module AxumDsl
               "files" => [], "subprocs" => [], "binding_fns" => [], "opaque_types" => [],
               "statics" => [], "serve_files" => [], "assets" => [], "layers" => [], "views" => nil, "layout" => nil,
               "database" => nil, "migrations" => nil, "records" => [], "queries" => [],
-              "cookies" => nil, "currents" => [], "builtins" => [] }
+              "cookies" => nil, "currents" => [], "builtins" => [], "sanitizers" => [], "cable" => nil }
       @helper_table = {}   # helpers compiled so far, in declaration order: name -> record
       @helper_decls = {}   # helper name -> its DSL node (for messages)
       helper_nodes = []
       current_nodes = []
       route_nodes = []
+      cable_nodes = []
       filters = []
       # One declaration of the file, from this file or from a fragment use_dsl splices in at its line.
       declare = lambda do |n, p, k, b|
@@ -77,6 +78,7 @@ module AxumDsl
         when :helper then helper_nodes << [n, p, k, b]
         when :setting then add_setting(n, p, k, srv)
         when :cookies then add_cookies(n, k, srv)
+        when :sanitizer then add_sanitizer(n, p, k, srv)
         when :current then current_nodes << [n, p, k, b]
         when :database then add_database(n, p, k, srv)
         when :migrations then add_migrations(n, p, srv)
@@ -88,7 +90,8 @@ module AxumDsl
         when :rust_file then add_file(n, p, k, srv)
         when :file then add_any_file(n, p, k, srv)
         when :static then add_static(n, p[0], k[:dir], k, srv)
-        when :serve_file then add_serve_file(n, p[0], k[:from], srv)
+        when :serve_file then add_serve_file(n, p[0], k[:from], k, srv)
+        when :cable then cable_nodes << [n, p, k, b]
         when :openapi then add_openapi(n, p[0], k, srv)
         when :use_layer then add_layer(n, p, k, srv)
         when :use_bindings then add_bindings(n, p, srv)
@@ -117,6 +120,7 @@ module AxumDsl
       check_database(srv)
       check_queries(srv)
       @helper_async = resolve_helper_async(helper_nodes, srv)
+      @helper_blocks = helper_nodes.to_h { |_n, p, _k, b| [p[0].to_s, b] } # a cached route is refused when a helper it calls is not repeatable
       helper_nodes.each { |n, p, k, b| helper_decl(n, p, k, b, srv) }
       srv["user_helpers"] = @helper_table.values
       current_nodes.each { |n, p, k, b| current_decl(n, p, k, b, srv) }
@@ -128,19 +132,29 @@ module AxumDsl
         srv["routes"] << decl
         (@route_decl_nodes ||= []) << [decl, n]
       end
+      cable_nodes.each { |n, p, k, b| add_cable(n, p, k, b, srv) } # after the routes, the currents and the queries it names
+      check_broadcast_sites(srv)
       check_private_cache_except(srv) # statics and routes are both complete now
+      check_rack_defaults(srv)
+      check_response_cache(srv)
       check_filter_skips(srv)
-      srv["filter_skips"] = true if srv["routes"].any? { |r| r["skip"].to_a.any? } || srv["statics"].any? { |s| s["skip"].to_a.any? }
+      # The response cache finds its routes by the same run-time path match a `skip:` uses.
+      srv["filter_skips"] = true if srv["routes"].any? { |r| r["skip"].to_a.any? || r["cache"] } || srv["statics"].any? { |s| s["skip"].to_a.any? } || srv["serve_files"].any? { |f| f["skip"].to_a.any? } || (srv["cable"] && srv["before"].any? { |f| f["name"] })
       check_errors_routes(srv)
       check_openapi(srv)
       lower_bindings(srv)
       srv["checked"] = (@flags["checked"] || {}).keys.sort
       srv["helpers"] = (@flags["helpers"] || {}).keys.sort
       srv["html_escape"] = true if @flags["html_escape"] # a body used h(...), so the crate gets the escaper
+      srv["html_escape_into"] = true if @flags["html_escape_into"] # a view escaped a value into its buffer
       srv["transactions"] = true if @flags["transactions"] # a body opened a transaction, so the crate gets db_tx
       srv["queries_in_tx"] = (@flags["queries_in_tx"] || {}).keys.sort # statements called inside a transaction
       srv["queries_outside"] = (@flags["queries_outside"] || {}).keys.sort # statements whose pooled wrapper is emitted
       srv["sanitize"] = true if @flags["sanitize"] # a view used |sanitize, so the crate gets the sanitiser
+      srv["all_emoji"] = true if @flags["all_emoji"] # a view used `{% if x|all_emoji %}`
+      srv["sanitize_profiles"] = (@flags["sanitize_profiles"] || {}).keys.sort # the declared `sanitizer`s a view named
+      srv["sanitize_renderers"] = @flags["sanitize_renderers"] || {} # the Rust each one's attachment and sound partials compile to
+      srv["editable_profiles"] = (@flags["editable_profiles"] || {}).keys.sort # the sanitizers a view named with `|editable`
       srv["required_current"] = true if @flags["required_current"] # a route read a `required:` current at its non-nil type
       srv["builtins"] = (@flags["builtins"] || {}).keys.sort # random_token, request_ip, user_agent, Bcrypt.*: the runtime each needs
       srv["cookies"].merge!((@flags["cookie_use"] || {}).transform_keys(&:to_s)) if srv["cookies"]
@@ -251,6 +265,11 @@ module AxumDsl
 
         bad(@extern_nodes.fetch(fname),
             "`#{fname}` is declared but never called; call it as rust(:#{fname}, ...) in a body, or remove it")
+      end
+      srv["sanitizers"].each do |s|
+        next if (@flags["sanitize_profiles"] || {})[s["name"]]
+
+        bad(@sanitizer_nodes.fetch(s["name"]), "sanitizer `#{s['name']}` is declared but no view names it; write `{{ body|sanitize :#{s['name']} }}` in a view, or remove it")
       end
       used_settings = @flags["used_settings"] || {}
       srv["settings"].each do |s|
@@ -412,6 +431,89 @@ module AxumDsl
       (@setting_nodes ||= {})[name] = node
       (@flags["settings"] ||= {})[name] = entry
     end
+    # Tags and attributes a `sanitizer` may never allow: they run script or load active content, whatever else
+    # the file says.
+    SANITIZER_FORBIDDEN_TAGS = %w[script style iframe object embed frame frameset applet base meta link noscript template svg math].freeze
+    SANITIZER_FORBIDDEN_ATTRIBUTES = %w[style srcdoc formaction].freeze
+
+    # sanitizer :message_body, tags: %w[p a], attributes: %w[href class], link_rel: false, autolink_target: "_blank"
+    # (docs/views.md): a named allowlist that `{{ body|sanitize :message_body }}` cleans a string with. The lists are
+    # checked here, once; a view naming a sanitizer that is not declared is refused where the view is compiled.
+    def add_sanitizer(node, pos, kw, srv)
+      name = pos[0]
+      bad(node, "duplicate sanitizer `#{name}`#{first_at(node, @sanitizer_nodes&.[](name))}") if srv["sanitizers"].any? { |s| s["name"] == name }
+      tags = kw[:tags]
+      attributes = kw[:attributes]
+      bad(node, "`tags:` of sanitizer `#{name}` names no tag; a sanitizer that allows nothing is `{{ x }}`") if tags.empty?
+      tags.each do |t|
+        bad(node, "`#{t.inspect}` is not a tag name in sanitizer `#{name}`: lowercase letters, digits and `-`") unless t.match?(/\A[a-z][a-z0-9-]*\z/)
+        bad(node, "sanitizer `#{name}` may not allow the tag `#{t}`: it runs script or loads active content") if SANITIZER_FORBIDDEN_TAGS.include?(t)
+      end
+      attributes.each do |a|
+        bad(node, "`#{a.inspect}` is not an attribute name in sanitizer `#{name}`: lowercase letters, digits, `-`, `_` and `:`") unless a.match?(/\A[a-z][a-z0-9_:-]*\z/)
+        bad(node, "sanitizer `#{name}` may not allow the attribute `#{a}`: an event handler or an embedded document runs script") if a.start_with?("on") || SANITIZER_FORBIDDEN_ATTRIBUTES.include?(a)
+      end
+      bad(node, "`tags:` of sanitizer `#{name}` lists a tag twice") unless tags.uniq.size == tags.size
+      bad(node, "`attributes:` of sanitizer `#{name}` lists an attribute twice") unless attributes.uniq.size == attributes.size
+      bad(node, "`link_rel: true` is the default (ammonia adds rel=\"noopener noreferrer\" to links); leave `link_rel:` out, or write `link_rel: false`") if kw[:link_rel] == true
+      target = kw[:autolink_target]
+      bad(node, "`autolink_target:` of sanitizer `#{name}` is a browsing-context name such as \"_blank\", got #{target.inspect}") if target && !target.match?(/\A_?[A-Za-z][A-Za-z0-9_-]*\z/)
+      entry = { "name" => name, "tags" => tags, "attributes" => attributes, **located(node) }
+      entry["link_rel"] = false if kw[:link_rel] == false
+      entry["autolink_target"] = target if target
+      attachments = sanitizer_attachments(node, name, kw[:attachments])
+      entry["attachments"] = attachments unless attachments.empty?
+      sounds, partials = sanitizer_sounds(node, name, kw[:sounds], kw[:sound_partials])
+      unless sounds.empty?
+        entry["sounds"] = sounds
+        entry["sound_partials"] = partials
+      end
+      srv["sanitizers"] << entry
+      (@sanitizer_nodes ||= {})[name] = node
+      (@flags["sanitizers"] ||= {})[name] = entry
+    end
+
+    # The attachment content types a `sanitizer` can render, and the partial arguments each reads (Body::SANITIZER_PARTIALS).
+    SANITIZER_ATTACHMENTS = ["application/vnd.actiontext.opengraph-embed", "application/vnd.campfire.mention"].freeze
+
+    # `attachments: { "application/vnd.actiontext.opengraph-embed" => :opengraph_embed }`: the view partial that draws
+    # an <action-text-attachment> of each content type. Only a type the compiler can read the details of is accepted.
+    def sanitizer_attachments(node, name, hash)
+      (hash || {}).to_h do |type, partial|
+        unless SANITIZER_ATTACHMENTS.include?(type)
+          bad(node, "sanitizer `#{name}` cannot render the attachment type #{type.inspect}; it reads #{SANITIZER_ATTACHMENTS.join(", ")}")
+        end
+        unless partial.is_a?(Symbol) && partial.to_s.match?(Views::NAME)
+          bad(node, "`attachments:` of sanitizer `#{name}` names the partial that draws #{type} with a symbol, such as :opengraph_embed")
+        end
+        [type, partial.to_s]
+      end
+    end
+
+    # `sounds: { "bell" => "🔔", "56k" => ["sounds/56k.webp", 79, 33] }, sound_partials: { text: :sound_with_text, image: :sound_with_image }`:
+    # the names a body of exactly `/play NAME` plays, each with its text or its image (a file under the digest
+    # mount, its width and height), and the two partials that draw them. Returns [the sounds, the partials].
+    def sanitizer_sounds(node, name, sounds, partials)
+      if sounds.nil? || sounds.empty?
+        bad(node, "`sound_partials:` of sanitizer `#{name}` draws the `sounds:` it lists, and it lists none") if partials
+        return [[], nil]
+      end
+      unless partials && %w[text image].sort == partials.keys.map(&:to_s).sort && partials.values.all? { |v| v.is_a?(Symbol) && v.to_s.match?(Views::NAME) }
+        bad(node, "sanitizer `#{name}` lists `sounds:`, so it needs `sound_partials: { text: :sound_with_text, image: :sound_with_image }`: the partials that draw a text sound and an image sound")
+      end
+      list = sounds.map do |sound, what|
+        bad(node, "`#{sound.inspect}` is not a sound name in sanitizer `#{name}`: letters, digits and _ (a body is `/play NAME`)") unless sound.match?(/\A[A-Za-z0-9_]+\z/)
+        if what.is_a?(String)
+          { "name" => sound, "text" => what }
+        elsif what.is_a?(Array) && what.size == 3 && what[0].is_a?(String) && what[1..].all? { |n| n.is_a?(Integer) && n.positive? }
+          { "name" => sound, "image" => what[0], "width" => what[1], "height" => what[2] }
+        else
+          bad(node, "sound `#{sound}` of sanitizer `#{name}` is its text (\"🔔\") or its image [\"sounds/#{sound}.webp\", width, height]")
+        end
+      end
+      [list, partials.to_h { |k, v| [k.to_s, v.to_s] }]
+    end
+
     # The shortest key a cookie may be signed with (Cookies::KEY_MIN).
     COOKIE_KEY_MIN = Cookies::KEY_MIN
 
@@ -564,10 +666,21 @@ module AxumDsl
       each_child(blk, :record) do |n, p, k, _b|
         fname, ftype = p
         bad(n, "duplicate field `#{fname}`") if fields.any? { |f| f["name"] == fname }
+        if (elem = CompositeTypes.object_list_name(ftype))
+          # A list of records is not a column: the query named by `from:` runs once per row, its arguments filled
+          # from this row's fields of the same names (checked in check_queries, once every record is read).
+          from = k[:from] or bad(n, "record field `#{fname}` is a list of #{elem}, which no column holds: name the query that fills it, `field :#{fname}, list(:#{elem}), from: :a_query`")
+          k.each_key { |key| bad(n, "`#{key}:` does not apply to a list field of a record; the only option is `from:`") unless key == :from }
+          field = { "name" => fname, "type" => ftype, "from" => from }
+          note_field(n, field)
+          fields << field
+          next
+        end
         unless Db::SCALARS.include?(ftype)
-          bad(n, "record field `#{fname}` is a column, so its type is one of #{Db::SCALARS.map { |t| ":#{t}" }.join(', ')}, not :#{ftype}")
+          bad(n, "record field `#{fname}` is a column, so its type is one of #{Db::SCALARS.map { |t| ":#{t}" }.join(', ')}, not :#{ftype}; a list of records is `list(:Record), from: :a_query`")
         end
         k.each_key do |key|
+          bad(n, "`from:` fills a list field; a column has none") if key == :from
           bad(n, "`#{key}:` does not apply to a record field; the only option is `optional: true`, for a column that may be NULL") unless key == :optional
         end
         bad(n, "`optional: false` is the default; leave `optional:` out") if k[:optional] == false
@@ -672,6 +785,39 @@ module AxumDsl
       bad(@database_node, "the database is declared but no `query` or `execute` runs against it; add one, or remove `database`") if srv["queries"].empty?
     end
 
+    # A record's list fields (`field :boosts, list(:Boost), from: :boosts_of`): the sub-query runs once per row of
+    # the record, so it must be a query returning list(:Boost), whose arguments are columns of this record with the
+    # same names and types, and the element record is a plain row (one level: no list fields of its own). The
+    # sub-query counts as called, and as called inside a transaction (the row's own connection), so it gets no
+    # pooled wrapper unless a body also calls it.
+    def check_record_lists(srv)
+      names = srv["records"].map { |r| r["name"] }
+      srv["records"].each do |r|
+        node = @record_nodes.fetch(r["name"])
+        r["fields"].select { |f| f["from"] }.each do |f|
+          elem = CompositeTypes.object_list_name(f["type"])
+          child = srv["records"].find { |x| x["name"] == elem } or
+            undeclared(node, "record `#{r['name']}`: field `#{f['name']}` is a list of `#{elem}`, which is not a declared record", elem, names)
+          bad(node, "record `#{r['name']}`: field `#{f['name']}` lists `#{elem}`, which has list fields of its own; one level of lists is supported") if child["fields"].any? { |x| x["from"] }
+          qnames = srv["queries"].select { |q| q["kind"] == "query" }.map { |q| q["name"] }
+          sub = srv["queries"].find { |q| q["name"] == f["from"] && q["kind"] == "query" } or
+            undeclared(node, "record `#{r['name']}`: field `#{f['name']}` is filled `from: :#{f['from']}`, which is not a query", f["from"], qnames)
+          ret = sub["returns"]
+          unless ret && ret["shape"] == "list" && ret["record"] == elem
+            bad(node, "record `#{r['name']}`: field `#{f['name']}` is a list of `#{elem}`, so query `#{sub['name']}` must return list(:#{elem})")
+          end
+          sub["args"].each do |aname, atype|
+            col = r["fields"].find { |x| x["name"] == aname && !x["from"] }
+            bad(node, "record `#{r['name']}`: query `#{sub['name']}` takes `#{aname}`, which the sub-query is filled with from the row's field of that name, and record `#{r['name']}` has no such column (its columns: #{r['fields'].reject { |x| x['from'] }.map { |x| x['name'] }.join(', ')})") unless col
+            bad(node, "record `#{r['name']}`: query `#{sub['name']}` takes `#{aname}` as :#{atype}, but the column `#{aname}` is :#{col['type']}") unless col["type"] == atype
+            bad(node, "record `#{r['name']}`: column `#{aname}` is optional, so it cannot be bound as an argument of `#{sub['name']}`") if col["optional"]
+          end
+          (@flags["used_queries"] ||= {})[sub["name"]] = true
+          (@flags["queries_in_tx"] ||= {})[sub["name"]] = true
+        end
+      end
+    end
+
     # What a query returns, resolved against the records (a record may be declared after the query that returns
     # it): the IR then carries the shape, the record's field names the server checks the columns against at
     # startup, and the type a body sees the call as.
@@ -681,6 +827,7 @@ module AxumDsl
 
         bad(@record_nodes.fetch(r["name"]), "record `#{r['name']}` has the same name as a params group; both become a struct of that name")
       end
+      check_record_lists(srv)
       srv["queries"].each do |q|
         node = @query_nodes.fetch(q["name"])
         bad(node, "#{q['kind']} `#{q['name']}` has the same name as a rust_fn, cmd_fn or script_fn") if srv["externs"].key?(q["name"])
@@ -689,7 +836,7 @@ module AxumDsl
           names = srv["records"].map { |r| r["name"] }
           rec = srv["records"].find { |r| r["name"] == ret["record"] } or
             undeclared(node, "query `#{q['name']}` returns record `#{ret['record']}`, which is not declared", ret["record"], names)
-          q.merge!("shape" => ret["shape"], "record" => rec["name"], "fields" => rec["fields"].map { |f| f["name"] })
+          q.merge!("shape" => ret["shape"], "record" => rec["name"], "fields" => rec["fields"].reject { |f| f["from"] }.map { |f| f["name"] })
           q["rtype"] = ret["shape"] == "list" ? "list<struct:#{rec['name']}>" : "opt<struct:#{rec['name']}>"
         else
           q.merge!("shape" => "scalar", "type" => ret["type"], "nilable" => ret["nilable"])
@@ -805,6 +952,18 @@ module AxumDsl
       [real, source]
     end
 
+    # A `file ..., binary: true` (an image send_file answers with): found and confined like local_source, but never
+    # read as text, so its bytes need not be UTF-8. [real path, ""].
+    def local_binary(node, rel)
+      base = dir_of(node)
+      full = File.expand_path(rel, base)
+      bad(node, "file not found: #{rel}") unless File.file?(full)
+      real = File.realpath(full)
+      bad(node, "file must stay inside #{base}") unless real.start_with?(base + File::SEPARATOR)
+      bad(node, "file is larger than #{MAX_RS_BYTES} bytes") if File.size(real) > MAX_RS_BYTES
+      [real, ""]
+    end
+
     # The path a `static` mount or a `serve_file` route answers on: written out, with no capture, wildcard
     # or regex character, because the axum service under it reads the request path, not the parameters.
     def service_path(node, path, what)
@@ -855,16 +1014,17 @@ module AxumDsl
     # every other input the compiler reads.
     def asset_text(real) = Lsp::Sources[real] || File.binread(real)
 
-    # The name a file is served under with `digest: true`: its own name with `-<12 hex digits of SHA-256>`
-    # before the extension, so `campfire.css` becomes `campfire-3f9a0c1b2d4e.css`. The digest is of the bytes
-    # the compiler read (the same short digest a build notice names), so the name changes exactly when the file
-    # does -- which is what makes a far-future Cache-Control safe on it.
-    def fingerprinted(rel, text)
+    # The name a file is served under with `digest: true`: its own name with `-<8 hex digits>` before the
+    # extension, so `campfire.css` becomes `campfire-3f9a0c1b.css`. The digits are Propshaft's (AxumDsl::Propshaft.digest:
+    # SHA-1 of the file, the files its CSS refers to, and the assets version), so the name changes exactly when the
+    # file or one it refers to does -- which is what makes a far-future Cache-Control safe on it -- and is the
+    # name Rails serves the same file under.
+    def fingerprinted(rel, digest)
       dir = File.dirname(rel)
       base = File.basename(rel)
       ext = File.extname(base)
       stem = ext.empty? ? base : base.delete_suffix(ext)
-      name = "#{stem}-#{AxumDsl.short_digest(text)}#{ext}"
+      name = "#{stem}-#{digest}#{ext}"
       dir == "." ? name : "#{dir}/#{name}"
     end
 
@@ -919,26 +1079,38 @@ module AxumDsl
         base = dir.chomp("/")
         urls = {}
         used = {}
+        reals = {}
+        texts = {}
         files.each do |crate_path, file|
-          text = asset_text(file)
           rel = crate_path.delete_prefix("#{base}/")
-          finger = fingerprinted(rel, text)
+          reals[rel] = file
+          texts[rel] = asset_text(file)
+        end
+        version = kw[:version] || Propshaft::VERSION
+        fingers = texts.keys.to_h { |rel| [rel, fingerprinted(rel, Propshaft.digest(rel, texts, version))] }
+        mount = pre == "/" ? "" : pre
+        texts.each do |rel, text|
+          finger = fingers[rel]
           target = "#{base}/#{finger}"
           if used.key?(target)
             bad(node, "two files under static dir #{dir.inspect} both fingerprint to #{target}; rename one")
           end
           used[target] = true
-          add_asset(node, srv, target, file, text: text)
-          urls[rel] = pre == "/" ? "/#{finger}" : "#{pre}/#{finger}"
+          add_asset(node, srv, target, reals[rel], text: Propshaft.compile(rel, text, fingers, mount))
+          urls[rel] = "#{mount}/#{finger}"
         end
         (@flags["asset_mounts"] ||= []) << pre
         (@flags["asset_urls"] ||= {})[pre] = urls
         entry = { "prefix" => pre, "dir" => dir, "files" => files.size, "digest" => true, **located(node) }
+        entry["version"] = kw[:version] if kw[:version]
+        entry["max_age"] = kw[:max_age] if kw[:max_age]
         entry["skip"] = kw[:skip] if kw[:skip]
         srv["statics"] << entry
       else
+        bad(node, "`static` `version:` is the assets version of a `digest: true` mount; add `digest: true` or drop `version:`") if kw[:version]
         files.each { |crate_path, file| add_asset(node, srv, crate_path, file) }
         entry = { "prefix" => pre, "dir" => dir, "files" => files.size, **located(node) }
+        entry["max_age"] = kw[:max_age] if kw[:max_age]
         entry["skip"] = kw[:skip] if kw[:skip]
         srv["statics"] << entry
       end
@@ -947,13 +1119,213 @@ module AxumDsl
     # serve_file "/report.txt", from: "public/report.txt": one route answered by one file, copied into the
     # crate at its own relative path like a static mount. It is deliberately declarative: a body-level
     # send_file would have to await a file service, and the body language has no such await.
-    def add_serve_file(node, path, from, srv)
+    def add_serve_file(node, path, from, kw, srv)
       route = service_path(node, path, "a serve_file path")
       bad(node, "duplicate serve_file #{route.inspect}") if srv["serve_files"].any? { |f| f["path"] == route }
       real = asset_path(node, from, "serve_file from")
       bad(node, "serve_file from #{from.inspect} is a directory; mount a directory with `static \"/assets\", dir: ...`") if File.directory?(real)
-      srv["serve_files"] << { "path" => route, "from" => from, **located(node) }
+      entry = { "path" => route, "from" => from, **located(node) }
+      entry["max_age"] = kw[:max_age] if kw[:max_age]
+      entry["skip"] = kw[:skip] if kw[:skip]
+      (@serve_file_nodes ||= {})[route] = node
+      srv["serve_files"] << entry
       add_asset(node, srv, from, real)
+    end
+
+    # cable "/cable", authenticate_with: :user do channel "HeartbeatChannel" ... end: an Action Cable endpoint
+    # (docs/cable.md). The path is written out like a serve_file's. The connection is authenticated by a nil-able
+    # `current`, each `channel` is a subscription name the client may confirm, and the options of a channel say what
+    # its identifier must carry. Read after the routes, the currents and the queries, so each name is checked.
+    def add_cable(node, pos, kw, blk, srv)
+      bad(node, "duplicate `cable`#{first_at(node, @cable_node)}; a service has one Action Cable endpoint") if srv["cable"]
+      path = service_path(node, pos[0], "a cable path")
+      taken = srv["routes"].any? { |r| r["method"] == "get" && r["path"] == path } ||
+              srv["serve_files"].any? { |f| f["path"] == path } || srv["openapi"]&.[]("path") == path ||
+              srv["statics"].any? { |s| path == s["prefix"] || path.start_with?("#{s['prefix'].chomp('/')}/") }
+      bad(node, "the cable path #{path.inspect} is already answered by a GET route, a `serve_file`, the OpenAPI document or a `static` mount") if taken
+      @cable_node = node
+      name = kw[:authenticate_with]
+      cur = srv["currents"].find { |c| c["name"] == name } or
+        undeclared(node, "`cable` authenticates with current `#{name}`, which is not declared", name, srv["currents"].map { |c| c["name"] })
+      unless cur["shape"] == "one" || (cur["shape"] == "scalar" && cur["nilable"])
+        bad(node, "`cable authenticate_with: :#{name}` needs a nil-able current (`returns: :Record?` or a `:type?`): nil is the connection that is not signed in")
+      end
+      (@flags["used_currents"] ||= {})[name] = true
+      channels = []
+      each_child(blk, :cable) do |n, p, k, b|
+        channels << cable_channel(n, p[0], k, b, channels, cur, srv)
+      end
+      bad(node, "`cable` declares no channel; add one inside the block, such as `channel \"HeartbeatChannel\"`") if channels.empty?
+      entry = { "path" => path, "authenticate_with" => name, "channels" => channels, "user_rust" => cable_user_types(cur).last, **located(node) }
+      member = channels.find { |c| c["member_of"] }
+      entry["user_id"] = cable_user_id(@cable_member_nodes[member["name"]], cur, srv) if member
+      # `close_remote_connections(key)` finds a connection by the identity its session holds.
+      closers = @flags["close_sites"]
+      entry["user_key"] = cable_user_key(closers, cur, srv) if closers
+      srv["cable"] = entry
+    end
+
+    # The signed-in user as a channel callback sees it: [the body language's type, the Rust type]. A record current is
+    # the record, a scalar current its scalar (it is never nil once the connection is authenticated).
+    def cable_user_types(cur)
+      return [:"struct:#{cur['record']}", cur["record"]] if cur["shape"] == "one"
+
+      [cur["type"].to_sym, Sessions::SCALAR_RUST.fetch(cur["type"])]
+    end
+
+    # A broadcast needs the hub the `cable` declaration writes, so a file that broadcasts and has no `cable` is refused,
+    # at the first broadcast (the bodies that call it are compiled before the cable is read).
+    def check_broadcast_sites(srv)
+      site = @flags["broadcast_sites"]&.first
+      return if site.nil? || srv["cable"]
+
+      bad(site, "this broadcasts to Action Cable subscribers, and the file declares no `cable`; add `cable \"/cable\", authenticate_with: :user do ... end`")
+    end
+
+    # One `channel "Name", signed_stream:, room_param:, member_of:, on_subscribe:` of a cable: its IR hash.
+    def cable_channel(node, name, kw, blk, earlier, cur, srv)
+      unless name.match?(/\A[A-Z][A-Za-z0-9_]*(::[A-Z][A-Za-z0-9_]*)*\z/)
+        bad(node, "channel name #{name.inspect} is the class name the client subscribes with, such as \"RoomMessagesChannel\"")
+      end
+      bad(node, "duplicate channel #{name.inspect}") if earlier.any? { |c| c["name"] == name }
+      bad(node, "channel #{name.inspect} names both `signed_stream:` and `room_param:`; a subscription finds its room one way") if kw[:signed_stream] && kw[:room_param]
+      channel = { "name" => name }
+      channel["signed_stream"] = cable_secret(node, kw[:signed_stream], srv) if kw[:signed_stream]
+      channel["room_param"] = kw[:room_param] if kw[:room_param]
+      if kw[:member_of]
+        bad(node, "channel #{name.inspect}: `member_of:` needs `signed_stream:` or `room_param:` to say which room to ask about") unless channel["signed_stream"] || channel["room_param"]
+        channel["member_of"] = cable_member_query(node, kw[:member_of], srv)
+        (@cable_member_nodes ||= {})[name] = node
+      end
+      if kw[:on_subscribe]
+        bad(node, "channel #{name.inspect}: `on_subscribe:` needs `member_of:`, because it runs for the room and the user the subscription proved") unless channel["member_of"]
+        channel["on_subscribe"] = cable_subscribe_statement(node, kw[:on_subscribe], srv)
+      end
+      channel["broadcasting"] = Cable.channel_name(name)
+      cable_callbacks(node, name, blk, channel, cur, srv) if blk
+      channel
+    end
+
+    # The callbacks in a channel's block, lowered into the channel's IR (docs/cable.md). `stream_from` and `stream_for`
+    # name what the subscription listens to; `after_subscribe` runs once the streams are joined, `on_unsubscribe` when the
+    # subscription is dropped or the socket closes, and each `perform :action` answers that action of a client's `message`.
+    # A callback names the values it wants as block parameters: the signed-in user (under the `current`'s name), `room_id` when the
+    # channel finds a room, and `room` (the row `member_of:` found) while the subscription is being made.
+    def cable_callbacks(node, name, blk, channel, cur, srv)
+      calls = []
+      each_child(blk, :channel) { |n, p, k, b| calls << [n, p, k, b] }
+      declares_for = calls.any? { |n, _, _, _| n.name == :stream_for }
+      user_type, user_rust = cable_user_types(cur)
+      vars = { cur["name"] => [user_type, user_rust] }
+      vars["room_id"] = [:i64, "i64"] if channel["room_param"] || (channel["signed_stream"] && channel["member_of"])
+      subscribing = vars.dup
+      subscribing["room"] = [:"struct:#{channel['member_of']['record']}", channel["member_of"]["record"]] if channel["member_of"]
+      lower = lambda do |n, b, label, scope, ret, stream_for|
+        Body.new(@path, { "fields" => [] }, @regexes, srv["externs"], @flags, "channel #{name.inspect} #{label}", @binding_modules,
+                 @helper_table, srv["params"] + srv["records"], kind: :cable).lower_cable(b, scope, ret, stream_for).merge("label" => label, **located(n))
+      end
+      calls.each do |n, p, _k, b|
+        case n.name
+        when :stream_from, :stream_for, :after_subscribe, :on_unsubscribe
+          key = n.name.to_s
+          bad(n, "channel #{name.inspect} declares `#{key}` twice") if channel[key]
+          if n.name == :stream_from || n.name == :stream_for
+            channel[key] = lower.call(n, b, key, subscribing, :string, false)
+          elsif n.name == :after_subscribe
+            channel[key] = lower.call(n, b, key, subscribing, :unit, declares_for)
+          else
+            channel[key] = lower.call(n, b, key, vars, :unit, declares_for)
+          end
+        when :perform
+          action = p[0]
+          performs = (channel["performs"] ||= [])
+          bad(n, "channel #{name.inspect} performs `#{action}` twice") if performs.any? { |x| x["action"] == action }
+          performs << { "action" => action, "body" => lower.call(n, b, "perform :#{action}", vars, :unit, declares_for) }
+        end
+      end
+    end
+
+    # `signed_stream: :secret_key`: the setting Turbo's signed stream names are verified with, held to the rules of
+    # every signing call (Body#signed_secret!): a required string setting, one secret for the whole service.
+    def cable_secret(node, secret, srv)
+      declared = @flags["settings"] || {}
+      entry = declared[secret] or
+        bad(node, "no setting `#{secret}` is declared#{declared.empty? ? '' : " (declared: #{declared.keys.join(', ')})"}; `signed_stream:` names the required string setting that holds SECRET_KEY_BASE",
+            word: secret, from: declared.keys)
+      if entry["type"] || entry["optional"]
+        bad(node, "`signed_stream:` must name a required string setting, not #{entry['type'] ? "a `type: :#{entry['type']}`" : 'an optional'} one")
+      end
+      if (earlier = @flags["signed_id_secret"]) && earlier != secret
+        bad(node, "`signed_stream: :#{secret}`: the service already signs with setting `#{earlier}`; a service derives one signed-ID key per process, so every call must name the same secret")
+      end
+      @flags["signed_id_secret"] = secret
+      (@flags["used_settings"] ||= {})[secret] = true
+      (@flags["builtins"] ||= {})[SignedId::TURBO_VERIFY] = true
+      secret
+    end
+
+    # `member_of: :room_for_user`: a query taking `id:` (the room) and `user_id:`, both :i64, and returning `:Record?`.
+    # The room is a member's when it finds a row. Marked called, with its pooled wrapper, so the crate emits it.
+    def cable_member_query(node, name, srv)
+      queries = @flags["queries"] || {}
+      q = queries[name] or undeclared(node, "`member_of:` names query `#{name}`, which is not declared", name, queries.keys)
+      unless q["kind"] == "query" && q["shape"] == "one" && q["args"].map(&:first).sort == %w[id user_id] && q["args"].all? { |_, t| t == "i64" }
+        bad(node, "`member_of: :#{name}` needs a query with the arguments `id:` and `user_id:` (both :i64) that returns `:Record?`: the row of the room and the user, or nil")
+      end
+      (@flags["used_queries"] ||= {})[name] = true
+      (@flags["queries_outside"] ||= {})[name] = true
+      { "name" => name, "args" => q["args"].map(&:first), "record" => q["record"] }
+    end
+
+    # `on_subscribe: :connect_membership`: an `execute` (or `query`) taking `room_id:` and `user_id:`, both :i64, run
+    # once for each confirmed subscription. Marked called, with its pooled wrapper, so the crate emits it.
+    def cable_subscribe_statement(node, name, srv)
+      queries = @flags["queries"] || {}
+      q = queries[name] or undeclared(node, "`on_subscribe:` names statement `#{name}`, which is not declared", name, queries.keys)
+      unless q["args"].map(&:first).sort == %w[room_id user_id] && q["args"].all? { |_, t| t == "i64" }
+        bad(node, "`on_subscribe: :#{name}` needs an `execute` with the arguments `room_id:` and `user_id:` (both :i64)")
+      end
+      (@flags["used_queries"] ||= {})[name] = true
+      (@flags["queries_outside"] ||= {})[name] = true
+      { "name" => name, "args" => q["args"].map(&:first) }
+    end
+
+    # The Rust expression of the signed-in user's id for a `member_of` query: the `id` field of a record current, or
+    # the value of an :i64 one.
+    def cable_user_id(node, cur, srv)
+      if cur["shape"] == "one"
+        rec = srv["records"].find { |r| r["name"] == cur["record"] }
+        return "user.id" if rec["fields"].any? { |f| f["name"] == "id" && f["type"] == "i64" }
+
+        bad(node, "`member_of:` asks about the user's id, but record `#{cur['record']}` (the current `#{cur['name']}`) has no `id` field of type :i64")
+      end
+      return "user" if cur["type"] == "i64"
+
+      bad(node, "`member_of:` asks about the user's id, but the current `#{cur['name']}` is a #{cur['type']}, not an :i64 or a record with an `id`")
+    end
+
+    # What `close_remote_connections(key)` is matched against: the connection's identity as a Rust String expression of `user`
+    # (a record current is its `id`, an :i64 current its value, a string current itself), and the argument types the call
+    # may pass for it. `sites` are the calls, as [node, the argument's type].
+    def cable_user_key(sites, cur, srv)
+      node = sites.first.first
+      if cur["shape"] == "one"
+        rec = srv["records"].find { |r| r["name"] == cur["record"] }
+        bad(node, "`close_remote_connections` closes the connections of a user id, but record `#{cur['record']}` (the current `#{cur['name']}`) has no `id` field of type :i64") unless rec["fields"].any? { |f| f["name"] == "id" && f["type"] == "i64" }
+        key, id = "user.id.to_string()", true
+      elsif cur["type"] == "i64"
+        key, id = "user.to_string()", true
+      elsif cur["type"] == "string"
+        key, id = "user.clone()", false
+      else
+        bad(node, "`close_remote_connections` identifies a connection by its current `#{cur['name']}`, which is a #{cur['type']}, not an :i64, a :string or a record with an `id`")
+      end
+      sites.each do |site, type|
+        next if id ? %i[int i64 i32].include?(type) : %i[str string].include?(type)
+
+        bad(site, "`close_remote_connections` takes #{id ? 'the user\'s id (an :i64)' : "the user's name (a string)"}, as the current `#{cur['name']}` is #{id ? 'a record or an :i64' : 'a string'}, got #{TypeNames.display(type)}")
+      end
+      key
     end
 
     # openapi "/openapi.json", title: "Notes", version: "1.0.0": the service answers GET at that path with an
@@ -1000,7 +1372,8 @@ module AxumDsl
     # twice is refused rather than emitted twice.
     LAYER_KEYWORDS = { "compression" => [], "cors" => [:origins], "timeout" => [:secs], "trace" => [:forwarded],
                        "fetch_metadata" => [], "csrf" => [], "rate_limit" => [:per, :burst, :path],
-                       "private_cache" => [:except] }.freeze
+                       "private_cache" => [:except],
+                       "rack_defaults" => RackDefaults::KEYWORDS, "front" => [:cache_mb], "method_override" => [] }.freeze
     LAYER_ORIGIN = /\A[A-Za-z][A-Za-z0-9+.\-]*:\/\/[!-~]+\z/
     def add_layer(node, pos, kw, srv)
       name = pos[0].to_s
@@ -1083,6 +1456,10 @@ module AxumDsl
           entry["except"] = except
         end
         @private_cache_node = node
+      when "rack_defaults"
+        add_rack_defaults(node, kw, entry)
+      when "front"
+        entry["cache_mb"] = kw[:cache_mb] if kw[:cache_mb]
       end
       srv["layers"] << entry
     end
@@ -1104,6 +1481,70 @@ module AxumDsl
         next if srv["statics"].any? { |s| s["prefix"] == prefix || prefix.start_with?("#{s['prefix']}/") }
 
         bad(@private_cache_node, "`use_layer :private_cache` `except:` entry #{prefix.inspect} is not served by a `static` mount; only public files may leave the layer off: name a static mount's prefix, or drop the prefix")
+      end
+    end
+
+    # `use_layer :rack_defaults, security_headers: true, etag: true, ...` (RackDefaults): one keyword per part,
+    # and at least one must be written. The names a keyword takes are checked here; the settings, the static
+    # mounts and the fingerprinted files they name are checked once the whole file is read
+    # (check_rack_defaults).
+    RACK_COOKIE_NAME = /\A[A-Za-z_][A-Za-z0-9_\-]*\z/
+    def add_rack_defaults(node, kw, entry)
+      @rack_defaults_node = node
+      bad(node, "`use_layer :rack_defaults` needs at least one part: #{RackDefaults::KEYWORDS.map { |k| "`#{k}:`" }.join(', ')}") if kw.empty?
+      %i[security_headers etag vary_accept].each { |key| entry[key.to_s] = true if kw[key] }
+      %i[version revision].each { |key| entry[key.to_s] = kw[key].to_s if kw[key] }
+      %i[preload refresh_cookies except].each do |key|
+        next unless kw[key]
+
+        bad(node, "`use_layer :rack_defaults` `#{key}:` needs at least one entry; drop the keyword to leave that part off") if kw[key].empty?
+        entry[key.to_s] = kw[key]
+      end
+      entry["refresh_cookies"].to_a.each do |name|
+        bad(node, "`use_layer :rack_defaults` `refresh_cookies:` entry #{name.inspect} must be a cookie name") unless name.match?(RACK_COOKIE_NAME)
+      end
+      cookie = kw[:session_cookie]
+      if cookie
+        bad(node, "`use_layer :rack_defaults` `session_cookie:` #{cookie.inspect} must be a cookie name") unless cookie.match?(RACK_COOKIE_NAME)
+        entry["session_cookie"] = cookie
+        (@flags["builtins"] ||= {})["random_token"] = true
+      end
+      entry["except"].to_a.each do |prefix|
+        bad(node, "`use_layer :rack_defaults` `except:` entry #{prefix.inspect} must start with /, a path prefix as `static` writes it") unless prefix.start_with?("/")
+        bad(node, "`use_layer :rack_defaults` `except:` entry #{prefix.inspect} must be a static mount's prefix without a trailing /") if prefix == "/" || prefix.end_with?("/")
+      end
+    end
+
+    # What needs the whole file: `version:` and `revision:` name declared settings (the layer reads them, so
+    # they count as used), `except:` names static mounts, and `preload:` names files of the one fingerprinted
+    # mount, resolved here to the URLs the Link header carries.
+    def check_rack_defaults(srv)
+      entry = srv["layers"].find { |l| l["name"] == "rack_defaults" }
+      return unless entry
+
+      node = @rack_defaults_node
+      %w[version revision].each do |key|
+        next unless entry[key]
+
+        declared = srv["settings"].map { |s| s["name"] }
+        unless declared.include?(entry[key])
+          bad(node, "`use_layer :rack_defaults` `#{key}:` names setting `#{entry[key]}`, which is not declared (declared: #{declared.join(', ')})", word: entry[key], from: declared)
+        end
+        (@flags["used_settings"] ||= {})[entry[key]] = true
+      end
+      entry["except"].to_a.each do |prefix|
+        next if srv["statics"].any? { |s| s["prefix"] == prefix || prefix.start_with?("#{s['prefix']}/") }
+        next if srv["serve_files"].any? { |f| f["path"] == prefix }
+
+        bad(node, "`use_layer :rack_defaults` `except:` entry #{prefix.inspect} is not served by a `static` mount or a `serve_file`; name a static mount's prefix or a served file's path")
+      end
+      return unless entry["preload"]
+
+      mounts = @flags["asset_mounts"].to_a
+      bad(node, "`use_layer :rack_defaults` `preload:` needs one `static ..., digest: true` mount: the file's fingerprinted URL is the link") unless mounts.size == 1
+      urls = (@flags["asset_urls"] || {})[mounts[0]] || {}
+      entry["preload_urls"] = entry["preload"].map do |file|
+        urls[file] or bad(node, "`use_layer :rack_defaults` `preload:` names #{file.inspect}, which is no file under the #{mounts[0].inspect} mount (files: #{urls.keys.sort.join(', ')})")
       end
     end
 
@@ -1136,7 +1577,9 @@ module AxumDsl
       if kw[:env] && !kw[:env].match?(/\A[A-Za-z_][A-Za-z0-9_]*\z/)
         bad(node, "`env:` is an environment variable name, such as \"BLENDER_PYTHON\"")
       end
-      real, source = local_source(node, rel, "file")
+      binary = kw[:binary] == true
+      bad(node, "a `binary: true` file is sent by its path (file_path); it has no `entries:`") if binary && kw[:entries]
+      real, source = binary ? local_binary(node, rel) : local_source(node, rel, "file")
       entries = kw[:entries] || []
       twice = entries.find { |e| entries.count(e) > 1 }
       bad(node, "`#{twice}` is listed twice in entries:") if twice
@@ -1144,7 +1587,7 @@ module AxumDsl
       unchecked = (kw[:unchecked] || []).uniq
       sigs = entries.to_h { |e| [e, python_entry(node, rel, source, e, !unchecked.include?("args"))] }
       record = { "name" => name, "path" => rel, "real" => real, "env" => kw[:env], "entries" => entries,
-                 "unchecked" => unchecked, "sigs" => sigs, **located(node) }
+                 "unchecked" => unchecked, "sigs" => sigs, "binary" => binary, **located(node) }
       srv["files"] << record
       (@flags["files"] ||= {})[name] = record
       (@file_nodes ||= {})[name] = node
@@ -1346,6 +1789,13 @@ module AxumDsl
 
     def field_options(node, field, opts, srv, pool = srv["params"], label = "params")
       type = field["type"]
+      if type == "upload" # a file input: nil when no file was chosen, and nothing about its content is checked here
+        bad(node, "an :upload field is part of a `params` group (a browser's multipart form), not of a #{label}") unless label == "params"
+        field["optional"] = true
+        stray = opts.keys - %i[description optional]
+        bad(node, "`#{stray.first}:` does not apply to an :upload field") unless stray.empty?
+        return
+      end
       if (oname = CompositeTypes.object_list_name(type)) # a list of another params struct, declared above
         bad(node, "#{label} `#{oname}` is not declared above this field; declare it first") unless pool.any? { |x| x["name"] == oname }
         bad(node, "`default:` does not apply to a list of objects") if opts.key?(:default)
@@ -1483,9 +1933,9 @@ module AxumDsl
 
       bad(node, "expected a type symbol like :string, or map(...) / list(...), got #{nodename(node)}") unless node.is_a?(Prism::SymbolNode)
       s = node.unescaped
-      unless TYPES.key?(s.to_sym) || FIELD_LISTS.include?(s.to_sym) || s.match?(CAMEL)
-        bad(node, "`:#{s}` is not a field type (#{(TYPES.keys + FIELD_LISTS).map(&:inspect).join(" ")}, map(...), list(...), or the CamelCase name of another params)",
-            word: s, from: TYPES.keys + FIELD_LISTS)
+      unless TYPES.key?(s.to_sym) || FIELD_LISTS.include?(s.to_sym) || FIELD_UPLOADS.include?(s.to_sym) || s.match?(CAMEL)
+        bad(node, "`:#{s}` is not a field type (#{(TYPES.keys + FIELD_LISTS + FIELD_UPLOADS).map(&:inspect).join(" ")}, map(...), list(...), or the CamelCase name of another params)",
+            word: s, from: TYPES.keys + FIELD_LISTS + FIELD_UPLOADS)
       end
       bad(node, "`:#{s}` is a Rust keyword") if RUST_KW.include?(s)
       s
@@ -1573,11 +2023,13 @@ module AxumDsl
     # verb decides it. Nested objects, lists and maps are declared above the field that uses them.
     def params_decl(node, pos, blk, srv)
       (@params_nodes ||= {})[pos[0]] = node
+      bad(node, "`Upload` is the type of an :upload field in a body (`avatar.filename`, `avatar.store(...)`); name this params group something else") if pos[0] == "Upload"
       bad(node, "duplicate params `#{pos[0]}`#{first_at(node, srv["params"].find { |x| x["name"] == pos[0] })}") if srv["params"].any? { |x| x["name"] == pos[0] }
       fields = []
       each_child(blk, :params) do |n, p, k, _b|
         bad(n, "duplicate field `#{p[0]}`") if fields.any? { |f| f["name"] == p[0] }
         field = { "name" => p[0], "type" => p[1].to_s }
+        bad(n, "`from:` fills a list field of a `record` (docs/database.md); a params field is read from the request") if k.key?(:from)
         field["description"] = k[:description] if k[:description]
         field["in"] = k.delete(:in).to_s if k.key?(:in)
         field["wire_name"] = k.delete(:name) if k.key?(:name)
@@ -1586,10 +2038,14 @@ module AxumDsl
           bad(n, "field `#{field['name']}` is `in: :path`, so its type must be a scalar " \
                  "(:string, :i32, :i64, :f64 or :bool), not :#{field['type']}: a path capture is one value")
         end
-        if field["in"] == "form" && !SCALAR_FIELD_TYPES.include?(field["type"])
+        if field["type"] == "upload" && field["in"] != "form"
+          bad(n, "field `#{field['name']}` is an :upload, which a browser sends in a multipart/form-data body: say `in: :form` " \
+                 "(and `name: \"user[avatar]\"` for a Rails form's key)")
+        end
+        if field["in"] == "form" && field["type"] != "upload" && !LIST_TYPES.include?(field["type"]) && !SCALAR_FIELD_TYPES.include?(field["type"])
           bad(n, "field `#{field['name']}` is `in: :form`, so its type must be a scalar " \
-                 "(:string, :i32, :i64, :f64 or :bool), not :#{field['type']}: a urlencoded body is flat, and " \
-                 "serde_urlencoded cannot build a list, a map or a nested object; send those as a JSON body " \
+                 "(:string, :i32, :i64, :f64 or :bool), a list of them (:string_list, :i64_list, :f64_list: Rails' `name[]` keys) or an :upload, " \
+                 "not :#{field['type']}: a form body is flat, and it cannot build a map or a nested object; send those as a JSON body " \
                  "(`in: :body`)")
         end
         if field.key?("wire_name")
@@ -1623,7 +2079,7 @@ module AxumDsl
     RESERVED_HELPERS = %w[main check run_subprocess arith_error str_to_i str_to_int result rust setting
                           file_text file_path entry entry_args json text html halt redirect status content_type
                           etag params raise Integer current cookie set_cookie delete_cookie random_token request_ip
-                          user_agent transaction].freeze
+                          request_base_url request_path request_method user_agent turbo_frame_request? transaction plain_text request_body url_encode urlsafe_decode64 qr_code_svg active_storage_disk_path active_storage_verified_id active_storage_verified_key inline_disposition].freeze
 
     # helper :guard, args: [:string], returns: :string do |url| ... end. A helper is compiled in declaration
     # order and may only call helpers declared above it, so recursion cannot happen. Types are never inferred.
@@ -1822,10 +2278,16 @@ module AxumDsl
 
         bad(node, "route `#{verb} #{path}` skips `:#{filter_name}`, but no `before :#{filter_name}` filter is declared#{named_filters.empty? ? '' : " (named filters: #{named_filters.join(', ')})"}")
       end
+      cache = kw[:cache]
+      check_route_cache(node, verb, path, blk, srv) if cache
       body = Body.new(@path, prm || { "fields" => [] }, @regexes, srv["externs"], @flags, "route `#{verb} #{path}`",
                       @binding_modules, @helper_table, srv["params"] + srv["records"], kind: :route, skip: skips).lower(blk)
       if body["content_type"]
         bad(node, "`content_type(...)` is only meaningful in a `before` filter; it sets the default for the routes that follow")
+      end
+      if body["request"].to_a.include?("body") && (body_field = field_in.find { |_, loc| %w[body form].include?(loc) })
+        bad(node, "route `#{verb} #{path}` reads the raw request body with `request_body` and also reads params `#{prm_name}` field `#{body_field[0]}` from the #{body_field[1] == "form" ? "form" : "JSON"} body; " \
+                  "axum lets only one extractor consume the request body, so the group's fields must be `in: :path` or `in: :query`")
       end
       # A body that read errors[:field] needs a params group whose check() can report something; that test
       # needs every params group, so it runs once the whole file is read (check_errors_routes).
@@ -1834,13 +2296,62 @@ module AxumDsl
                "description" => kw[:description], "body" => body, **located(node) }
       decl["field_in"] = field_in unless field_in.empty?
       decl["skip"] = skips unless skips.empty?
+      decl["cache"] = cache.to_s if cache
       decl
+    end
+
+    # The calls whose answer a database commit does not explain: a cached copy would repeat a random token, a
+    # file read from disk, the caller's address (it is not in the cache key) or the result of Rust or a
+    # subprocess the compiler cannot see into.
+    UNCACHEABLE_CALLS = %i[random_token send_file file_text request_ip request_body rust].freeze
+
+    # `get "/x", cache: :private do ... end` (AP1, the reference is once-campfire-rust/crates/campfire/src/response_cache.rs):
+    # the whole response is kept until the next commit, so the route must be a read of the database, and the crate
+    # must have one to watch.
+    def check_route_cache(node, verb, path, blk, srv)
+      bad(node, "route `#{verb} #{path}` has `cache: :private`, but only a `get` route can be cached; a `#{verb}` changes something, and a cached answer would skip it") unless verb == "get"
+      bad(node, "route `get #{path}` has `cache: :private`, which watches the database for commits; declare `database :sqlite, path: \"...\"` or drop `cache:`") unless srv["database"]
+      call, name = uncacheable_call(blk, srv, [])
+      return unless call
+
+      bad(call, "route `get #{path}` has `cache: :private`, but its body calls `#{name}`, whose result a database commit does not explain, so a cached copy would repeat it; drop `cache:` or the call")
+    end
+
+    # The first call in a node that a cache must not repeat, as [call node, how it is named]; a helper it calls is searched too.
+    def uncacheable_call(node, srv, seen)
+      if node.is_a?(Prism::CallNode) && node.receiver.nil?
+        name = node.name.to_s
+        return [node, name] if UNCACHEABLE_CALLS.include?(node.name) || srv["subprocs"].any? { |s| s["name"].to_s == name } || srv["externs"].key?(name)
+
+        helper = @helper_blocks[name]
+        if helper && !seen.include?(name)
+          seen << name
+          inner = uncacheable_call(helper, srv, seen)
+          return [node, "#{name}` (its helper calls `#{inner[1]}"] if inner
+        end
+      end
+      node.compact_child_nodes.each do |child|
+        found = uncacheable_call(child, srv, seen)
+        return found if found
+      end
+      nil
+    end
+
+    # The cache's size is the setting `response_cache_mb` when the file declares one, so it has to be a whole number of MB.
+    def check_response_cache(srv)
+      return unless srv["routes"].any? { |r| r["cache"] }
+
+      s = srv["settings"].find { |x| x["name"].to_s == "response_cache_mb" } or return
+      (@flags["used_settings"] ||= {})[s["name"]] = true # the cache reads it, not a body
+      return if s["type"] == "i64" && !s["optional"]
+
+      bad(@setting_nodes[s["name"]], "setting `response_cache_mb` is the response cache's size in MB (0 turns it off), so it must be a required-or-defaulted integer: `setting :response_cache_mb, env: \"...\", default: 64, type: :i64`")
     end
 
     # A static mount can name the named `before` filters it does not run. The mount is declared before the
     # filters are read, so the names are checked here, once both lists are complete. A mount at "/" takes
-    # no skip at all (add_static refuses one: the fallback would cover every GET path), and `serve_file`
-    # and `set :public_folder` take no skip for now.
+    # no skip at all (add_static refuses one: the fallback would cover every GET path), and
+    # `set :public_folder` takes no skip for now. A `serve_file` names its filters the same way.
     def check_static_skips(srv)
       named = srv["before"].filter_map { |f| f["name"] }
       srv["statics"].each do |s|
@@ -1848,6 +2359,13 @@ module AxumDsl
           next if named.include?(filter_name)
 
           bad(@static_nodes[s["prefix"]], "static `#{s['prefix']}` skips `:#{filter_name}`, but no `before :#{filter_name}` filter is declared#{named.empty? ? '' : " (named filters: #{named.join(', ')})"}")
+        end
+      end
+      srv["serve_files"].each do |f|
+        f["skip"].to_a.each do |filter_name|
+          next if named.include?(filter_name)
+
+          bad(@serve_file_nodes[f["path"]], "serve_file `#{f['path']}` skips `:#{filter_name}`, but no `before :#{filter_name}` filter is declared#{named.empty? ? '' : " (named filters: #{named.join(', ')})"}")
         end
       end
     end
@@ -1877,16 +2395,27 @@ module AxumDsl
     # Refused rather than narrowed, because the filter layer runs before axum has chosen a route.
     def check_filter_skips(srv)
       by_method = srv["routes"].group_by { |r| r["method"] }
-      # A `serve_file` and the OpenAPI document are axum routes too, but neither takes `skip:`, so a route
-      # pattern that matches one of them would step the filter aside for it. Compare against them as routes
-      # that do not skip the filter, exactly like a literal route beside a capture.
+      # A `serve_file` and the OpenAPI document are axum routes too. A `serve_file` carries its own `skip:`, the
+      # OpenAPI document takes none, so a route pattern that matches either would step the filter aside for it.
+      # Compare against them as routes, exactly like a literal route beside a capture.
+      file_routes = []
       srv["serve_files"].to_a.each do |f|
-        %w[get head].each { |method| (by_method[method] ||= []) << { "method" => method, "path" => f["path"], "skip" => [] } }
+        %w[get head].each do |method|
+          entry = { "method" => method, "path" => f["path"], "skip" => f["skip"].to_a }
+          (by_method[method] ||= []) << entry
+          file_routes << [entry, @serve_file_nodes[f["path"]]]
+        end
       end
       if srv["openapi"]
         %w[get head].each { |method| (by_method[method] ||= []) << { "method" => method, "path" => srv["openapi"]["path"], "skip" => [] } }
       end
-      @route_decl_nodes.to_a.each do |route, node|
+      # The cable endpoint steps every named filter aside for GET of its path, as a serve_file that skips them all does.
+      if srv["cable"]
+        entry = { "method" => "get", "path" => srv["cable"]["path"], "skip" => srv["before"].filter_map { |f| f["name"] } }
+        (by_method["get"] ||= []) << entry
+        file_routes << [entry, @cable_node]
+      end
+      (@route_decl_nodes.to_a + file_routes).each do |route, node|
         route["skip"].to_a.each do |filter_name|
           by_method.fetch(route["method"], []).each do |other|
             next if other.equal?(route) || other["skip"].to_a.include?(filter_name)
@@ -1894,7 +2423,7 @@ module AxumDsl
 
             bad(node, "route `#{route['method']} #{route['path']}` skips `:#{filter_name}`, but the run-time skip " \
                       "(method and path) also matches `#{other['method']} #{other['path']}`, which does not skip it; " \
-                      "give every handler that path reaches the same `skip:` (a `serve_file` or the OpenAPI " \
+                      "give every handler that path reaches the same `skip:` (the OpenAPI " \
                       "document takes none, so narrow this route's path), or use paths that cannot overlap")
           end
         end
@@ -1913,13 +2442,32 @@ module AxumDsl
         return true if x.nil? && y.nil?
         return true if wildcard_segment?(x) || wildcard_segment?(y)
         return false if x.nil? || y.nil?
-        return false unless x == y || capture_segment?(x) || capture_segment?(y)
+        return false unless segments_overlap?(x, y)
 
         i += 1
       end
     end
 
-    def capture_segment?(seg) = seg.start_with?("{") && seg.end_with?("}") && !seg.start_with?("{*")
+    # Two non-tail segments can match one part: equal, or a capture whose literal prefix and suffix agree with the
+    # other side (`@{id}` meets `@7` and `{id}`, but not `messages`).
+    def segments_overlap?(x, y)
+      return true if x == y
+
+      px, sx = capture_edges(x)
+      py, sy = capture_edges(y)
+      return false if px.nil? && py.nil?
+      return x.length > py.length + sy.length && x.start_with?(py) && x.end_with?(sy) if px.nil?
+      return y.length > px.length + sx.length && y.start_with?(px) && y.end_with?(sx) if py.nil?
+
+      (px.start_with?(py) || py.start_with?(px)) && (sx.end_with?(sy) || sy.end_with?(sx))
+    end
+
+    # The literal text before and after a segment's `{name}` capture, or nil when it has none.
+    def capture_edges(seg)
+      open = seg.index("{")
+      close = seg.rindex("}")
+      open && close ? [seg[0...open], seg[(close + 1)..]] : nil
+    end
 
     def wildcard_segment?(seg) = seg.to_s.start_with?("{*")
 
@@ -1988,7 +2536,8 @@ module AxumDsl
 
     # `set :name, value`: Sinatra's way of configuring a service without a `configure` block. `port` and `bind`
     # configure the listener; `listener` swaps the TCP listener for a Rust type of the file's own (TLS), and
-    # `log` picks the log format; `name` and `version` name the crate, as the `server` declaration does;
+    # `log` picks the log format; `trust_forwarded_for` makes request_ip trust X-Forwarded-For without the trace
+    # layer that normally declares that trust; `name` and `version` name the crate, as the `server` declaration does;
     # `public_folder` mounts a directory of files at "/", which is Sinatra's own meaning for the name; and
     # `views`/`layout` say where a body's `render` reads its views and which one wraps them (see Views). The
     # value of a setting is a literal, or a symbol where the setting names something (`set :layout, :app`),
@@ -2060,6 +2609,14 @@ module AxumDsl
         bad(node, "duplicate `set :log`#{first_at(node, @log_node)}") if srv["log"]
         srv["log"] = value.to_s
         @log_node = node
+      when :trust_forwarded_for
+        unless value == true || value == false
+          bad(node, "`set :trust_forwarded_for` is true or false, written out: it trusts the first " \
+                    "X-Forwarded-For entry for request_ip")
+        end
+        bad(node, "duplicate `set :trust_forwarded_for`#{first_at(node, @trust_forwarded_for_node)}") if @trust_forwarded_for_node
+        srv["trust_forwarded_for"] = value
+        @trust_forwarded_for_node = node
       end
     end
 
@@ -2253,6 +2810,26 @@ module AxumDsl
         bad(node, "expected an array of check names such as %i[each_read], got #{nodename(node)}") unless node.is_a?(Prism::ArrayNode)
         return node.elements.map { |el| value(el, FILE_CHECKS).to_s }
       end
+      if want == :hash
+        # A hash literal of string or symbol keys; a value is a string, a symbol (kept as its name), an integer or a list of them.
+        bad(node, "expected a hash literal such as { \"a\" => :b }, got #{nodename(node)}") unless node.is_a?(Prism::HashNode)
+        scalar = lambda do |v|
+          case v
+          when Prism::StringNode then v.unescaped
+          when Prism::SymbolNode then v.unescaped.to_sym
+          when Prism::IntegerNode then v.value
+          else bad(v, "a hash value is a string, symbol or integer literal, or a list of them, got #{nodename(v)}")
+          end
+        end
+        out = {}
+        node.elements.each do |el|
+          bad(el, "unsupported #{nodename(el)} in a hash literal (write `\"key\" => value`)") unless el.is_a?(Prism::AssocNode) && (el.key.is_a?(Prism::StringNode) || el.key.is_a?(Prism::SymbolNode))
+          key = el.key.unescaped
+          bad(el, "duplicate key #{key.inspect}") if out.key?(key)
+          out[key] = el.value.is_a?(Prism::ArrayNode) ? el.value.elements.map(&scalar) : scalar.call(el.value)
+        end
+        return out
+      end
       if want == :strs
         bad(node, "expected an array of string literals, got #{nodename(node)}") unless node.is_a?(Prism::ArrayNode)
         return node.elements.map { |el| value(el, :str) }
@@ -2292,6 +2869,8 @@ module AxumDsl
         bad(b, "`#{node.name}` takes no block") if b
         return nil
       end
+      return nil if b.nil? && sig[:optional_block]
+
       bad(node, "`#{node.name}` needs a do ... end block") unless b
       bad(b, "unsupported #{nodename(b)} (a literal block is required)") unless b.is_a?(Prism::BlockNode)
       bad(b.parameters, "`#{node.name}` block takes no parameters") if sig[:block] == :decls && b.parameters

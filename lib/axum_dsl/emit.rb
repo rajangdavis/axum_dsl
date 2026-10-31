@@ -249,6 +249,29 @@ module AxumDsl
       }
     RS
 
+    # The escaper a view's `{{ name }}` lowers to: the same five replacements as axum_dsl_html_escape, but
+    # appended straight to the render's buffer, so a value is never copied into a String of its own first.
+    # Emitted only when a view escapes a value that is not known at compile time.
+    HTML_ESCAPE_INTO = <<~'RS'
+      fn axum_dsl_html_escape_into(out: &mut String, input: &str) {
+          let mut copied = 0;
+          for (i, c) in input.char_indices() {
+              let replacement = match c {
+                  '&' => "&amp;",
+                  '<' => "&lt;",
+                  '>' => "&gt;",
+                  '"' => "&quot;",
+                  '\'' => "&#39;",
+                  _ => continue,
+              };
+              out.push_str(&input[copied..i]);
+              out.push_str(replacement);
+              copied = i + c.len_utf8();
+          }
+          out.push_str(&input[copied..]);
+      }
+    RS
+
     # What `use_layer :trace, forwarded: true` puts on the router: the span client_span builds, and the
     # request and response events at INFO, which is the level the subscriber main installs shows.
     FORWARDED_TRACE = "::tower_http::trace::TraceLayer::new_for_http().make_span_with(client_span)" \
@@ -284,6 +307,40 @@ module AxumDsl
               })
               .unwrap_or_default();
           ::tracing::info_span!("request", method = %request.method(), uri = %request.uri(), client = %client)
+      }
+    RS
+
+    # The allocator of every emitted crate, copied in shape from the hand-written Campfire server
+    # (once-campfire-rust/crates/campfire/src/main.rs): jemalloc, and on Linux `thp:never` in its options plus
+    # prctl(PR_SET_THP_DISABLE) at the top of main, so an idle server does not back every thread stack and
+    # jemalloc region with whole 2 MB pages. The Linux-only items are cfg-gated so a macOS build stays
+    # warning-free under -D warnings. Always emitted.
+    ALLOCATOR = <<~'RS'
+      #[global_allocator]
+      static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
+
+      // jemalloc reads its options from this exported symbol (tikv-jemallocator's `_rjem_` prefix) when it
+      // starts, before main. It is a `const char *`, so a thin pointer to the first byte.
+      #[cfg(target_os = "linux")]
+      #[allow(unsafe_code)]
+      #[unsafe(export_name = "_rjem_malloc_conf")]
+      pub static JEMALLOC_CONF: Option<&'static std::ffi::c_char> =
+          // SAFETY: points at the first byte of a static, NUL-terminated string.
+          Some(unsafe { &*c"thp:never".as_ptr() });
+
+      // With transparent huge pages set to `always`, every thread stack gets backed by whole 2 MB pages as
+      // soon as it is touched; nothing here is big enough to gain from them, so the process opts out.
+      #[allow(unsafe_code)]
+      fn disable_transparent_huge_pages() {
+          #[cfg(target_os = "linux")]
+          {
+              let off: libc::c_ulong = 1;
+              // SAFETY: PR_SET_THP_DISABLE takes machine-width integer arguments and only changes this
+              // process's memory policy.
+              if unsafe { libc::prctl(libc::PR_SET_THP_DISABLE, off, 0 as libc::c_ulong, 0 as libc::c_ulong, 0 as libc::c_ulong) } != 0 {
+                  eprintln!("couldn't disable transparent huge pages: {}", std::io::Error::last_os_error());
+              }
+          }
       }
     RS
 
@@ -341,10 +398,19 @@ module AxumDsl
 
         [dependencies]
         axum = { version = "0.8", default-features = false, features = [#{axum_features(ir).map { |f| "\"#{f}\"" }.join(", ")}] }
-        tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "signal"#{Sessions.tokio_features(ir)}#{SendFile.tokio_features(ir)}] }
+        tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "signal"#{ir["database"] && Sessions.tokio_features(ir).empty? ? ", \"sync\"" : ""}#{Sessions.tokio_features(ir)}#{SendFile.tokio_features(ir)}#{Multipart.tokio_features(ir)}#{Cable.tokio_features(ir)}] }
         serde = { version = "1", features = ["derive"] }
         serde_json = "1"
-        anyhow = "1"#{regex_dep(ir)}#{tower_http_dep(ir)}#{tracing_deps(ir)}#{crate_deps(ir)}#{database_deps(ir)}#{dependency_lines(Cookies.deps(ir), SignedId.deps(ir), Sessions.deps(ir), Sanitize.deps(ir))}
+        anyhow = "1"
+        tikv-jemallocator = "0.6"#{regex_dep(ir)}#{tower_http_dep(ir)}#{tracing_deps(ir)}#{crate_deps(ir)}#{database_deps(ir)}#{dependency_lines(Cookies.deps(ir), SignedId.deps(ir), Sessions.deps(ir), Sanitize.deps(ir), ResponseCache.deps(ir), Front.deps(ir), Multipart.deps(ir))}
+
+        [target.'cfg(target_os = "linux")'.dependencies]
+        libc = "0.2"
+
+        # One codegen unit with fat LTO; not `panic = "abort"`, so a panicking request still answers 500.
+        [profile.release]
+        lto = "fat"
+        codegen-units = 1
       TOML
     end
 
@@ -356,6 +422,7 @@ module AxumDsl
     def axum_features(ir)
       feats = %w[http1 tokio query json]
       feats << "form" if ir["routes"].to_a.any? { |r| (r["field_in"] || {}).value?("form") }
+      feats.concat(Cable.axum_features(ir))
       feats
     end
 
@@ -471,9 +538,12 @@ module AxumDsl
     # feature. :fetch_metadata sits outside :csrf: the cheap cross-site refusal runs first, and the token
     # check is the guard behind it. :private_cache is outside both (and :rate_limit), so a refusal any of
     # them answers still carries the cache headers, and inside :trace, which only observes.
-    LAYER_ORDER = %w[compression cors timeout csrf fetch_metadata rate_limit private_cache trace].freeze
+    # :rack_defaults (RackDefaults) is first, so innermost: it sees the body before :compression encodes it, which
+    # is what its ETag digests; a refusal from an outer layer (csrf, fetch_metadata, rate_limit) skips it.
+    # :front (Front) is last but :trace: Rack::Deflater and Thruster wrap the whole app, every refusal included.
+    LAYER_ORDER = %w[rack_defaults compression cors timeout csrf fetch_metadata rate_limit private_cache front trace].freeze
     LAYER_FEATURES = { "compression" => "compression-gzip", "cors" => "cors", "timeout" => "timeout",
-                       "fetch_metadata" => nil, "csrf" => nil, "rate_limit" => nil, "private_cache" => nil,
+                       "fetch_metadata" => nil, "csrf" => nil, "rate_limit" => nil, "private_cache" => nil, "rack_defaults" => nil, "front" => nil,
                        "trace" => "trace" }.freeze
 
     def layer?(ir, name) = ir["layers"].to_a.any? { |l| l["name"] == name }
@@ -499,16 +569,20 @@ module AxumDsl
       when "csrf" then "::axum::middleware::from_fn(axum_dsl_csrf)"
       when "rate_limit" then "::axum::middleware::from_fn(axum_dsl_rate_limit)"
       when "private_cache" then "::axum::middleware::from_fn(axum_dsl_private_cache)"
+      when "rack_defaults" then RackDefaults.layer_expr
+      when "front" then Front.layer_expr
       when "trace" then forwarded?(ir) ? FORWARDED_TRACE : PLAIN_TRACE
       end
     end
 
     # use_layer :private_cache: a page behind a cookie must not be stored by a shared cache. Both headers
-    # are appended, never inserted, so a route's own `Cache-Control` is kept beside `private, no-cache`
-    # and an existing `Vary` gains `Cookie` rather than losing what it named. `except:` leaves the headers
-    # off the public files under the named static mounts: each prefix matches the path exactly or at a `/`
-    # boundary (`/assets` covers `/assets/x.css`, not `/assets2`), with no allocation. Without `except:`
-    # the emitted runtime is byte for byte what it always was.
+    # are appended, never inserted, so an existing `Vary` gains `Cookie` rather than losing what it named.
+    # A response whose own `Cache-Control` (a route's `headers "Cache-Control" => ...`) says `public` is
+    # left alone: that route chose a shared-cache policy, and `private, no-cache` beside `public`
+    # contradicts it. `except:` leaves the headers off the public files under the named static mounts:
+    # each prefix matches the path exactly or at a `/` boundary (`/assets` covers `/assets/x.css`, not
+    # `/assets2`), with no allocation. Without `except:` the emitted runtime is byte for byte what it
+    # always was.
     def private_cache_runtime(ir)
       except = layer_entry(ir, "private_cache")&.[]("except").to_a
       head = ["// use_layer :private_cache: a shared cache must not store an authenticated page: written by the compiler"]
@@ -517,8 +591,10 @@ module AxumDsl
           "async fn axum_dsl_private_cache(request: ::axum::extract::Request, next: ::axum::middleware::Next) -> ::axum::response::Response {",
           "    let mut response = next.run(request).await;",
           "    let headers = response.headers_mut();",
-          "    headers.append(::axum::http::header::CACHE_CONTROL, ::axum::http::HeaderValue::from_static(\"private, no-cache\"));",
-          "    headers.append(::axum::http::header::VARY, ::axum::http::HeaderValue::from_static(\"Cookie\"));",
+          "    if !headers.get_all(::axum::http::header::CACHE_CONTROL).iter().any(|v| v.to_str().map_or(false, |s| s.to_ascii_lowercase().contains(\"public\"))) {",
+          "        headers.append(::axum::http::header::CACHE_CONTROL, ::axum::http::HeaderValue::from_static(\"private, no-cache\"));",
+          "        headers.append(::axum::http::header::VARY, ::axum::http::HeaderValue::from_static(\"Cookie\"));",
+          "    }",
           "    response",
           "}"
         ]
@@ -537,8 +613,10 @@ module AxumDsl
         "    let mut response = next.run(request).await;",
         "    if !exempt {",
         "        let headers = response.headers_mut();",
-        "        headers.append(::axum::http::header::CACHE_CONTROL, ::axum::http::HeaderValue::from_static(\"private, no-cache\"));",
-        "        headers.append(::axum::http::header::VARY, ::axum::http::HeaderValue::from_static(\"Cookie\"));",
+        "        if !headers.get_all(::axum::http::header::CACHE_CONTROL).iter().any(|v| v.to_str().map_or(false, |s| s.to_ascii_lowercase().contains(\"public\"))) {",
+        "            headers.append(::axum::http::header::CACHE_CONTROL, ::axum::http::HeaderValue::from_static(\"private, no-cache\"));",
+        "            headers.append(::axum::http::header::VARY, ::axum::http::HeaderValue::from_static(\"Cookie\"));",
+        "        }",
         "    }",
         "    response",
         "}"
@@ -881,8 +959,12 @@ module AxumDsl
     # and check()/errors stay keyed by it. Every other constraint is enforced by check(), not by serde.
     def field_attrs(f, struct)
       attrs = []
-      attrs << "#[serde(rename = #{AxumDsl.rstr(f['wire_name'])})]" if f["wire_name"]
-      attrs << "#[serde(default = \"#{default_name(struct, f)}\")]" if f.key?("default")
+      # An :upload field is not read from the urlencoded text: its struct takes the file from the multipart body (Multipart).
+      # A list field of a form is taken from every repeated key by its struct too (Multipart), and its default with it.
+      taken = f["type"] == "upload" || (f["in"] == "form" && Multipart::LIST_TYPES.include?(f["type"]))
+      attrs << "#[serde(skip)]" if taken
+      attrs << "#[serde(rename = #{AxumDsl.rstr(f['wire_name'])})]" if f["wire_name"] && !taken
+      attrs << "#[serde(default = \"#{default_name(struct, f)}\")]" if f.key?("default") && !taken
       attrs
     end
 
@@ -919,6 +1001,7 @@ module AxumDsl
     def field_rust_type(type)
       case type
       when "string_list" then "Vec<String>"
+      when "upload" then "AxumDslUpload"
       when "i64_list" then "Vec<i64>"
       when "f64_list" then "Vec<f64>"
       when CompositeTypes::MAP_FIELD, CompositeTypes::MAP_OF_MAP_FIELD
@@ -1173,8 +1256,10 @@ module AxumDsl
       out.push("fn check_files() -> Result<(), String> {")
       files.each do |f|
         name = f["name"]
+        # A `binary: true` file is not text: the server only checks that it can be read.
+        read = f["binary"] ? "std::fs::read(&path)" : "std::fs::read_to_string(&path)"
         out.push("    {", "        let path = file_path_#{name}();",
-                 "        let #{f['entries'].empty? ? '_text' : 'text'} = std::fs::read_to_string(&path).map_err(|e| format!(\"error: cannot read file `#{name}` at {}: {e}\", path.display()))?;")
+                 "        let #{f['entries'].empty? ? '_text' : 'text'} = #{read}.map_err(|e| format!(\"error: cannot read file `#{name}` at {}: {e}\", path.display()))?;")
         out << "        check_file_entries(#{AxumDsl.rstr(name)}, &path, &text, FILE_ENTRIES_#{name.upcase})?;" unless f["entries"].empty?
         out << "    }"
       end
@@ -1437,6 +1522,7 @@ module AxumDsl
         mapped(o, ranges, s, "params `#{s['owner']}` (constraints)") { o.concat(check_impl(s, ir, check: want_check, errors: want_errors)) }
         o << ""
       end
+      o.concat(Multipart.struct_impls(plan))
       unless regexes.empty?
         o << "use regex::Regex;"
         o << "use std::sync::LazyLock;"
@@ -1484,6 +1570,11 @@ module AxumDsl
         o.concat(HTML_ESCAPE.lines.map(&:chomp))
         o << ""
       end
+      if ir["html_escape_into"]
+        o << "// HTML escaping for a view's `{{ name }}`, written into the render's buffer: written by the compiler"
+        o.concat(HTML_ESCAPE_INTO.lines.map(&:chomp))
+        o << ""
+      end
       o.concat(Sanitize.items(ir))
       ir["user_helpers"].to_a.each do |h|
         mapped(o, ranges, h, "helper `#{h['name']}`") { o.concat(helper_fn(h)) }
@@ -1493,9 +1584,19 @@ module AxumDsl
       database_items(o, ranges, ir) if ir["database"]
       o.concat([*Cookies.runtime_lines(ir), ""]) if ir["cookies"]
       o.concat([*SignedId.items(ir), ""]) if SignedId.used?(ir)
+      o.concat([*Crc32.items(ir), ""]) if Crc32.used?(ir)
+      o.concat([*Url.items(ir), ""]) if Url.used?(ir)
+      o.concat([*Qr.items(ir), ""]) if Qr.used?(ir)
       o.concat(Sessions.items(ir))
       o.concat(Csrf.items(ir))
+      o.concat(ResponseCache.items(ir))
       o.concat([*private_cache_runtime(ir), ""]) if layer?(ir, "private_cache")
+      o.concat([*RackDefaults.runtime(ir), ""]) if RackDefaults.used?(ir)
+      o.concat(Multipart.items(ir))
+      o.concat([*MethodOverride.runtime, ""]) if MethodOverride.used?(ir)
+      o.concat(Front.items(ir)) if Front.used?(ir)
+      o.concat(Front.static_items(ir))
+      o.concat(Front.serve_file_items(ir))
       o.concat([*rate_limit_runtime(ir), ""]) if layer?(ir, "rate_limit")
       if Sessions.currents?(ir)
         o.concat(Sessions.currents_lines(ir))
@@ -1505,6 +1606,10 @@ module AxumDsl
         end
       end
       o.concat(files_runtime(ir))
+      if Cable.used?(ir)
+        mapped(o, ranges, ir["cable"], "cable `#{ir["cable"]["path"]}`") { o.concat(Cable.items(ir)) }
+        o << ""
+      end
       if error_needed?(ir, plan)
         # error_runtime writes the compiler's own 500 helper and the `error` filter's response; when the
         # filter has a line, the whole block is claimed for it (the compiler-written helper has none).
@@ -1540,6 +1645,9 @@ module AxumDsl
       end
       o << "// Resolves on ctrl-c or SIGTERM, so the server stops taking connections and drains: written by the compiler"
       o.concat(SHUTDOWN_SIGNAL.lines.map(&:chomp))
+      o << ""
+      o << "// jemalloc as the global allocator, and no transparent huge pages on Linux: written by the compiler"
+      o.concat(ALLOCATOR.lines.map(&:chomp))
       o << ""
       o.concat(main_fn(ir, plan))
       o.concat(regex_test(regexes))
@@ -1606,14 +1714,18 @@ module AxumDsl
     def response_expr(b)
       base = b["type"] == "response" ? b["expr"] : "#{Body::INTO}(#{b['expr']})"
       headers = b["headers"].to_a
-      return base if b["status"].nil? && headers.empty? && b["etag"].nil? && !b["errors"] && !b["cookies"]
+      computed = b["computed_headers"].to_a
+      return base if b["status"].nil? && headers.empty? && computed.empty? && b["etag"].nil? && !b["errors"] && !b["cookies"]
 
-      # The etag value is a statement before the body's last expression, so it is computed before the
-      # response value is built: a local the response moves is still there to borrow.
-      lines = if b["etag"]
-                ["{ let __etag = #{b['etag']};", "    let mut __stated = #{base};"]
-              else
+      # The etag value and a computed header's value are statements before the body's last expression, so they are
+      # computed before the response value is built: a local the response moves is still there to borrow.
+      prelude = []
+      prelude << "let __etag = #{b['etag']};" if b["etag"]
+      computed.each_with_index { |(_, value), i| prelude << "let __header_#{i} = #{value};" }
+      lines = if prelude.empty?
                 ["{ let mut __stated = #{base};"]
+              else
+                ["{ #{prelude.first}", *prelude.drop(1).map { |l| "    #{l}" }, "    let mut __stated = #{base};"]
               end
       if b["status"]
         # A body that set a status decides for itself, so a route that reads errors takes the 400 below
@@ -1626,6 +1738,12 @@ module AxumDsl
         lines << "    if !#{Body::ERRORS_MAP}.is_empty() { *__stated.status_mut() = ::axum::http::StatusCode::BAD_REQUEST; }"
       end
       lines.concat(header_inserts(headers, "__stated").map { |l| "    #{l}" })
+      # A computed header: a value no header may carry (a control character) is left off rather than failing the request.
+      computed.each_with_index do |(name, _), i|
+        lines << "    if let Ok(__header_value) = ::axum::http::HeaderValue::from_str(&__header_#{i}) {"
+        lines << "        __stated.headers_mut().insert(::axum::http::HeaderName::from_static(#{AxumDsl.rstr(name.to_s.downcase)}), __header_value);"
+        lines << "    }"
+      end
       # A route body's `etag(value)`: the ETag rides on the final response, and a request whose
       # If-None-Match lists the value is answered 304 with no body. `__etag` was computed above, before the
       # response was built; only the comparison and the header happen here.
@@ -1643,7 +1761,9 @@ module AxumDsl
         lines << "    }"
       end
       # the cookies the body set or deleted (set_cookie / delete_cookie): one Set-Cookie line each
-      lines << "    axum_dsl_apply_cookies(&mut __stated, &__cookies);" if b["cookies"]
+      # A fallible body applies them where its closure's result is matched instead (assign_response), so an early
+      # `return` leaves with them too.
+      lines << "    axum_dsl_apply_cookies(&mut __stated, &__cookies);" if b["cookies"] && !b["fallible"]
       lines << "    __stated }"
       lines.join("\n")
     end
@@ -1672,7 +1792,7 @@ module AxumDsl
        *b["locals"].map { |l| "    #{l}" },
        "    Ok(#{response_expr(b)})",
        "#{call} {",
-       "    Ok(response) => response,",
+       b["cookies"] ? "    Ok(mut response) => { axum_dsl_apply_cookies(&mut response, &__cookies); response }" : "    Ok(response) => response,",
        "    Err(message) => error_response(&message),",
        "};"]
     end
@@ -1689,13 +1809,20 @@ module AxumDsl
       parts = entry["parts"]
       lines = []
       body = entry["route"]["body"]
+      cached = entry["route"]["cache"]
       request = request_extractors(body)
+      request += ResponseCache.extractors if cached
       lines << "#[allow(unused_variables)]" unless parts.empty?
-      lines << "async fn #{name}(#{(request + parts.map { |p| extractor_param(p) }).join(', ')}) -> ::axum::response::Response {"
+      # `request_body` reads the whole body: axum's Bytes, which consumes it, so it is the last extractor (the reader
+      # refused a route that also has a JSON or form params group).
+      raw_body = body["request"].to_a.include?("body") ? ["__body: ::axum::body::Bytes"] : []
+      lines << "async fn #{name}(#{(request + parts.map { |p| extractor_param(p) } + raw_body).join(', ')}) -> ::axum::response::Response {"
       # What the body read of the request (body.rb: need): the peer address becomes the Option the body's code reads,
       # and a body that sets cookies keeps their Set-Cookie lines until the response is built (response_expr).
       lines << "    let __peer = Some(__connect);" if body["request"].to_a.include?("peer")
       lines << "    let mut __cookies: Vec<String> = Vec::new();" if body["cookies"]
+      # A cached route answers a hit here, after the filters, before anything of its body runs (ResponseCache).
+      lines.concat(ResponseCache.lookup_lines(entry["route"]["path"])) if cached
       # A route whose body reads errors[:field] takes the check's messages into the body instead of the
       # 400 below; a route of any other kind writes exactly what it always wrote. The map is built before
       # the destructuring, which moves the struct the checks read.
@@ -1712,7 +1839,7 @@ module AxumDsl
         lines << "    let #{p['struct']} { #{p['fields'].map { |f| f['name'] }.join(', ')} } = #{p['binding']};"
       end
       lines.concat(assign_response(entry["route"]["body"], "response").map { |l| "    #{l}" })
-      lines << "    response"
+      lines << (cached ? ResponseCache.admit_line : "    response")
       lines << "}"
       lines
     end
@@ -1734,11 +1861,15 @@ module AxumDsl
     end
 
     # The extractors a body that reads the request needs, ahead of the params ones (the body extractor goes last):
-    # the headers (cookie, user_agent, request_ip), the peer (request_ip, current) and the request's current cells.
+    # the headers (cookie, user_agent, request_ip), the method (request_method), the peer (request_ip, current) and
+    # the request's current cells.
     def request_extractors(body)
       want = body["request"].to_a
       out = []
       out << "__headers: ::axum::http::HeaderMap" if want.include?("headers")
+      # `Method` is bound by name: axum extracts it, and its field is private, so a `Method(__method)`
+      # pattern is a private tuple-struct constructor (E0603), not a binding.
+      out << "__method: ::axum::http::Method" if want.include?("method")
       out << "::axum::extract::ConnectInfo(__connect): ::axum::extract::ConnectInfo<::std::net::SocketAddr>" if want.include?("peer")
       out << "::axum::Extension(__currents): ::axum::Extension<::std::sync::Arc<AxumDslCurrents>>" if want.include?("currents")
       out << "::axum::Extension(__csrf): ::axum::Extension<AxumDslCsrfToken>" if want.include?("csrf")
@@ -1749,7 +1880,12 @@ module AxumDsl
       case p["source"]
       when "path" then "axum::extract::Path(#{p['binding']}): axum::extract::Path<#{p['struct']}>"
       when "query" then "axum::extract::Query(#{p['binding']}): axum::extract::Query<#{p['struct']}>"
-      when "form" then "axum::extract::Form(#{p['binding']}): axum::extract::Form<#{p['struct']}>"
+      when "form"
+        if Multipart.upload_form?(p["fields"]) # a multipart body too, with the file fields (multipart.rb)
+          "AxumDslForm(#{p['binding']}): AxumDslForm<#{p['struct']}>"
+        else
+          "axum::extract::Form(#{p['binding']}): axum::extract::Form<#{p['struct']}>"
+        end
       else "axum::extract::Json(#{p['binding']}): axum::extract::Json<#{p['struct']}>"
       end
     end
@@ -1779,6 +1915,8 @@ module AxumDsl
       # headers are copied, so the request can still be moved into the next handler.
       want = b["request"].to_a
       lines << "    let __headers = request.headers().clone();" if want.include?("headers")
+      lines << "    let __path = request.uri().path().to_string();" if want.include?("path")
+      lines << "    let __method = request.method().clone();" if want.include?("method")
       lines << "    let __peer = request.extensions().get::<::axum::extract::ConnectInfo<::std::net::SocketAddr>>().map(|__c| __c.0);" if want.include?("peer")
       lines << "    let __currents = request.extensions().get::<::std::sync::Arc<AxumDslCurrents>>().cloned().unwrap_or_default();" if want.include?("currents")
       lines << "    let __csrf = request.extensions().get::<AxumDslCsrfToken>().cloned().unwrap_or_default();" if want.include?("csrf")
@@ -1829,19 +1967,25 @@ module AxumDsl
     # The routes and static mounts that name this filter in `skip:`, as [method, axum path] pairs. The run-time
     # check compares the request's method and URI path against them; Reader#check_filter_skips refused a route
     # pair that could also match a route which does not skip the filter. A static mount is a GET service at its
-    # prefix and everything under it, so it contributes the prefix and its `{*path}` subtree.
+    # prefix and everything under it, so it contributes the prefix and its `{*path}` subtree; a `serve_file` is
+    # a GET and HEAD route at its path.
     def skip_entries(ir, name)
       routes = ir["routes"].to_a.select { |r| r["skip"].to_a.include?(name) }.map { |r| [r["method"], r["path"]] }
       statics = ir["statics"].to_a.select { |s| s["skip"].to_a.include?(name) }.flat_map do |s|
         subtree = s["prefix"] == "/" ? "/{*path}" : "#{s['prefix']}/{*path}"
         [["get", s["prefix"]], ["get", subtree]]
       end
-      (routes + statics).uniq
+      files = ir["serve_files"].to_a.select { |f| f["skip"].to_a.include?(name) }.flat_map { |f| [["get", f["path"]], ["head", f["path"]]] }
+      cable = Cable.used?(ir) ? [["get", ir["cable"]["path"]]] : [] # the endpoint authenticates itself, so no named filter runs for it
+      (routes + statics + files + cable).uniq
     end
 
+    # One condition per skipped method/path, joined with `||` by before_fn. No parentheses: `&&` binds tighter
+    # than `||`, and a filter whose only skip is the implicit /cable entry would otherwise emit `{ (cond) }`,
+    # which `-D unused-parens` refuses.
     def skip_conditions(entries)
       entries.map do |method, path|
-        "(*method == ::axum::http::Method::#{method.upcase} && axum_dsl_skip_match(#{AxumDsl.rstr(path)}, path))"
+        "*method == ::axum::http::Method::#{method.upcase} && axum_dsl_skip_match(#{AxumDsl.rstr(path)}, path)"
       end
     end
 
@@ -1923,12 +2067,17 @@ module AxumDsl
       end
       # One route per `serve_file`, and one service for each `static` mount: ServeDir nested at the mount
       # prefix, or the fallback when the prefix is "/" (axum refuses to nest at "/").
-      ir["serve_files"].to_a.each do |f|
-        chain << ".route(#{AxumDsl.rstr(f['path'])}, axum::routing::get_service(::tower_http::services::ServeFile::new(#{AxumDsl.rstr(f['from'])})))"
+      ir["serve_files"].to_a.each_with_index do |f, i|
+        service = "axum::routing::get_service(::tower_http::services::ServeFile::new(#{AxumDsl.rstr(f['from'])}))"
+        service += ".layer(#{Front.serve_file_layer_expr(i)})" if f["max_age"]
+        chain << ".route(#{AxumDsl.rstr(f['path'])}, #{service})"
       end
       chain << ".route(#{AxumDsl.rstr(ir['openapi']['path'])}, axum::routing::get(openapi_json))" if ir["openapi"]
-      ir["statics"].to_a.each do |s|
+      chain << ".route(#{AxumDsl.rstr(ir['cable']['path'])}, axum::routing::get(axum_dsl_cable))" if Cable.used?(ir)
+      ir["statics"].to_a.each_with_index do |s, i|
         service = "::tower_http::services::ServeDir::new(#{AxumDsl.rstr(s['dir'])}).append_index_html_on_directories(true)"
+        # A mount with a fingerprint or a max-age sends its files' headers through a router of its own (Front.static_items).
+        service = "axum::Router::new().fallback_service(#{service}).layer(#{Front.static_layer_expr(i)})" if s["digest"] || s["max_age"]
         chain << if s["prefix"] == "/"
                    ".fallback_service(#{service})"
                  else
@@ -1938,17 +2087,24 @@ module AxumDsl
       chain << ".fallback(not_found)" if ir["not_found"]
 
       ir["before"].to_a.each_index { |i| chain << ".layer(axum::middleware::from_fn(before_#{i + 1}))" }
+      # The response cache reads its generation outside every filter, so a commit during a filter is seen (ResponseCache).
+      chain << ".layer(#{ResponseCache.layer_expr})" if ResponseCache.used?(ir)
       # The cells of `current` are made by the outermost filter layer, so a filter and its route read the same ones.
       chain << ".layer(axum::middleware::from_fn(axum_dsl_current_scope))" if Sessions.currents?(ir)
       # The use_layer middleware, in the emitter's fixed order (LAYER_ORDER), after every route and the
       # fallback, because axum's Router::layer only wraps what is already registered.
       LAYER_ORDER.each { |name| chain << ".layer(#{layer_expr(ir, name)})" if layer?(ir, name) }
       chain[-1] = "#{chain[-1]};"
+      # :method_override is not in LAYER_ORDER: it wraps the finished router (MethodOverride), so its method
+      # change comes before routing, which Router::layer cannot do.
+      wrap = MethodOverride.used?(ir) ? MethodOverride.wrap_lines : []
       [
         "#[tokio::main]",
         "async fn main() -> anyhow::Result<()> {",
+        "    disable_transparent_huge_pages();",
         *start,
         "    let router = #{chain.join("\n        ")}",
+        *wrap,
         # the environment wins over `set :port`/`set :bind`; a PORT that is not a port is refused like a
         # setting that cannot load, before anything listens
         "    let port = match std::env::var(\"PORT\") {",
@@ -1964,7 +2120,7 @@ module AxumDsl
         "    let bind = std::env::var(\"BIND\").unwrap_or_else(|_| #{AxumDsl.rstr(bind_default(ir))}.to_string());",
         *listener_lines(ir),
         "    axum::serve(listener, router.into_make_service_with_connect_info::<std::net::SocketAddr>())",
-        "        .with_graceful_shutdown(shutdown_signal())",
+        "        .with_graceful_shutdown(#{Cable.used?(ir) ? "async {\n            shutdown_signal().await;\n            #{Cable.stop_call};\n        }" : "shutdown_signal()"})",
         "        .await?;",
         "    Ok(())",
         "}"

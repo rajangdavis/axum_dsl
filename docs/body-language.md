@@ -33,18 +33,21 @@ instead. `axum_dsl skill` writes the complete, generated reference; the outline:
   keyword), arithmetic and comparisons, `&& || !`, `if`/`elsif`/`else`, `unless`, ternary,
   `case`/`when` (with string, integer and regex subjects), string interpolation, guard clauses
   (`return "x" if cond`, `raise "msg" unless cond`), and blocks with one parameter.
-- **Statements before the last expression:** only `name = expr`, a guard clause, `status(...)`,
-  `content_type(...)`, `headers(...)`, `etag(...)`, a bare `execute`/`query` call (its value dropped) or `.each { ... }`.
+- **Statements before the last expression:** only `name = expr`, a guard clause, a conditional statement,
+  `status(...)`, `content_type(...)`, `headers(...)`, `etag(...)`, a bare `execute`/`query` call (its value dropped)
+  or `.each { ... }`. A conditional statement is an `if`/`unless` with no else whose body is only bare
+  `execute`/`query` calls, local assignments or nested conditional statements; it compiles to a Rust `if` block and
+  the route continues afterwards. A body that leaves with `return`/`raise` is still a guard clause.
   The last expression is the response.
 - **Required currents.** `current(:user)` has the nil-able type its `current` declares, except in a route that
   does not skip the filter named by `required: :authenticate`: there it reads as the non-nil type, so no
   `nil?`/`||` is needed. A route that skips that filter and reads the current is refused (see
   [Sessions](sessions.md)).
 - **Transactions.** With a `database`, `transaction do ... end` runs declared statement calls on one
-  connection and is the block's value: `name = query/execute call` locals, bare calls, and a final call or
-  local. A database error rolls the block back. A nested `transaction`, `return`, `raise`, guard clause or
-  non-SQL statement inside is refused: a `return` would bypass the rollback, and non-SQL work does not belong
-  in a retried/rolled-back unit. In Rust the block is a `move` closure, so a value it uses is moved into it;
+  connection and is the block's value: `name = query/execute call` locals, bare calls, conditional statements
+  whose bodies are those calls, and a final call or local. A database error rolls the block back. A nested
+  `transaction`, `return`, `raise`, guard clause or non-SQL statement inside is refused: a `return` would bypass
+  the rollback, and non-SQL work does not belong in a retried/rolled-back unit. In Rust the block is a `move` closure, so a value it uses is moved into it;
   clone it or compute it outside if the route needs it afterwards.
 - **Strings:** `upcase downcase strip capitalize length split partition chars lines reverse tr delete
   squeeze index start_with? end_with? include? empty? match? =~ gsub sub to_i`, slicing `s[start, len]`
@@ -98,7 +101,7 @@ instead. `axum_dsl skill` writes the complete, generated reference; the outline:
   literal MIME type, such as `content_type: "text/vnd.turbo-stream.html"`), which travel on the value as
   its status and Content-Type header, so a `return` can carry them. A `redirect` path is written in the
   source: a string literal, or a literal
-  interpolating only numbers and bools (`redirect("/rooms/#{room_id}")`). It becomes the `Location`
+  interpolating only numbers, bools or a `url_encode(...)` call (`redirect("/rooms/#{room_id}")`). It becomes the `Location`
   header, and a computed string could carry a byte the header rejects, so it is refused. Its literal text
   is visible ASCII (0x20-0x7E, or a tab), with no leading or trailing whitespace, because that text is the
   header value. A body may not use both `status(code)` and a helper's `status:`: the statement applies
@@ -118,10 +121,61 @@ instead. `axum_dsl skill` writes the complete, generated reference; the outline:
   bytes on the response with the literal Content-Type, and answers a plain 500 if the read fails. The file is
   not declared beside the DSL file and is not copied into the crate; a path that comes from a request is the
   application's trust decision, so check the row or the prefix first and answer 404 yourself.
+  `send_file(path, content_type: "image/webp", disposition: :inline)` (or `:attachment`) is Rails' `send_file` disposition: the
+  response also carries `Content-Disposition: inline; filename="<last path segment>"; filename*=UTF-8''<segment>`
+  (ASCII `filename=`, other non-ASCII characters as `?`, the full name percent-encoded) and `Content-Transfer-Encoding: binary`;
+  without `disposition:` neither header is added.
   `rails_signed_id(token, purpose: "user/avatar", secret: :secret_key)` is a value, not a response: it is the
   integer id inside a Rails 8 `signed_id` token, or nil when the token is malformed, unsigned with that key,
-  for another purpose, carries an expiry, or its payload is not an integer. `secret:` names a required string
+  for another purpose, carries an expiry without `check_expiry: true`, or its payload is not an integer. `secret:` names a required string
   setting (usually SECRET_KEY_BASE); `purpose:` is the full `"<model>/<purpose>"` string Rails composes.
+  `rails_signed_id_for(id, purpose: "user/avatar", secret: :secret_key)` is the other direction: the token
+  Rails' `user.signed_id(purpose: :avatar)` writes for an integer id (the same envelope, url-safe unpadded
+  base64 and HMAC-SHA256 hex), so both `rails_signed_id` and Rails verify it. `expires_in: 14400` (a positive integer
+  literal of seconds, Rails' `expires_in: 4.hours`) adds the `exp` the clock gives at signing, written as
+  `iso8601(3)` between `data` and `pur`. By default `rails_signed_id` refuses an expiring token (it does not check
+  the expiry); `check_expiry: true` is Rails' `signed_id_verifier.verified(token, purpose:)` / `User.find_signed`:
+  a token with no `exp` is accepted, one whose `exp` is still in the future returns the id, and one whose `exp` is
+  now or in the past is nil. A view writes the same token with
+  `{{ rails_signed_id user_id, purpose: "user/avatar", secret: :secret_key }}` (see [Views](views.md)).
+  `turbo_signed_stream_name(*parts, secret: :secret_key)` is turbo-rails' `Turbo::StreamsChannel.signed_stream_name`:
+  the parts (strings or symbols) are joined with `:` as `stream_name_from` does, JSON-dumped, strict-base64
+  encoded and signed with the key derived for `"turbo/signed_stream_verifier_key"`, giving
+  `<base64>--<hex digest>`. `global_id_param("Rooms::Open", room.id, app: "campfire")` is `record.to_gid_param`
+  (the url-safe unpadded base64 of `gid://campfire/Rooms::Open/<id>`), the part a record becomes in a stream
+  name, so `turbo_stream_from @room, :messages` is
+  `turbo_signed_stream_name(global_id_param("Rooms::Open", room.id, app: "campfire"), :messages, secret: :secret_key)`.
+  `urlsafe_base64(text)` is Ruby's `Base64.urlsafe_encode64` (padded with `=`), as the QR link
+  `/qr_code/<urlsafe_base64(url)>` uses. `url_encode(text)` is Ruby's `URI.encode_www_form_component`
+  (Rack::Utils.escape), the escaping Rails writes for a query parameter: `new_session_url(email_address:
+  "david@37signals.com")` carries `david%4037signals.com`. All three signing calls must name the same `secret:`.
+  `rails_signed_global_id("User", user.id, app: "campfire", purpose: "attachable", secret: :secret_key)` is
+  `record.attachable_sgid`: the `SignedGlobalID` token over `gid://<app>/<model>/<id>?expires_in` with purpose
+  `attachable`, JSON `_rails` metadata, padded URL-safe base64 and an HMAC-SHA1 digest under
+  `key_generator.generate_key("signed_global_ids")`. `purpose:` defaults to `attachable`; the token is what an
+  Action Text mention attachment and a `<lexxy-prompt-item>` carry. `json_object("name" => value, ...)` writes
+  one JSON object as a string and `json_array([...])` joins already-serialized objects into a JSON array; they
+  are for a JSON response built from records, where a map literal's keys must share one value type.
+  `urlsafe_decode64(text)` is `Base64.urlsafe_decode64` as text (nil where Ruby raises or the bytes are not UTF-8), and
+  `qr_code_svg(text)` is `RQRCode::QRCode.new(text).as_svg(viewbox: true, fill: :white, color: :black)` byte for byte (nil
+  past version 40): together they are Campfire's `GET /qr_code/:id`. `crc32(text)` is Ruby's `Zlib.crc32(text)`, the unsigned 32-bit CRC-32 the Campfire avatar palette indexes with.
+  `plain_text(html)` is Action Text's `to_plain_text` of a stored body (the conversion a sanitizer's `attachments:` uses, with the
+  trailing newlines removed). `request_body` is the whole request body as UTF-8 text (`request.body.read.force_encoding("UTF-8")`),
+  for a route; the route cannot also read params `in: :body` or `in: :form` (a friendly compile error), because axum lets one
+  extractor consume the body. `request_path` is the URI path, for a `before` filter. `request_method` is the HTTP method
+  in upper case (`"GET"`, `"POST"`), for a route and a `before` filter (Rails' `request.get?`/`request.head?`), and it sees
+  `use_layer :method_override`'s rewrite. A route's `headers` value may be a string
+  expression (`headers "X-Total-Count" => count.to_s`), computed before the response is built like `etag(value)`; an empty
+  value leaves the header off (Rack drops a nil header), and a value no header may carry is dropped. A `json_object` value may
+  itself be a `json_object(...)`, which nests as an object.
+  `broadcast name, "key" => value, ...` is `ActionCable.server.broadcast`: it sends a JSON object (keys in the order written) to every
+  Action Cable subscription listening on the broadcasting name, `broadcast_to "key" => value` does so for the stream a channel's
+  `stream_for` made, and `broadcast_turbo(*stream_parts, action: :append, target: "id", html: render_string(:view, locals: {...}),
+  maintain_scroll: true)` sends a `<turbo-stream>` tag (turbo-rails' `broadcast_<action>_to`; `:remove` takes no `html:`). They are
+  statements for a route, a `before` filter or a channel callback, never wait for a socket, and need a `cable` declaration (see
+  [Action Cable](cable.md)). `close_remote_connections(user.id, reconnect: true)` (Rails' `User#close_remote_connections`) makes every open
+  connection of that user id send `{"type":"disconnect","reason":"remote","reconnect":true}` and close; it is a statement of the same kind. `render_string(:view, locals: {...})` renders a view to a String, with no layout, instead of answering with it.
+
 - **Escaping.** `h(value)` escapes `&`, `<`, `>`, `"` and `'` and gives a string: it is what a page
   interpolates, inside `html(...)` or a string. `raw(value)` is the same value with no escaping, and is
   the XSS door, named so a review can grep for `raw(`; a view's `{{ name }}` and `{{ name|raw }}` are exactly
@@ -135,7 +189,8 @@ instead. `axum_dsl skill` writes the complete, generated reference; the outline:
   `setting :name, env: "..."`, resolved once when the server starts; a route or filter body may read it, a
   helper or a binding body may not (see [Coverage](coverage.md)). `file_text(:name)`
   is the text of a file declared with `file "path", as: :name`, read from disk on each call (an error if
-  it cannot be read); `file_path(:name)` is the path it is read from. `entry(:name, :fn)` is the string
+  it cannot be read); `file_path(:name)` is the path it is read from. A file declared `binary: true` (an image a
+  route sends with `send_file(file_path(:name), ...)`) is copied into the crate byte for byte and has no `file_text`. `entry(:name, :fn)` is the string
   `"fn"`, refused unless `:fn` is in the file's `entries:`; `entry_args(:name, :fn, key: value, ...)`
   builds the arguments as JSON text through `serde_json`, a dependency of every emitted crate; no example
   or test exercises it yet (see [Coverage](coverage.md)).

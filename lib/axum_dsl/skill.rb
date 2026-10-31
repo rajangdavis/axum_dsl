@@ -123,8 +123,14 @@ module AxumDsl
       wraps the whole router in a tower-http layer; `:rate_limit` (`per:`, `burst:`, optional `path:`) and
       `:private_cache` (which appends `Cache-Control: private, no-cache` and `Vary: Cookie` to every
       response) are the compiler's own. `except: ["/assets"]` on `:private_cache` leaves its headers off
-      the public files under a declared `static` mount (only a mount may be named); a route still adds
-      `private, no-store` when it wants it. A layer answers every route, so where the declaration sits
+      the public files under a declared `static` mount (only a mount may be named); a response whose own `Cache-Control` (a route's `headers`) says `public` keeps it and gets neither header; a route still adds
+      `private, no-store` when it wants it. `:rack_defaults` is Rails' default response headers for rendered HTML, one keyword per part
+      (`security_headers: true`, `version:`/`revision:` setting names, `etag: true`, `vary_accept: true`,
+      `preload: ["app.css"]`, `refresh_cookies: ["session_token"]`, `session_cookie: "_app_session"`, `except:`). `:front` is Rack::Deflater and Thruster in front of the app
+      (gzip, `Vary: accept-encoding`, `X-Cache`, an in-memory cache of public max-age responses; `cache_mb:`).
+      `:method_override` is Rack::MethodOverride: a POST with a `_method=patch|delete` form field (or an
+      `X-HTTP-Method-Override` header) is routed as that method, so a browser form reaches `patch`/`delete` routes.
+      A layer answers every route, so where the declaration sits
       does not matter. The shape is
       Sinatra's: there is no enclosing block, so `server` carries only the crate's name and version and the
       routes sit at the top level. Paths use Sinatra's `:name` capture syntax, translated to axum 0.8's
@@ -178,7 +184,7 @@ module AxumDsl
       either; `signed: false` is a plain cookie with no MAC). A body reads one with
       `cookie(:name)` (nil when absent or not signed by this key) and a route writes one with
       `set_cookie :name, value, http_only: true, same_site: :lax, permanent: true` and
-      `delete_cookie :name`. `random_token`, `request_ip` and `user_agent` are values, `Bcrypt.verify(plain,
+      `delete_cookie :name`. `random_token`, `request_ip`, `request_base_url`, `user_agent` and `turbo_frame_request?` (a boolean: the request has a non-blank Turbo-Frame header) are values, `Bcrypt.verify(plain,
       digest)` and `Bcrypt.hash(plain)` are built in, and `current :user, returns: :User? do ... end` declares a
       per-request value that a route or filter reads with `current(:user)`; `required: :authenticate` makes it
       non-nil in routes that do not skip that named filter. `use_layer :fetch_metadata` refuses
@@ -473,7 +479,7 @@ module AxumDsl
       when :lit then "a string, number or true/false literal"
       when :setting then "a string, number or true/false literal, or a symbol naming what the setting points at, such as the view `set :layout` names"
       when :default then "a string, number or true/false literal, or a list of them for a list field"
-      when :fieldtype then "a type symbol (#{(TYPES.keys + FIELD_LISTS).map(&:inspect).join(', ')}, map(...), list(...), or the CamelCase name of another params to nest an object)"
+      when :fieldtype then "a type symbol (#{(TYPES.keys + FIELD_LISTS + FIELD_UPLOADS).map(&:inspect).join(', ')}, map(...), list(...), or the CamelCase name of another params to nest an object)"
       when :num then "number literal"
       when :uint then "non-negative integer literal"
       when :snake then "snake_case symbol"
@@ -482,6 +488,7 @@ module AxumDsl
       when :types then "array of type symbols"
       when :helper_kw then "hash of `name: [type, required]` keyword parameters"
       when :strs then "array of string literals"
+      when :hash then "hash literal of string or symbol keys; each value a string, symbol, integer or a list of them"
       when :snakes then "array of snake_case symbols, such as %i[place look]"
       when :file_checks then "array of check names: #{FILE_CHECKS.map(&:inspect).join(', ')}"
       when :sqlargs then "hash of the query's arguments, such as `{ limit: :i64 }`; each a scalar type"

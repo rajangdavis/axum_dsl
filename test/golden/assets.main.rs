@@ -11,8 +11,20 @@ async fn axum_dsl_private_cache(request: ::axum::extract::Request, next: ::axum:
     let mut response = next.run(request).await;
     if !exempt {
         let headers = response.headers_mut();
-        headers.append(::axum::http::header::CACHE_CONTROL, ::axum::http::HeaderValue::from_static("private, no-cache"));
-        headers.append(::axum::http::header::VARY, ::axum::http::HeaderValue::from_static("Cookie"));
+        if !headers.get_all(::axum::http::header::CACHE_CONTROL).iter().any(|v| v.to_str().map_or(false, |s| s.to_ascii_lowercase().contains("public"))) {
+            headers.append(::axum::http::header::CACHE_CONTROL, ::axum::http::HeaderValue::from_static("private, no-cache"));
+            headers.append(::axum::http::header::VARY, ::axum::http::HeaderValue::from_static("Cookie"));
+        }
+    }
+    response
+}
+
+// static "/assets": its files' headers, as Propshaft and ActionDispatch::Static send them: written by the compiler
+async fn axum_dsl_static_headers_1(request: ::axum::extract::Request, next: ::axum::middleware::Next) -> ::axum::response::Response {
+    let mut response = next.run(request).await;
+    if response.status().is_success() || response.status().as_u16() == 304 {
+        let headers = response.headers_mut();
+        headers.remove("accept-ranges");
     }
     response
 }
@@ -26,7 +38,7 @@ async fn route_1() -> ::axum::response::Response {
 }
 
 async fn route_2() -> ::axum::response::Response {
-    let response = ::axum::response::IntoResponse::into_response(::axum::response::Html(format!("<!doctype html>\n<html lang=\"en\">\n<head>\n<link rel=\"stylesheet\" href='{}'>\n</head>\n<body><p>Fingerprinted assets</p></body>\n</html>\n", "/assets/campfire-ba52bca62f07.css")));
+    let response = ::axum::response::IntoResponse::into_response(::axum::response::Html({ let mut __out = String::with_capacity(158); __out.push_str("<!doctype html>\n<html lang=\"en\">\n<head>\n<link rel=\"stylesheet\" href='/assets/campfire-08bc2f1d.css'>\n</head>\n<body><p>Fingerprinted assets</p></body>\n</html>\n"); __out }));
     response
 }
 
@@ -50,14 +62,43 @@ async fn shutdown_signal() {
     }
 }
 
+// jemalloc as the global allocator, and no transparent huge pages on Linux: written by the compiler
+#[global_allocator]
+static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
+
+// jemalloc reads its options from this exported symbol (tikv-jemallocator's `_rjem_` prefix) when it
+// starts, before main. It is a `const char *`, so a thin pointer to the first byte.
+#[cfg(target_os = "linux")]
+#[allow(unsafe_code)]
+#[unsafe(export_name = "_rjem_malloc_conf")]
+pub static JEMALLOC_CONF: Option<&'static std::ffi::c_char> =
+    // SAFETY: points at the first byte of a static, NUL-terminated string.
+    Some(unsafe { &*c"thp:never".as_ptr() });
+
+// With transparent huge pages set to `always`, every thread stack gets backed by whole 2 MB pages as
+// soon as it is touched; nothing here is big enough to gain from them, so the process opts out.
+#[allow(unsafe_code)]
+fn disable_transparent_huge_pages() {
+    #[cfg(target_os = "linux")]
+    {
+        let off: libc::c_ulong = 1;
+        // SAFETY: PR_SET_THP_DISABLE takes machine-width integer arguments and only changes this
+        // process's memory policy.
+        if unsafe { libc::prctl(libc::PR_SET_THP_DISABLE, off, 0 as libc::c_ulong, 0 as libc::c_ulong, 0 as libc::c_ulong) } != 0 {
+            eprintln!("couldn't disable transparent huge pages: {}", std::io::Error::last_os_error());
+        }
+    }
+}
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
+    disable_transparent_huge_pages();
     let router = axum::Router::new()
         .route("/api/ping", axum::routing::get(route_1))
         .route("/fingerprints", axum::routing::get(route_2))
         .route("/report.txt", axum::routing::get_service(::tower_http::services::ServeFile::new("public/report.txt")))
         .nest_service("/files", ::tower_http::services::ServeDir::new("public").append_index_html_on_directories(true))
-        .nest_service("/assets", ::tower_http::services::ServeDir::new("fingerprints").append_index_html_on_directories(true))
+        .nest_service("/assets", axum::Router::new().fallback_service(::tower_http::services::ServeDir::new("fingerprints").append_index_html_on_directories(true)).layer(::axum::middleware::from_fn(axum_dsl_static_headers_1)))
         .layer(::axum::middleware::from_fn(axum_dsl_private_cache));
     let port = match std::env::var("PORT") {
         Ok(value) => match value.parse::<u16>() {

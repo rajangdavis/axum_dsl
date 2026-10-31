@@ -9,9 +9,8 @@ struct NoteId {
     id: i64,
 }
 
-// HTML escaping for h(...) (raw(...) is the unescaped door): written by the compiler
-fn axum_dsl_html_escape(input: &str) -> std::borrow::Cow<'_, str> {
-    let mut escaped: Option<String> = None;
+// HTML escaping for a view's `{{ name }}`, written into the render's buffer: written by the compiler
+fn axum_dsl_html_escape_into(out: &mut String, input: &str) {
     let mut copied = 0;
     for (i, c) in input.char_indices() {
         let replacement = match c {
@@ -22,18 +21,11 @@ fn axum_dsl_html_escape(input: &str) -> std::borrow::Cow<'_, str> {
             '\'' => "&#39;",
             _ => continue,
         };
-        let out = escaped.get_or_insert_with(|| String::with_capacity(input.len() + 8));
         out.push_str(&input[copied..i]);
         out.push_str(replacement);
         copied = i + c.len_utf8();
     }
-    match escaped {
-        Some(mut out) => {
-            out.push_str(&input[copied..]);
-            std::borrow::Cow::Owned(out)
-        }
-        None => std::borrow::Cow::Borrowed(input),
-    }
+    out.push_str(&input[copied..]);
 }
 
 #[derive(Clone, serde::Serialize)]
@@ -57,16 +49,70 @@ fn db() -> &'static deadpool_sqlite::Pool {
     DB.get().expect("the database is opened before the server starts")
 }
 
-// Runs one statement on a pooled connection; an error names the query.
+// Writers queue here, in the process, instead of in SQLite's busy handler (which sleeps 1 to 100 ms between
+// retries): once-campfire-rust/crates/db/src/database.rs runs every write on one thread for the same reason.
+// Taken before a pooled connection, so a waiting writer holds none. DB_WRITES says, per DB_STATEMENTS entry,
+// whether the statement writes (sqlite3_stmt_readonly, so a RETURNING write counts); reads never take it.
+static DB_WRITE_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+static DB_WRITES: std::sync::OnceLock<Vec<bool>> = std::sync::OnceLock::new();
+
+// Reads run on threads of their own, not tokio's blocking pool, as in once-campfire-rust/crates/db/src/database.rs: there a read
+// that found every connection busy parked a blocking thread, while here a waiting read costs a queue entry and a reader
+// that finishes takes the next read without a hand-off. One queue, DB_READERS threads, each with its own query_only connection.
+const DB_READERS: usize = 5;
+type DbRead = Box<dyn FnOnce(&mut rusqlite::Connection) + Send>;
+struct DbReadQueue {
+    jobs: std::sync::Mutex<std::collections::VecDeque<DbRead>>,
+    ready: std::sync::Condvar,
+}
+static DB_READS: std::sync::OnceLock<DbReadQueue> = std::sync::OnceLock::new();
+
+fn db_reader(mut __c: rusqlite::Connection) {
+    let queue = DB_READS.get().expect("the read queue is set before its readers start");
+    loop {
+        let job = {
+            let mut jobs = queue.jobs.lock().unwrap_or_else(|p| p.into_inner());
+            loop {
+                if let Some(job) = jobs.pop_front() {
+                    break job;
+                }
+                jobs = queue.ready.wait(jobs).unwrap_or_else(|p| p.into_inner());
+            }
+        };
+        job(&mut __c);
+    }
+}
+
+// Runs the statement DB_STATEMENTS[index]: a read on a reader thread, a write on a pooled connection; an error names the query.
 async fn db_run<T: Send + 'static>(
+    index: usize,
     name: &'static str,
     work: impl FnOnce(&mut rusqlite::Connection) -> rusqlite::Result<T> + Send + 'static,
 ) -> Result<T, String> {
+    if let (true, Some(queue)) = (DB_WRITES.get().is_some_and(|w| !w[index]), DB_READS.get()) {
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        let job: DbRead = Box::new(move |__c| {
+            let __out = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| work(__c)));
+            let _ = tx.send(__out);
+        });
+        queue.jobs.lock().unwrap_or_else(|p| p.into_inner()).push_back(job);
+        queue.ready.notify_one();
+        return match rx.await {
+            Ok(Ok(out)) => out.map_err(|e| format!("query `{name}`: {e}")),
+            Ok(Err(_)) => Err(format!("query `{name}`: the read panicked")),
+            Err(_) => Err(format!("query `{name}`: the database reader is gone")),
+        };
+    }
+    let _write = if DB_WRITES.get().is_some_and(|w| w[index]) { Some(DB_WRITE_LOCK.lock().await) } else { None };
     let conn = db().get().await.map_err(|e| format!("query `{name}`: no database connection: {e}"))?;
-    conn.interact(work)
-        .await
-        .map_err(|e| format!("query `{name}`: {e}"))?
-        .map_err(|e| format!("query `{name}`: {e}"))
+    conn.interact(move |__c| {
+        let __out = work(__c)?;
+        db_after_write(__c);
+        Ok::<T, rusqlite::Error>(__out)
+    })
+    .await
+    .map_err(|e| format!("query `{name}`: {e}"))?
+    .map_err(|e| format!("query `{name}`: {e}"))
 }
 
 async fn db_open() -> Result<(), String> {
@@ -75,12 +121,45 @@ async fn db_open() -> Result<(), String> {
         _ => "notes.sqlite3".to_string(),
     };
     let pool = deadpool_sqlite::Config::new(path.clone())
-        .create_pool(deadpool_sqlite::Runtime::Tokio1)
+        .builder(deadpool_sqlite::Runtime::Tokio1)
+        .map_err(|e| format!("database {path}: cannot create the connection pool: {e}"))?
+        .post_create(deadpool_sqlite::Hook::async_fn(|conn, _| {
+            Box::pin(async move {
+                conn.interact(db_connection_setup)
+                    .await
+                    .map_err(|e| deadpool_sqlite::HookError::message(e.to_string()))?
+                    .map_err(deadpool_sqlite::HookError::message)
+            })
+        }))
+        .build()
         .map_err(|e| format!("database {path}: cannot create the connection pool: {e}"))?;
     let conn = pool.get().await.map_err(|e| format!("database {path}: cannot open it: {e}"))?;
     conn.interact(db_startup)
         .await
         .map_err(|e| format!("database {path}: {e}"))??;
+    let (__wake, __woken) = std::sync::mpsc::sync_channel::<()>(1);
+    let mut __checkpointer = rusqlite::Connection::open(&path).map_err(|e| format!("database {path}: cannot open the checkpointer connection: {e}"))?;
+    db_connection_setup(&mut __checkpointer).map_err(|e| format!("database {path}: {e}"))?;
+    std::thread::Builder::new()
+        .name("db-checkpointer".into())
+        .spawn(move || {
+            while __woken.recv().is_ok() {
+                let _running = DB_CHECKPOINT_RUNNING.lock().unwrap_or_else(|p| p.into_inner());
+                db_checkpoint(&__checkpointer, "PASSIVE");
+            }
+        })
+        .map_err(|e| format!("database {path}: cannot start the checkpointer: {e}"))?;
+    let _ = DB_WAKE.set(__wake);
+    let _ = DB_READS.set(DbReadQueue { jobs: Default::default(), ready: Default::default() });
+    for _ in 0..DB_READERS {
+        let mut __reader = rusqlite::Connection::open(&path).map_err(|e| format!("database {path}: cannot open a reader connection: {e}"))?;
+        db_connection_setup(&mut __reader).map_err(|e| format!("database {path}: {e}"))?;
+        __reader.pragma_update(None, "query_only", true).map_err(|e| format!("database {path}: cannot make a reader query_only: {e}"))?;
+        std::thread::Builder::new()
+            .name("db-reader".into())
+            .spawn(move || db_reader(__reader))
+            .map_err(|e| format!("database {path}: cannot start a reader: {e}"))?;
+    }
     let _ = DB.set(pool);
     Ok(())
 }
@@ -95,6 +174,65 @@ const DB_STATEMENTS: &[(&str, &str, &str, u8, &[&str])] = &[
     ("add_note", "examples/notes.axum.rb:32", DB_SQL_ADD_NOTE, 1, &[]),
     ("delete_note", "examples/notes.axum.rb:36", DB_SQL_DELETE_NOTE, 0, &[]),
 ];
+
+// Per-connection settings, run on every connection the pool opens (journal_mode=WAL is a property of
+// the database file and is set once in db_startup). The statement cache holds every declared statement,
+// at least rusqlite's default of 16, so prepare_cached never evicts one it will need again.
+fn db_connection_setup(__c: &mut rusqlite::Connection) -> Result<(), String> {
+    __c.execute_batch("PRAGMA synchronous=NORMAL; PRAGMA cache_size=2000; PRAGMA journal_size_limit=67108864;")
+        .map_err(|e| format!("database: cannot set the connection pragmas: {e}"))?;
+    __c.set_prepared_statement_cache_capacity(16);
+    __c.wal_hook(Some(db_note_wal_size));
+    Ok(())
+}
+
+// Checkpoints run off the committing request (once-campfire-rust/crates/db/src/database.rs, measured in
+// plans/perf-attribution.md): the WAL hook below replaces SQLite's auto-checkpoint and only notes the WAL size.
+const DB_AUTOCHECKPOINT_PAGES: i32 = 1000;
+const DB_WAL_LIMIT_PAGES: i32 = 10_000;
+static DB_WAL_PAGES: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(0);
+static DB_WOKEN_AT: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(0);
+static DB_WAKE: std::sync::OnceLock<std::sync::mpsc::SyncSender<()>> = std::sync::OnceLock::new();
+// Held while the checkpointer runs, so a RESTART waits for it rather than being refused.
+static DB_CHECKPOINT_RUNNING: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+// SQLite calls this only for a commit that wrote frames, so a write that changed nothing (an UPDATE whose
+// WHERE matched no row) does not move the response cache's generation.
+fn db_note_wal_size(_: &rusqlite::hooks::Wal, pages: std::os::raw::c_int) -> rusqlite::Result<()> {
+    DB_WAL_PAGES.store(pages, std::sync::atomic::Ordering::Relaxed);
+    Ok(())
+}
+
+// After a write on `__c`: wake the checkpointer per 1,000 pages the WAL grew, RESTART it past 10,000.
+fn db_after_write(__c: &rusqlite::Connection) {
+    match DB_WAL_PAGES.swap(0, std::sync::atomic::Ordering::Relaxed) {
+        0 => {}
+        pages if pages >= DB_WAL_LIMIT_PAGES => {
+            let _running = DB_CHECKPOINT_RUNNING.lock().unwrap_or_else(|p| p.into_inner());
+            db_checkpoint(__c, "RESTART");
+        }
+        pages => {
+            let woken_at = DB_WOKEN_AT.load(std::sync::atomic::Ordering::Relaxed);
+            if pages < woken_at {
+                DB_WOKEN_AT.store(0, std::sync::atomic::Ordering::Relaxed); // the WAL restarted
+            }
+            let woken_at = DB_WOKEN_AT.load(std::sync::atomic::Ordering::Relaxed);
+            // While a checkpoint is still due (the channel is full), the next write tries again.
+            if pages - woken_at >= DB_AUTOCHECKPOINT_PAGES && DB_WAKE.get().is_some_and(|w| w.try_send(()).is_ok()) {
+                DB_WOKEN_AT.store(pages, std::sync::atomic::Ordering::Relaxed);
+            }
+        }
+    }
+}
+
+// A checkpoint that could not finish is reported in the `busy` column, not as an error.
+fn db_checkpoint(__c: &rusqlite::Connection, mode: &str) {
+    match __c.query_row(&format!("PRAGMA wal_checkpoint({mode})"), [], |__r| __r.get::<_, i64>(0)) {
+        Ok(0) => {}
+        Ok(_) => eprintln!("database: WAL checkpoint {mode} could not finish"),
+        Err(e) => eprintln!("database: WAL checkpoint {mode} failed: {e}"),
+    }
+}
 
 fn db_startup(__c: &mut rusqlite::Connection) -> Result<(), String> {
     __c.execute_batch("PRAGMA journal_mode=WAL;")
@@ -124,8 +262,10 @@ fn db_startup(__c: &mut rusqlite::Connection) -> Result<(), String> {
         .map_err(|e| format!("migration {__file}: {e}"))?;
         __tx.commit().map_err(|e| format!("migration {__file}: {e}"))?;
     }
+    let mut __writes = Vec::with_capacity(DB_STATEMENTS.len());
     for &(__name, __at, __sql, __check, __fields) in DB_STATEMENTS {
         let __stmt = __c.prepare(__sql).map_err(|e| format!("{__at}: query `{__name}`: {e}"))?;
+        __writes.push(!__stmt.readonly());
         match __check {
             1 if __stmt.column_count() == 0 => {
                 return Err(format!("{__at}: query `{__name}` returns no columns, but it is declared to return a single value"));
@@ -137,6 +277,7 @@ fn db_startup(__c: &mut rusqlite::Connection) -> Result<(), String> {
             _ => {}
         }
     }
+    let _ = DB_WRITES.set(__writes);
     Ok(())
 }
 
@@ -161,7 +302,7 @@ fn query_recent_notes_on(__c: &rusqlite::Connection, limit: i64) -> rusqlite::Re
 }
 
 async fn query_recent_notes(limit: i64) -> Result<Vec<Note>, String> {
-    db_run("recent_notes", move |__c| query_recent_notes_on(__c, limit))
+    db_run(0, "recent_notes", move |__c| query_recent_notes_on(__c, limit))
     .await
 }
 
@@ -174,7 +315,7 @@ fn query_find_note_on(__c: &rusqlite::Connection, id: i64) -> rusqlite::Result<O
 }
 
 async fn query_find_note(id: i64) -> Result<Option<Note>, String> {
-    db_run("find_note", move |__c| query_find_note_on(__c, id))
+    db_run(1, "find_note", move |__c| query_find_note_on(__c, id))
     .await
 }
 
@@ -187,7 +328,7 @@ fn query_add_note_on(__c: &rusqlite::Connection, body: String) -> rusqlite::Resu
 }
 
 async fn query_add_note(body: String) -> Result<i64, String> {
-    db_run("add_note", move |__c| query_add_note_on(__c, body))
+    db_run(2, "add_note", move |__c| query_add_note_on(__c, body))
     .await
 }
 
@@ -200,7 +341,7 @@ fn query_delete_note_on(__c: &rusqlite::Connection, id: i64) -> rusqlite::Result
 }
 
 async fn query_delete_note(id: i64) -> Result<i64, String> {
-    db_run("delete_note", move |__c| query_delete_note_on(__c, id))
+    db_run(3, "delete_note", move |__c| query_delete_note_on(__c, id))
     .await
 }
 
@@ -238,7 +379,7 @@ async fn route_2() -> ::axum::response::Response {
 
 async fn route_3() -> ::axum::response::Response {
     let response = match (async || -> Result<::axum::response::Response, String> {
-        Ok(::axum::response::IntoResponse::into_response(::axum::response::Html(format!("<!doctype html>\n<html lang=\"en\">\n<head><title>Notes</title></head>\n<body>\n<ul>\n{}\n</ul>\n</body>\n</html>\n", { let mut __s = String::new(); for __it_note in &query_recent_notes(20).await? { __s.push_str(&format!("\n  <li id=\"note-{}\">{} <small>{}</small></li>\n", axum_dsl_html_escape(&__it_note.id.to_string()).into_owned(), axum_dsl_html_escape(&__it_note.body).into_owned(), axum_dsl_html_escape(&__it_note.created_at).into_owned())); } __s }))))
+        Ok(::axum::response::IntoResponse::into_response(::axum::response::Html({ let mut __out = String::with_capacity(190); __out.push_str("<!doctype html>\n<html lang=\"en\">\n<head><title>Notes</title></head>\n<body>\n<ul>\n"); for __it_note in &query_recent_notes(20).await? { __out.push_str("\n  <li id=\"note-"); let _ = ::std::fmt::Write::write_fmt(&mut __out, format_args!("{}", __it_note.id)); __out.push_str("\">"); axum_dsl_html_escape_into(&mut __out, &__it_note.body); __out.push_str(" <small>"); axum_dsl_html_escape_into(&mut __out, &__it_note.created_at); __out.push_str("</small></li>\n"); } __out.push_str("\n</ul>\n</body>\n</html>\n"); __out })))
     })().await {
         Ok(response) => response,
         Err(message) => error_response(&message),
@@ -291,8 +432,37 @@ async fn shutdown_signal() {
     }
 }
 
+// jemalloc as the global allocator, and no transparent huge pages on Linux: written by the compiler
+#[global_allocator]
+static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
+
+// jemalloc reads its options from this exported symbol (tikv-jemallocator's `_rjem_` prefix) when it
+// starts, before main. It is a `const char *`, so a thin pointer to the first byte.
+#[cfg(target_os = "linux")]
+#[allow(unsafe_code)]
+#[unsafe(export_name = "_rjem_malloc_conf")]
+pub static JEMALLOC_CONF: Option<&'static std::ffi::c_char> =
+    // SAFETY: points at the first byte of a static, NUL-terminated string.
+    Some(unsafe { &*c"thp:never".as_ptr() });
+
+// With transparent huge pages set to `always`, every thread stack gets backed by whole 2 MB pages as
+// soon as it is touched; nothing here is big enough to gain from them, so the process opts out.
+#[allow(unsafe_code)]
+fn disable_transparent_huge_pages() {
+    #[cfg(target_os = "linux")]
+    {
+        let off: libc::c_ulong = 1;
+        // SAFETY: PR_SET_THP_DISABLE takes machine-width integer arguments and only changes this
+        // process's memory policy.
+        if unsafe { libc::prctl(libc::PR_SET_THP_DISABLE, off, 0 as libc::c_ulong, 0 as libc::c_ulong, 0 as libc::c_ulong) } != 0 {
+            eprintln!("couldn't disable transparent huge pages: {}", std::io::Error::last_os_error());
+        }
+    }
+}
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
+    disable_transparent_huge_pages();
     if let Err(message) = db_open().await {
         eprintln!("{message}");
         std::process::exit(2);

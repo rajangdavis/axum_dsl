@@ -59,7 +59,7 @@ end
   extractor, which is what an HTML form POST sends: it is always written out, it belongs to
   post/put/patch only (a browser sends a form body on no other verb), and a group cannot mix `:body` and
   `:form`, because axum lets one extractor consume the body. A urlencoded body is flat key/value pairs,
-  so a form field is a scalar; a list or a nested object belongs in a JSON body. A body the `Form` extractor cannot deserialize at all (a missing field, or a value of the wrong shape) is answered by axum itself with 422, where a value that parses but breaks a constraint is the 400 the generated `check()` gives. A Rails form's bracketed key (`message[body]`) is a `name:` on the field, not a nested form object: the URL-encoded body stays flat, and the wire key is the one the extractor reads.
+  so a form field is a scalar, a list of scalars (Rails' repeated `name[]` keys, below) or an `:upload`; a map or a nested object belongs in a JSON body. A body the `Form` extractor cannot deserialize at all (a missing field, or a value of the wrong shape) is answered by axum itself with 422, where a value that parses but breaks a constraint is the 400 the generated `check()` gives. A Rails form's bracketed key (`message[body]`) is a `name:` on the field, not a nested form object: the URL-encoded body stays flat, and the wire key is the one the extractor reads. A group with an `:upload` field also reads a `multipart/form-data` body (see Uploads below).
 - **Field types** are `:string :i32 :i64 :f64 :bool`, lists (`:string_list`, `:i64_list`, `:f64_list`,
   also written `list(:string)`, `list(:i64)`, `list(:f64)`), typed maps with string keys and one value
   type (`map(:i64)`, `map(:string)`, `map(:f64)`, `map(:bool)`, `map(list(:string))`, `map(map(:i64))`),
@@ -67,12 +67,39 @@ end
   (`field :address, :Address`) and read it in the body as `address.city`; an `optional: true` object is
   read nil-safely as `address&.city`. `format:` (`:uri :email :date_time :date :uuid :hostname :ipv4
   :ipv6`) is advice to the client and is not checked by the service. A map is a Rust `BTreeMap`, so keys
-  come back sorted, and maps are read-only.
+  come back sorted, and maps are read-only. `:upload` is a file chosen in a browser form (see Uploads below):
+  `in: :form` only, always nil-able, no constraints.
+- **Uploads** (`multipart/form-data`, what a form with a file input sends even when no file is chosen). A group that
+  has an `:upload` field reads its form the way Rack does: a urlencoded body exactly as before, a multipart body as
+  its text parts (into the group's other `in: :form` fields, bracketed `name:` keys included; a repeated name keeps
+  its last value) and its file parts (into the `:upload` fields by `name:`, else by field name). A group with neither
+  an `:upload` nor a list field keeps axum's `Form` and answers a multipart body 415.
+  **Repeated keys.** A `:string_list`, `:i64_list` or `:f64_list` field `in: :form` (`field :user_ids, list(:i64),
+  in: :form, name: "user_ids[]", default: []`) collects every occurrence of its key, in order, from a urlencoded
+  or a multipart body, as Rack does for `name[]`: `user_ids[]=1&user_ids[]=2` is `[1, 2]`. A value that does not
+  parse as the element type is 422. When the key is absent the field is its `default:` (`[]` is Rails'
+  `params.fetch(:user_ids, [])`), nil when `optional: true`, else 422. A key that is not a list keeps its last
+  value when repeated, as Rack does (axum's own `Form` would refuse a repeat). A group with a list field reads
+  its urlencoded body with the same code as a multipart one (2 MiB, else 413). A file input nobody chose a file in sends a
+  part with an empty filename; Rack drops it, so the field is nil, as is a missing one. The whole body is held in
+  memory (128 MiB, else 413), at most 4096 parts and 128 files (413), and a body that is not well formed is 400.
+  In the body the field is an object with `filename`, `content_type`, `size` (bytes), `checksum` (Active Storage's:
+  the base64 MD5) and `metadata` (the blob's analyzed JSON: `{"identified":true,"width":W,"height":H,"analyzed":true}` for
+  a JPEG, PNG, GIF or WebP, read from its header without EXIF rotation; `{"identified":true,"analyzed":true}` otherwise), read like a nested object (`avatar&.filename`, or `unless avatar.nil?` on a local first), and
+  `avatar.store(root)` writes the file the way Active Storage's Disk service does: under a new 28-character lowercase
+  base36 key, at `<root>/<key[0,2]>/<key[2,2]>/<key>`, and gives the key back. The `active_storage_blobs` and
+  `active_storage_attachments` rows are the app's own `execute` statements (`key`, `filename`, `content_type`,
+  `byte_size: avatar.size`, `checksum: avatar.checksum`), in a `transaction` if they must go together; `store` is an
+  `await` that fails the request (the `error` filter, else 500) when the write fails. No width or height is read from
+  an image and no variant is made. `examples/upload.axum.rb` is a complete service; `Upload` cannot name a params group.
 - **Response helpers.** `text(s)` and `html(s)` answer a string (the first as `text/plain`, the second
   as `text/html`); `json(value)` serialises the value as JSON; `redirect("/path")` answers a 302 Found
   (`redirect(path, status: 303)` names another redirect status: 301, 302, 303, 307 or 308); its path is
   a literal of visible ASCII (0x20-0x7E, or a tab) with no leading or trailing whitespace, or a literal
-  interpolating only numbers and bools, because it becomes the `Location` header.
+  interpolating only numbers, bools or a `url_encode(...)` call, because it becomes the `Location` header. In a route, a `before`
+  or a `current` body, a path starting with `/` is written as an absolute URL, as Rails' `redirect_to`
+  does: the request's scheme and host (`request_base_url`, which trusts `X-Forwarded-Host`/`-Proto` only
+  under `use_layer :trace, forwarded: true`) in front of the path. The response has an empty body and `Content-Type: text/html; charset=utf-8`, as Rails' `redirect_to` does.
   A body may not combine `status(...)` with a helper's `status:`;
   `render :signup, locals: { ... }` answers with a view (see below and [Views](views.md)); and
   `halt(status, body)` stops with that status (or `halt(status)` with no body). They are values, so they
@@ -90,9 +117,10 @@ end
   string is a 200 text response, which is Sinatra's rule.
 - **Views.** `render :signup, locals: { name: params[:name] }` answers with a page: the `.html` file
   `views/signup.html` (`set :views` names the folder), read at compile time and compiled into the emitted
-  Rust, so the crate carries no template and no `.html` file. A view holds exactly ten markers —
+  Rust, so the crate carries no template and no `.html` file. A view holds exactly twelve markers —
   `{{ name }}` (escaped), `{{ name|raw }}` (unescaped), `{{ name|sanitize }}` (HTML text cleaned, not
-  escaped), `{{ yield }}` (the wrapped view's markup, in a layout),
+  escaped), `{{ yield }}` (the wrapped view's markup, in a layout), `{{ yield :nav }}` and
+  `{% content_for :nav %}…{% endcontent_for %}` (a layout's named region and the page's fill for it),
   `{% raw %}…{% endraw %}` (copied byte for byte) and `{{ partial :name, key: value }}` (another
   view file, read at compile time and inlined; its markers read only its arguments, and its arguments are
   literals or the caller's locals), `{% for x in xs %}…{% endfor %}` (the text once for each element of a list
@@ -111,7 +139,7 @@ end
   :authenticate do ... end` names the filter, and a route opts out with `skip: [:authenticate]`: the filter
   still layers the router, and the emitted layer compares the request's method and path with the skipping
   routes. A duplicate name, and a skip of a name no `before` declares, are refused. A skip that could also
-  match a route, a `serve_file` or the OpenAPI document is refused. `current :user, returns:
+  match a route, a `serve_file` that does not skip it or the OpenAPI document is refused. `current :user, returns:
   :User?, required: :authenticate` reads `current(:user)` at its non-nil type in routes that do not skip the
   filter, and refuses a route that skips it and still reads the current. `not_found do ... end` answers a
   request that matched no route (axum's fallback). `error do ... end` answers a route body that raised;
@@ -138,7 +166,7 @@ end
   `forwarded: true` the key is the caller's `X-Forwarded-For` entry, so trust it only behind a proxy that
   overwrites that header.
   `use_layer :private_cache` appends `Cache-Control: private, no-cache` and `Vary: Cookie` to every
-  response by default, never inserted, so a route's own `Cache-Control` is kept beside them; that is what
+  response by default, never inserted, so a route's own `Cache-Control` is kept beside them (unless it says `public`: then the route keeps its policy and gets neither header); that is what
   stops a shared cache from storing an authenticated page. Its one keyword is `except:`, an explicit list
   of literal path prefixes served by a declared `static` mount — `use_layer :private_cache, except:
   ["/assets"]` — which leave the layer off. `except:` may not name `/`, a route, or a path no mount
@@ -147,6 +175,53 @@ end
   Last-Modified/If-Modified-Since 304s. It is the compiler's own middleware with no tower-http feature,
   and it sits outside `:csrf`, `:fetch_metadata` and `:rate_limit`, so a refusal or a 429 from any of
   them carries the headers too.
+  `use_layer :rack_defaults` is what Rails' default middleware stack does to the HTML a route renders, one
+  keyword per part (at least one is needed): `security_headers: true` sets Rails 8's five default headers
+  (`X-Frame-Options: SAMEORIGIN`, `X-XSS-Protection: 0`, `X-Content-Type-Options: nosniff`,
+  `X-Permitted-Cross-Domain-Policies: none`, `Referrer-Policy: strict-origin-when-cross-origin`) on every
+  response, whatever its type, that has none of its own, except a Live one: a route that writes
+  `headers "X-Rack-Defaults" => "live"` (Rails' ActionController::Live controllers, such as an avatar's
+  `send_file`, which skip `default_headers`) gets none; the marker is removed before the response leaves.
+  `halt(204, "")` (also 205 and 304) sends no `Content-Type`, as Rails' `head :no_content` does. `version: :app_version` and
+  `revision: :git_revision` name declared settings written as `X-Version` and `X-Rev` (an empty revision writes
+  none, and both still apply to a file response); `etag: true` is Rack::ETag (a weak ETag over a 200 HTML,
+  Turbo Stream or JSON GET's body unless the route set one, 304 for a matching `If-None-Match`, and, when the route
+  set no `Cache-Control`, `max-age=0, private, must-revalidate` for a response with an ETag and `no-cache` for
+  one without; the validator is a std hash, not SHA-256, and a body over 16 MiB answers 500);
+  `vary_accept: true` adds `Vary: Accept` to a successful response whose format came from the `Accept` header
+  (an `Accept` with no `*/*` entry, as Turbo frame fetches send, or any `Accept` on an XHR; not when the URL
+  has a `format` parameter or a file extension); `preload: ["campfire.css"]` lists files of the one
+  `static ..., digest: true` mount in a `Link: <url>; rel=preload; as=style; nopush` header on a full layout
+  (a body starting `<!doctype html`; a turbo-frame fragment does not get it);
+  `refresh_cookies: ["session_token"]` writes a cookie the request carried again (twenty years, HttpOnly,
+  SameSite=Lax) when the response did not set it, and `session_cookie: "_app_session"` writes a plain HttpOnly
+  SameSite=Lax cookie on a response that does not carry it; both skip a 4xx/5xx answer and a redirect to
+  `/session/new`. `except:` leaves the layer off a declared `static` mount, as for `:private_cache`. The layer
+  is innermost, so it sees the body before `:compression` encodes it; a refusal from `:csrf`,
+  `:fetch_metadata` or `:rate_limit` does not pass through it. Declare it instead of `:private_cache` when the
+  service wants Rails' headers: the two both write `Cache-Control`.
+  `use_layer :method_override` is Rack::MethodOverride: a POST whose urlencoded body has a `_method` field, or whose
+  multipart/form-data body has a `_method` text part (the last one either way), else whose `X-HTTP-Method-Override` header is set, is routed as that method when it, upcased, is
+  GET, HEAD, PUT, POST, DELETE, OPTIONS, PATCH, LINK or UNLINK (anything else stays a POST), so a Rails-style
+  form (`method="post"` plus a hidden `_method=delete`) reaches the `delete` route. The body is read once
+  (a urlencoded body over 2 MiB, or a multipart one over 128 MiB, is a 413) and passed on unchanged, `_method`
+  included; a multipart body that does not parse is left to the route (400) and the header is read. It takes no keywords. Unlike the other
+  layers it wraps the finished router rather than being a `.layer(..)` on it, because axum's `Router::layer`
+  runs after the route is matched: it is outside every other layer, so `:csrf` and `:fetch_metadata` see the
+  rewritten method (a `DELETE` is still a write), and `:trace` logs it.
+  `use_layer :front` is what Rack::Deflater and Thruster (the proxy in front of a Rails app) do to every
+  response, as one middleware outside all the others but `:trace` (so `:rack_defaults`' ETag is over the identity
+  body). It gzips a response for a client whose `Accept-Encoding` allows gzip, whatever its size or type (not
+  1xx/204/304, `no-transform`, an already-encoded response, an event stream or an upgrade), sets
+  `Content-Encoding: gzip`, drops `Accept-Ranges`, and adds `accept-encoding` to `Vary` after the app's own
+  tokens (`accept, accept-encoding`). Thruster's cache keeps a GET/HEAD response that says `public` with a
+  `max-age` above 0 (and no `no-cache`) in memory until it expires, and answers a request with the same method,
+  path, query, host and `Vary`ing headers from it with `X-Cache: hit` (a 304 when `If-None-Match` names its
+  ETag); the first response is `X-Cache: miss`, and a request that cannot be cached (not GET/HEAD, an
+  upgrade, a `Range`, a URI over 2048 bytes) goes through with `X-Cache: bypass`. `cache_mb:` is the cache's
+  size (64; 0 turns it off); a response over 1 MB is not kept, and when the cache is full the entries nearest
+  their expiry go first. Not carried over from Thruster: zstd and the BREACH padding. A gzipped response is
+  buffered whole (up to 64 MiB). It adds the `flate2` crate.
   `:csrf` takes no keywords: it needs `cookies secret:`, and it refuses a write (anything but GET, HEAD
   and OPTIONS) whose `authenticity_token` field or `X-CSRF-Token` header does not match the signed
   `_axum_dsl_csrf` cookie, with 403; `use_layer :fetch_metadata` stays the first-line guard outside it
@@ -170,7 +245,8 @@ end
   cookies (`format: :rails` writes Rails' classic MessageVerifier value and `:rails7` the JSON/`_rails`
   value a default Rails 7/8 app reads), bodies read one with `cookie(:name)` (or
   `signed: false` for a plain one) and a route writes one with `set_cookie` / `delete_cookie`;
-  `random_token`, `request_ip`, `user_agent`; `current :user, returns: :User? do ... end`, a per-request value
+  `random_token`, `request_ip`, `request_base_url`, `request_path`, `request_method`, `user_agent`, `turbo_frame_request?`
+  (`set :trust_forwarded_for, true` makes `request_ip` read `X-Forwarded-For` without the trace layer); `current :user, returns: :User? do ... end`, a per-request value
   read with `current(:user)`; the built-in `Bcrypt.verify` / `Bcrypt.hash`; `use_layer :fetch_metadata`, which
   answers 403 to a cross-site write; `use_layer :csrf`, the signed-token check behind it (it needs
   `cookies secret:`); and `set :rust, :none`, which refuses every declaration that injects
@@ -191,6 +267,16 @@ end
   `cmd_fn`/`script_fn` run a subprocess; `file "python/x.py", as: :x` names a file bodies read with
   `file_text(:x)`; it is copied into the crate at that path and read from the working directory (or from
   `env:`), so editing the source needs a rebuild. See [Bindings](bindings.md).
+- **Response cache.** `get "/rooms/:id", cache: :private do ... end` keeps the whole response of a GET route in
+  memory until the next database commit (a read-only SQLite connection watches `PRAGMA data_version`) or 15
+  seconds, per request URI and headers, so per session. The `before` filters still run on every request and the
+  route body is skipped on a hit (its writes and `set_cookie` too); an `etag(...)` still answers 304. The size
+  is `setting :response_cache_mb, env: "...", default: 64, type: :i64` (64 MB without the setting, 0 off). With
+  `use_layer :front`, a client that accepts gzip has its entry stored already compressed at admission; a hit
+  skips the deflater, and `Accept-Encoding` is part of the key, so gzip and identity entries are separate. It
+  needs `database :sqlite`, is for `get` only, and refuses a body that calls `random_token`, `send_file`,
+  `file_text`, `request_ip`, `rust(...)` or a subprocess function. It is not `use_layer :private_cache`, which
+  only appends `Cache-Control: private, no-cache` and `Vary: Cookie` and stores nothing.
 - **Serving files.** `static "/assets", dir: "public"` mounts a directory at a path prefix; a named `before`
   filter covers it like a route, so `static "/assets", dir: "public", skip: [:authenticate]` keeps the
   directory public (GET of the prefix and its subtree): every request
@@ -198,9 +284,10 @@ end
   extension, answers a request for a directory as its `index.html`, and answers an empty 404 for a missing
   file and for a path segment holding `..` or a backslash. A mount at `/` is axum's fallback rather than a
   prefix, so it cannot take `skip:`: that skip would cover every GET path, and the compiler refuses it;
-  mount at a prefix instead. `serve_file` and `set :public_folder` take no `skip:` today.
+  mount at a prefix instead. `set :public_folder` takes no `skip:` today.
   `serve_file "/report.txt", from:
-  "public/report.txt"` answers one route with one file. `set :public_folder, "public"` is the same mount
+  "public/report.txt"` answers one route with one file; `skip: [:authenticate]` on it keeps the file public like a
+  route's does (GET and HEAD of that path). `set :public_folder, "public"` is the same mount
   at `/`, which is Sinatra's meaning for the setting; a `not_found` filter cannot go with it, because both
   claim axum's one fallback. A body-level `send_file` is refused: it would have to await a file service,
   and no response helper does. The declared path is **copied into the emitted crate** at the same relative
@@ -209,9 +296,15 @@ end
   `test/e2e_assets.sh` sets up, and what `axum_dsl build` + `axum_dsl run` produce in their `-o`
   directory). A path outside the DSL file's folder, or a symlink that leaves the declared directory, is
   refused, as is a route whose path sits under a mount prefix (axum would panic on the overlap).
-  `digest: true` copies each file under `<stem>-<twelve hex digits of its SHA-256><ext>` and serves only
-  that name, so a far-future `Cache-Control` is safe and the undigested path is a 404; a view writes the
-  URL with `{{ asset_path "campfire.css" }}` (see [Views](views.md)).
+  `digest: true` copies each file under `<stem>-<8 hex digits><ext>` and serves only that name (without
+  `Accept-Ranges`), so a far-future `Cache-Control` is safe and the undigested path is a 404. The digits are
+  Propshaft's: the first 8 of SHA-1 over the file's bytes, then the bytes of every file its CSS refers to with
+  `url(...)` or `@import url(...)` (depth first, once each), then `version:` ("1.0" by default, Rails'
+  `config.assets.version`), so `_reset.css` is `_reset-9c3efd7b.css` as in Rails; those references in the served
+  CSS become the digested URLs (`url("/assets/base-53e48027.css")`), and one that names no file of the mount
+  (`data:`, `http`, `//`, `#`) is left alone. `max_age: 2592000` adds `Cache-Control: max-age=2592000, public`
+  to the mount's successful responses that have none. A view writes the URL with
+  `{{ asset_path "campfire.css" }}` (see [Views](views.md)).
 - **An API document.** `openapi "/openapi.json"` makes the service answer `GET` at that path with an OpenAPI
   3.1 document the compiler wrote from the routes: each route is an operation (its `description:` is the
   summary), path and query fields are parameters, body and form fields are the request body, and a field's

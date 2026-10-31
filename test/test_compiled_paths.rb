@@ -123,9 +123,9 @@ class TestCompiledPaths < Minitest::Test
         render :home, locals: { markup: "<b>x</b>" }
       end
     RB
-    # `{{ keep }}` is no marker, so no local feeds it (a marker would make the render refuse); the braces
-    # are doubled because the view is a format! string.
-    assert_includes main, "{{{{ keep }}}}"
+    # `{{ keep }}` is no marker, so no local feeds it (a marker would make the render refuse); it is
+    # literal text, pushed as it is.
+    assert_includes main, "{{ keep }}"
     refute_includes main, "axum_dsl_html_escape", "the partial's only marker is |raw, so nothing is escaped"
   end
 
@@ -156,6 +156,17 @@ class TestCompiledPaths < Minitest::Test
     main = args_main('label:, hint: "none"', '{{ partial :f, label: "A" }}')
     assert_includes main, "none"
     refute_includes main, "{% args", "the declaration writes nothing"
+  end
+
+  # ERB under Erubi trim mode drops a line that holds only a `<%# %>` tag, newline included; `{% args %}` alone on
+  # its line is the same: the partial's text starts at the next line.
+  def test_an_args_line_alone_leaves_no_newline_behind
+    alone = compile(%(get "/" do\n  render :home\nend\n),
+                    views: { "views/home.html" => %({{ partial :f, label: "A" }}\n), "views/f.html" => "{% args label: %}\n<b>{{ label }}</b>\n" })
+    refute_includes alone, %(\\n<b>), "the declaration line's newline is not emitted"
+    shared = compile(%(get "/" do\n  render :home\nend\n),
+                     views: { "views/home.html" => %({{ partial :f, label: "A" }}\n), "views/f.html" => "{% args label: %} \n<b>{{ label }}</b>\n" })
+    assert_includes shared, %(\\n<b>), "a declaration sharing its line with text keeps the newline after the text"
   end
 
   def test_a_passed_args_value_overrides_the_default
@@ -486,24 +497,24 @@ class TestCompiledPaths < Minitest::Test
   def test_a_loop_over_records
     main = notes_main("<ul>{% for note in notes %}<li id=\"note-{{ note.id }}\">{{ note.body }}{{ note.body|raw }}</li>{% endfor %}</ul>\n")
     assert_includes main, "for __it_note in &"
-    assert_includes main, "axum_dsl_html_escape(&__it_note.id.to_string()).into_owned()", "an integer field is formatted, then escaped"
-    assert_includes main, "axum_dsl_html_escape(&__it_note.body).into_owned()", "a string field is escaped as the plain markers do"
-    assert_includes main, "__it_note.body.to_string()", "|raw writes the field as it is"
-    assert_includes main, "note-{}"
+    assert_includes main, "format_args!(\"{}\", __it_note.id)", "an integer field is written with its Display, which has nothing to escape"
+    assert_includes main, "axum_dsl_html_escape_into(&mut __out, &__it_note.body)", "a string field is escaped as the plain markers do"
+    assert_includes main, "__out.push_str(&__it_note.body)", "|raw writes the field as it is"
+    assert_includes main, "<li id=\\\"note-"
   end
 
   def test_a_loop_over_scalar_lists
     main = lists_main("{% for n in names %}<i>{{ n }}</i>{{ n|raw }}{% endfor %}{% for m in ns %}{{ m }},{% endfor %}\n")
-    assert_includes main, "axum_dsl_html_escape(__it_n.as_str()).into_owned()"
-    assert_includes main, "__it_n.as_str().to_string()"
-    assert_includes main, "axum_dsl_html_escape(&__it_m.to_string()).into_owned()"
+    assert_includes main, "axum_dsl_html_escape_into(&mut __out, __it_n.as_str())"
+    assert_includes main, "__out.push_str(__it_n.as_str())"
+    assert_includes main, "format_args!(\"{}\", __it_m)"
   end
 
   def test_nested_loops
     main = lists_main("{% for n in names %}{% for m in ns %}{{ n }}{{ m }}{% endfor %}{% endfor %}\n")
     assert_includes main, "for __it_n in &"
     assert_includes main, "for __it_m in &"
-    assert_equal 2, main.scan("let mut __s = String::new();").size, "one accumulator per loop"
+    assert_equal 1, main.scan("String::with_capacity(").size, "nested loops write into the render's one buffer"
   end
 
   def test_a_loop_over_a_field_of_the_enclosing_loop_variable
@@ -572,7 +583,7 @@ class TestCompiledPaths < Minitest::Test
       end
     RB
     assert_includes main, "if show {"
-    assert_includes main, "axum_dsl_html_escape("
+    assert_includes main, "if show { __out.push_str(\"y\"); } else { __out.push_str(\"n\"); }", "literal locals are escaped by the compiler"
   end
 
   # A nil-able condition is true when it is not nil, and the taken branch reads the value: the emitted guard
@@ -586,7 +597,7 @@ class TestCompiledPaths < Minitest::Test
       end
     RB
     assert_includes main, "if let Some(__if_first) = first.as_deref() {"
-    assert_includes main, "axum_dsl_html_escape(__if_first).into_owned()"
+    assert_includes main, "axum_dsl_html_escape_into(&mut __out, __if_first)"
     refute_match(/\bfirst\.(unwrap|expect)\(/, main)
   end
 
@@ -598,7 +609,7 @@ class TestCompiledPaths < Minitest::Test
     assert_includes main, "if show {"
     assert_includes main, "if again {"
     assert_includes main, "for __it_n in &"
-    assert_equal 3, main.scan("let mut __s = String::new();").size, "one accumulator per if and loop"
+    assert_equal 1, main.scan("String::with_capacity(").size, "ifs and loops write into the render's one buffer"
   end
 
   # `{% if %}` inside a loop takes a bool field and a nil-able field, and the nil-able field narrows inside
@@ -623,7 +634,23 @@ class TestCompiledPaths < Minitest::Test
     RB
     assert_includes main, "if __it_t.done {"
     assert_includes main, "if let Some(__if_t_note) = __it_t.note.as_deref() {"
-    assert_includes main, "axum_dsl_html_escape(__if_t_note).into_owned()"
+    assert_includes main, "axum_dsl_html_escape_into(&mut __out, __if_t_note)"
+  end
+
+  # A comparison passed as a local is the whole `if` condition, so it takes no parentheses of its own: rustc's
+  # unused_parens would fail the crate. The local is inlined as `(flags == 1)`, and only the outer pair goes.
+  def test_a_comparison_local_is_an_if_condition_without_parens
+    main = compile(<<~RB, views: { "views/home.html" => "{% if big %}<b>big</b>{% endif %}\n" })
+      params :Size do
+        field :n, :i64, in: :query
+      end
+
+      get "/", params: :Size do
+        render :home, locals: { big: params[:n] == 1 }
+      end
+    RB
+    assert_match(/\bif n == 1 \{/, main, "the comparison is the condition")
+    refute_match(/\bif \(/, main, "and carries no parentheses")
   end
 
   # `|sanitize`: a string local goes to the compiler's sanitiser with no escaper around it, and the crate gains
@@ -640,8 +667,8 @@ class TestCompiledPaths < Minitest::Test
       end
     RB
     main = files["src/main.rs"]
-    assert_includes main, "axum_dsl_sanitize(&body)"
-    assert_includes main, "fn axum_dsl_sanitize(html: &str) -> String", "the helper is emitted only for this use"
+    assert_includes main, "axum_dsl_sanitize_into(&mut __out, &body)"
+    assert_includes main, "fn axum_dsl_sanitize_into(buf: &mut String, html: &str)", "the helper is emitted only for this use"
     assert_includes main, "add_generic_attributes(&[\"class\"])", "Action Text/Trix classes survive"
     refute_includes main, "axum_dsl_html_escape", "sanitize does not escape: no escaper around the value"
     assert_includes files["Cargo.toml"], "ammonia = \"4\""
@@ -661,8 +688,8 @@ class TestCompiledPaths < Minitest::Test
       end
     RB
     main = files["src/main.rs"]
-    assert_includes main, "axum_dsl_html_escape(&body).into_owned()"
-    assert_includes main, "body.to_string()", "|raw writes the value as it is"
+    assert_includes main, "axum_dsl_html_escape_into(&mut __out, &body)"
+    assert_includes main, "__out.push_str(&body)", "|raw writes the value as it is"
     refute_includes main, "axum_dsl_sanitize"
     refute_includes main, "fn axum_dsl_sanitize"
     refute_includes files["Cargo.toml"], "ammonia"
@@ -673,8 +700,8 @@ class TestCompiledPaths < Minitest::Test
     main = notes_main("{% for note in notes %}{{ partial :cell, v: note.body }}{{ partial :cell, v: note.id }}{% endfor %}\n", views: views)
     assert_includes main, "&__it_note.body"
     main = lists_main("{% for n in names %}{{ partial :cell, v: n }}{% endfor %}{% for m in ns %}{{ partial :cell, v: m }}{% endfor %}\n", views: views)
-    assert_includes main, "axum_dsl_html_escape(__it_n.as_str())"
-    assert_includes main, "axum_dsl_html_escape(&__it_m.to_string())"
+    assert_includes main, "axum_dsl_html_escape_into(&mut __out, __it_n.as_str())"
+    assert_includes main, "format_args!(\"{}\", __it_m)"
   end
 
   def test_loop_refusals_in_the_view
@@ -762,6 +789,30 @@ class TestCompiledPaths < Minitest::Test
       refute_includes main, dir, "the build machine's absolute path is not baked into main.rs"
       refute_includes main, File.realpath(dir)
       assert_equal bytes, files["hatches/motd.txt"].b, "the copy is byte for byte"
+    end
+  end
+
+  # `binary: true`: a file that is not UTF-8 (an image) is copied byte for byte and checked at startup as bytes;
+  # it is sent by file_path, and file_text on it is refused.
+  def test_a_binary_file_is_copied_and_never_read_as_text
+    Dir.mktmpdir("paths") do |dir|
+      bytes = "\x89PNG\r\n\x1A\n\xFF\xFE".b
+      FileUtils.mkdir_p(File.join(dir, "public"))
+      File.binwrite(File.join(dir, "public", "icon.png"), bytes)
+      src = File.join(dir, "paths.axum.rb")
+      File.write(src, HEAD + <<~'RB')
+        file "public/icon.png", as: :icon, binary: true
+
+        get "/icon" do
+          send_file(file_path(:icon), content_type: "image/png")
+        end
+      RB
+      files = AxumDsl::Emit.files(AxumDsl.read(src), src)
+      assert_equal bytes, files["public/icon.png"].b, "the copy is byte for byte"
+      assert_includes files["src/main.rs"], "let _text = std::fs::read(&path)", "the startup check reads bytes"
+      File.write(src, HEAD + %(file "public/icon.png", as: :icon, binary: true\n\nget "/icon" do\n  text(file_text(:icon))\nend\n))
+      error = assert_raises(AxumDsl::CompileError) { AxumDsl.read(src) }
+      assert_includes error.message, "is a `binary: true` file"
     end
   end
 
@@ -881,8 +932,8 @@ class TestCompiledPaths < Minitest::Test
     RB
     assert_includes main, "fn before_1_skip(method: &::axum::http::Method, path: &str) -> bool {"
     assert_includes main,
-                    %q{(*method == ::axum::http::Method::GET && axum_dsl_skip_match("/session/new", path))}
-    assert_includes main, %q{axum_dsl_skip_match("/rooms/{id}", path))}, "a capture keeps the axum path shape"
+                    %q{*method == ::axum::http::Method::GET && axum_dsl_skip_match("/session/new", path)}
+    assert_includes main, %q{axum_dsl_skip_match("/rooms/{id}", path)}, "a capture keeps the axum path shape"
     assert_includes main, "if before_1_skip(request.method(), request.uri().path()) {"
     assert_includes main, "        return next.run(request).await;"
     refute_includes main, "before_2_skip", "an anonymous filter has no skip list"
@@ -890,6 +941,54 @@ class TestCompiledPaths < Minitest::Test
     assert_includes main, ".layer(axum::middleware::from_fn(before_2))", "a named filter is still a router layer"
     assert_includes main, "fn axum_dsl_skip_match(pattern: &str, path: &str) -> bool {"
     assert_includes main, %q(if segment.starts_with("{*")), "the matcher understands an axum wildcard"
+  end
+
+  # A filter whose skip list is one entry emits a bare condition as the function's body. It used to be
+  # parenthesized, and `(cond)` as an expression body is rustc's `unused_parens`, which every generated crate
+  # denies (`RUSTFLAGS=-Dwarnings`), so a filter whose only skip was the implicit /cable entry did not compile.
+  # No earlier test had exactly one entry: two routes join with `||`, and a serve_file contributes GET and HEAD.
+  def test_a_single_skip_condition_is_not_parenthesized
+    main = compile(<<~RB)
+      before :authenticate do
+        "continue"
+      end
+
+      get "/one", skip: [:authenticate] do
+        text("one")
+      end
+    RB
+    assert_includes main,
+                    "-> bool {\n    *method == ::axum::http::Method::GET && axum_dsl_skip_match(\"/one\", path)\n",
+                    "one entry is the function's whole body, unparenthesized"
+    refute_includes main, "-> bool {\n    (", "a parenthesized body is unused_parens, denied by -D warnings"
+  end
+
+  # A segment with a literal prefix and a capture (`@:message_id`) is an axum route as written, and the skip
+  # matcher reads its prefix: it used to compare `@{message_id}` with the concrete part as a literal, which never
+  # matched, so a cached route of that shape found no ticket and answered 500.
+  def test_a_prefixed_capture_segment_keeps_its_route_and_is_matched_by_prefix
+    main = compile(<<~RB)
+      setting :secret_key, env: "SECRET_KEY_BASE"
+      cookies secret: :secret_key
+
+      params :At do
+        field :id, :i64, in: :path
+        field :message_id, :i64, in: :path
+      end
+
+      before :authenticate do
+        return redirect("/login") if cookie(:who).nil?
+        "continue"
+      end
+
+      get "/rooms/:id/@:message_id", params: :At, skip: [:authenticate] do
+        text("at")
+      end
+    RB
+    assert_includes main, %q{.route("/rooms/{id}/@{message_id}"}
+    assert_includes main, %q{axum_dsl_skip_match("/rooms/{id}/@{message_id}", path)}
+    assert_includes main, "if let (Some(open), Some(close)) = (segment.find('{'), segment.rfind('}')) {"
+    assert_includes main, "!part.starts_with(prefix) || !part.ends_with(suffix)"
   end
 
   # The required form: after the named filter, the current reads at its non-nil type with no `nil?`/`||` in
@@ -1000,8 +1099,8 @@ class TestCompiledPaths < Minitest::Test
       end
     RB
     main = files["src/main.rs"]
-    assert_includes main, %q{(*method == ::axum::http::Method::GET && axum_dsl_skip_match("/assets", path))}
-    assert_includes main, %q{(*method == ::axum::http::Method::GET && axum_dsl_skip_match("/assets/{*path}", path))}
+    assert_includes main, %q{*method == ::axum::http::Method::GET && axum_dsl_skip_match("/assets", path)}
+    assert_includes main, %q{*method == ::axum::http::Method::GET && axum_dsl_skip_match("/assets/{*path}", path)}
     assert_includes main, "if before_1_skip(request.method(), request.uri().path()) {"
     assert_includes main, %q{.nest_service("/assets", ::tower_http::services::ServeDir::new("public")},
                     "the mount is still emitted"

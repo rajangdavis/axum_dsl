@@ -1,0 +1,61 @@
+# cargo-deny policy for the vetted dependency set (lib/axum_dsl/vetted/Cargo.lock). Run: make deny
+#
+# License policy. The owner, 2026-11-12: "I don't have licenses that I knowingly don't accept, I guess any
+# that opens me to liability or requires that I pay after X amount of money."
+# And, the same day: "(GPL, LGPL, AGPL) -> totally cool, everything I am releasing is AGPL", and for MPL-2.0:
+# "can I do a warning ... I will try to avoid".
+# The list below is an engineering default drawn from those sentences, not legal advice: permissive licenses
+# and the copyleft licenses that can be combined into an AGPL-3.0 release. GPL-2.0-only and LGPL-2.0-only are
+# left out on purpose: "version 2 only" code cannot be relicensed into a version 3 work, so a human should look.
+# Source-available or usage/revenue-limited licenses (BUSL-1.1, SSPL-1.0, Elastic-2.0, Commons-Clause,
+# PolyForm-*, FSL-*) and unlicensed or unknown crates are not listed, so cargo-deny rejects them and a human
+# decides.
+# MPL-2.0 is allowed here because cargo-deny has no per-license warning level: a license is allowed or it is an
+# error. The warning comes from make deny (bin/vet_lock --deny), which names every MPL-2.0 crate in the set.
+# To accept one crate under a license that is not listed, do not widen the list; add
+#   [[licenses.exceptions]]
+#   crate = "name"
+#   allow = ["LICENSE-ID"]
+
+[advisories]
+version = 2
+yanked = "warn"
+
+[licenses]
+version = 2
+confidence-threshold = 0.9
+allow = [
+    "MIT",
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "ISC",
+    "Zlib",
+    "0BSD",
+    "CC0-1.0",
+    "BSL-1.0",
+    "Unicode-3.0",
+    "Unicode-DFS-2016",
+    "MIT-0",
+    "Unlicense",
+    "AGPL-3.0-only",
+    "AGPL-3.0-or-later",
+    "GPL-3.0-only",
+    "GPL-3.0-or-later",
+    "GPL-2.0-or-later",
+    "LGPL-3.0-only",
+    "LGPL-3.0-or-later",
+    "LGPL-2.1-only",
+    "LGPL-2.1-or-later",
+    "MPL-2.0",  # allowed but warned about by make deny: modified MPL files must be published under MPL-2.0
+    # "OpenSSL",  # only if the tree needs it
+]
+
+[bans]
+multiple-versions = "warn"
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]

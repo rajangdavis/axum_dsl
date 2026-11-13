@@ -9,6 +9,7 @@ source "https://rubygems.org"
 # Prism's node classes change between versions, so Gemfile.lock is committed: it is the exact pin.
 gem "prism", "~> 1.9"
 gem "sorbet-runtime"
+gem "r2r-laws", path: "../r2r-laws"
 
 group :development, :test do
   gem "minitest"

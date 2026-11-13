@@ -182,7 +182,7 @@ async fn route_3(axum::extract::Form(__form): axum::extract::Form<MessageForm>) 
 async fn route_4(__headers: ::axum::http::HeaderMap) -> ::axum::response::Response {
     let response = { let __etag = "\"validator-v1\"".to_string();
     let mut __stated = ::axum::response::IntoResponse::into_response("fresh".to_string());
-    if let Ok(__etag_value) = ::axum::http::HeaderValue::from_str(&__etag) {
+    if let (false, Ok(__etag_value)) = (__etag.is_empty(), ::axum::http::HeaderValue::from_str(&__etag)) {
         let __not_modified = __headers
             .get(::axum::http::header::IF_NONE_MATCH)
             .and_then(|value| value.to_str().ok())

@@ -150,7 +150,7 @@ class TestSanitizer < Minitest::Test
     assert_includes main, "fn axum_dsl_sanitize_message_body_into(buf: &mut String, html: &str, host: &str)"
     assert_includes main, "if axum_dsl_is_sound_message_body("
     assert_includes main, "axum_dsl_sanitize_message_body_into(&mut __out, "
-    assert_includes files["Cargo.toml"], 'scraper = "0.20"'
+    assert_includes files["Cargo.toml"], 'scraper = { version = "0.20", features = ["deterministic"] }'
   end
 
   def test_a_sanitizer_without_attachments_or_sounds_emits_neither_runtime

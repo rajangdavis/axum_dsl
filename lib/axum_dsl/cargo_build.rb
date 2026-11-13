@@ -13,11 +13,25 @@ module AxumDsl
 
     module_function
 
+    # The cargo command for `sub`. A release build is the one that gets deployed, so it goes through cargo
+    # auditable: the binary carries its dependency list and `cargo audit bin` can check it later, away from this
+    # source.
+    def cargo(sub, release: false)
+      return ["cargo", sub] unless release
+      unless IO.popen(%w[cargo --list], &:read).match?(/^\s+auditable\b/)
+        raise CompileError, "axum_dsl: --release builds with cargo auditable; install it: cargo install cargo-auditable --locked"
+      end
+
+      ["cargo", "auditable", sub]
+    end
+
     # Returns true when cargo succeeds. Diagnostics go to `io`; cargo's own progress lines
-    # (Compiling, Finished) are cargo's stderr and pass through untouched.
-    def run(out, release: false, io: $stderr)
+    # (Compiling, Finished) are cargo's stderr and pass through untouched. `locked` (the default) passes
+    # --locked, so the build uses exactly the Cargo.lock the crate was pinned to; false is for a crate with
+    # its own rust_crate, which is not pinned.
+    def run(out, release: false, locked: true, io: $stderr)
       map = load_map(out)
-      argv = ["cargo", "build", "--message-format=json", *("--release" if release)]
+      argv = [*cargo("build", release: release), "--message-format=json", *("--locked" if locked), *("--release" if release)]
       io.puts "axum_dsl: #{argv.join(' ')} (in #{out})"
       status = nil
       Open3.popen2(*argv, chdir: out) do |_stdin, stdout, wait|

@@ -713,6 +713,35 @@ module AxumDsl
        ""]
     end
 
+    # The flash runtime (docs/sessions.md, "Flash"): the Flash a body reads, and the split of the flash cookie's value
+    # into its bare token and the declared message whose `.<key>` it ends in. Emitted when a body used the flash.
+    def flash_lines(flash)
+      messages = flash["messages"].map do |m|
+        "        (#{AxumDsl.rstr(".#{m['key']}")}, #{AxumDsl.rstr(m['key'])}, #{AxumDsl.rstr(m['text'])}, #{m['alert']}),"
+      end
+      ["// flash (flash cookie: #{flash['cookie'].inspect}): Rails' flash as a `.<key>` suffix on the cookie's value",
+       "#[derive(Clone, Debug, Default)]",
+       "#[allow(dead_code)] // a body reads the fields it needs",
+       "struct AxumDslFlash {",
+       "    on: bool,",
+       "    alert: bool,",
+       "    key: String,",
+       "    text: String,",
+       "}",
+       "",
+       "fn axum_dsl_flash_split(value: &str) -> (String, AxumDslFlash) {",
+       "    const MESSAGES: &[(&str, &str, &str, bool)] = &[",
+       *messages,
+       "    ];",
+       "    for &(suffix, key, text, alert) in MESSAGES {",
+       "        if let Some(bare) = value.strip_suffix(suffix) {",
+       "            return (bare.to_string(), AxumDslFlash { on: true, alert, key: key.to_string(), text: text.to_string() });",
+       "        }",
+       "    }",
+       "    (value.to_string(), AxumDslFlash::default())",
+       "}"]
+    end
+
     # The Rust of the cookie runtime: each signed format's sign and verify, then what is common to every
     # format (the Cookie header, the Set-Cookie lines, and putting them on a response). Each function is
     # emitted only when a body uses it, so the crate has no dead code.

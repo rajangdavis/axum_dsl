@@ -53,12 +53,56 @@ module AxumDsl
       }
     RS
 
+    # rate_limited?: Rails' rate_limit (ActionController::RateLimiting) on a memory cache: `increment(key, 1,
+    # expires_in: within)` keeps the first request's expiry, and past `to` the callback rejects.
+    RATE_LIMITED = <<~'RS'
+      static AXUM_DSL_RATE_LIMITED: ::std::sync::OnceLock<::std::sync::Mutex<::std::collections::HashMap<(String, String), (u64, u64)>>> =
+          ::std::sync::OnceLock::new();
+
+      fn axum_dsl_rate_limited(name: &str, client: String, to: u64, within: u64) -> bool {
+          let now = ::std::time::SystemTime::now()
+              .duration_since(::std::time::UNIX_EPOCH)
+              .map(|elapsed| elapsed.as_secs())
+              .unwrap_or(0);
+          let cells = AXUM_DSL_RATE_LIMITED.get_or_init(|| ::std::sync::Mutex::new(::std::collections::HashMap::new()));
+          let mut counts = match cells.lock() {
+              Ok(guard) => guard,
+              Err(poisoned) => poisoned.into_inner(),
+          };
+          counts.retain(|_, entry| entry.0 > now);
+          let entry = counts.entry((name.to_owned(), client)).or_insert((now.saturating_add(within), 0));
+          entry.1 = entry.1.saturating_add(1);
+          entry.1 > to
+      }
+    RS
+
+    REQUEST_REFERRER = <<~'RS'
+      fn axum_dsl_request_referrer(headers: &::axum::http::HeaderMap) -> String {
+          headers
+              .get(::axum::http::header::REFERER)
+              .and_then(|value| value.to_str().ok())
+              .unwrap_or_default()
+              .to_string()
+      }
+    RS
+
     TURBO_FRAME_REQUEST = <<~'RS'
       fn axum_dsl_turbo_frame_request(headers: &::axum::http::HeaderMap) -> bool {
           headers
               .get("turbo-frame")
               .and_then(|value| value.to_str().ok())
               .map_or(false, |value| !value.trim().is_empty())
+      }
+    RS
+
+    TURBO_STREAM_REQUEST = <<~'RS'
+      fn axum_dsl_turbo_stream_request(headers: &::axum::http::HeaderMap) -> bool {
+          headers
+              .get_all(::axum::http::header::ACCEPT)
+              .iter()
+              .filter_map(|value| value.to_str().ok())
+              .flat_map(|value| value.split(','))
+              .any(|entry| entry.split(';').next().map_or(false, |media| media.trim().eq_ignore_ascii_case("text/vnd.turbo-stream.html")))
       }
     RS
 
@@ -214,7 +258,10 @@ module AxumDsl
       add.call(request_ip_forwarded?(ir) ? REQUEST_IP_FORWARDED : REQUEST_IP_PEER) if builtin?(ir, "request_ip")
       add.call(forwarded?(ir) ? REQUEST_BASE_URL_FORWARDED : REQUEST_BASE_URL_PLAIN) if builtin?(ir, "request_base_url")
       add.call(USER_AGENT) if builtin?(ir, "user_agent")
+      add.call(REQUEST_REFERRER) if builtin?(ir, "request_referrer")
+      add.call(RATE_LIMITED) if builtin?(ir, "rate_limited?")
       add.call(TURBO_FRAME_REQUEST) if builtin?(ir, "turbo_frame_request?")
+      add.call(TURBO_STREAM_REQUEST) if builtin?(ir, "turbo_stream_request?")
       add.call(BCRYPT_VERIFY) if builtin?(ir, "bcrypt_verify")
       add.call(BCRYPT_HASH) if builtin?(ir, "bcrypt_hash")
       add.call(FETCH_METADATA) if ir["layers"].to_a.any? { |l| l["name"] == "fetch_metadata" }
@@ -226,7 +273,7 @@ module AxumDsl
     def current_rust(c)
       case c["shape"]
       when "list" then "Vec<#{c['record']}>"
-      when "one" then "Option<#{c['record']}>"
+      when "one" then c["missing"] ? c["record"] : "Option<#{c['record']}>"
       else c["nilable"] ? "Option<#{SCALAR_RUST.fetch(c['type'])}>" : SCALAR_RUST.fetch(c["type"])
       end
     end
@@ -249,13 +296,21 @@ module AxumDsl
        ""]
     end
 
+    # The last line of a current's function. A `missing:` current holds the row; a body that yields nothing fails the
+    # request as `raise "message"` does (`return Err(message.to_string())`), and the cell stays empty (no failure is cached).
+    def current_result(c, body)
+      return ["    Ok(#{body['expr']})"] unless c["missing"]
+
+      ["    match #{body['expr']} {", "        Some(__row) => Ok(__row),", "        None => Err(#{AxumDsl.rstr(c['missing'])}.to_string()),", "    }"]
+    end
+
     # One current's function: its block, run by the first read. `?` and `return` leave it with the error the
     # reading body then fails with.
     def current_fn(c)
       body = c["body"]
       ["async fn axum_dsl_current_#{c['name']}(__headers: &::axum::http::HeaderMap, __peer: Option<::std::net::SocketAddr>, __currents: &AxumDslCurrents) -> Result<#{current_rust(c)}, String> {",
        *body["locals"].map { |l| "    #{l}" },
-       "    Ok(#{body['expr']})",
+       *current_result(c, body),
        "}"]
     end
   end

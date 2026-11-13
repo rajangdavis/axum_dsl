@@ -1,0 +1,19 @@
+# expect: `group_concat` is an aggregate over the whole relation, so it is only the value of a `pick`
+server "refuse", version: "0.1.0"
+set :port, 8080
+
+database :sqlite, path: "x.db"
+
+table :rooms do
+  field :id, :i64
+  field :name, :string, optional: true
+  field :kind, :string
+end
+
+model :Room, table: :rooms do
+  query :q, args: {}, returns: :string do select(ids: group_concat(:kind)) end
+end
+
+get "/x" do
+  text("x")
+end

@@ -6,7 +6,7 @@ module AxumDsl
     SCALARS = { string: "String", str: "String", i32: "Integer (i32)", i64: "Integer (i64)", f64: "Float",
                 bool: "T::Boolean", strs: "T::Array[String]", i64s: "T::Array[Integer (i64)]", f64s: "T::Array[Float]",
                 regex: "Regexp", never: "T.noreturn", int: "Integer", block: "ContentBlock",
-                blocks: "T::Array[ContentBlock]", rcontent: "ResourceContents", rcontents: "T::Array[ResourceContents]",
+                blocks: "T::Array[ContentBlock]", rcontent: "ResourceContents", rcontents: "T::Array[ResourceContents]", time: "Time",
                 elicit_result: "Elicitation result", roots_result: "T::Array[Root]", ojson: "T.nilable(JSON value)", secret: "Secret", r_str: "Rust::Str" }.freeze
 
     # An internal type symbol ("struct:Name" for an object, :ostr ... for a nil-able) -> its display string.

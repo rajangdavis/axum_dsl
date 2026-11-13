@@ -53,7 +53,9 @@ class TestSignedIdRoundtrip < Minitest::Test
   def run_rust
     skip "no cargo" unless system("cargo --version", out: File::NULL, err: File::NULL)
 
-    ir = { "builtins" => AxumDsl::SignedId::BUILTINS }
+    # active_storage_disk_upload is a request handler (axum's HeaderMap, tokio's file writes), not a signing primitive:
+    # the bare crate here has neither, and Campfire's crate builds and exercises it.
+    ir = { "builtins" => AxumDsl::SignedId::BUILTINS - [AxumDsl::SignedId::DISK_UPLOAD] }
     Dir.mktmpdir("signed_id_rt") do |dir|
       Dir.mkdir(File.join(dir, "src"))
       File.write(File.join(dir, "Cargo.toml"), <<~TOML)
@@ -68,7 +70,8 @@ class TestSignedIdRoundtrip < Minitest::Test
       main = MAIN.gsub("%FUTURE%", self.class.token("2099-01-01T00:00:00.000Z").inspect)
                  .gsub("%PAST%", self.class.token("2000-01-01T00:00:00.000Z").inspect)
       File.write(File.join(dir, "src/main.rs"), "#![allow(dead_code)]\n#{AxumDsl::SignedId.items(ir).join("\n")}\n#{main}")
-      out, err, status = Open3.capture3("cargo", "run", "--quiet", chdir: dir)
+      AxumDsl::Lockfile.pin(dir, AxumDsl::Emit::VETTED_LOCK) # the same crates the emitter names, from the vetted set
+      out, err, status = Open3.capture3("cargo", "run", "--quiet", "--locked", chdir: dir)
       assert status.success?, err
       out.lines.map(&:chomp)
     end

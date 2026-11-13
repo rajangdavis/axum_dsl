@@ -427,7 +427,7 @@ module AxumDsl
 
     def dsl_md
       types = TYPES.map { |k, v| "- `:#{k}` is Rust `#{v}`" }
-      calls = SIG.flat_map { |name, sig| call_lines(name, sig) }
+      calls = AxumDsl.each_sig.flat_map { |name, sig| call_lines(name, sig) }
       [DSL_INTRO, "## Types", "", *types, "", "## Declarations", "", *calls,
        "## Examples", "", "A string route:", "", fence(TEXT), "",
        "A route backed by a subprocess, with no Rust:", "", fence(CMD), ""].join("\n")
@@ -461,7 +461,7 @@ module AxumDsl
         "`#{n}` (#{kind(sig[:pos][i])}#{mark})"
       end
       kws = sig[:kw].map { |n, (k, req)| "`#{n}:` (#{kind(k)}, #{req ? 'required' : 'optional'})" }
-      block = { nil => "no block", decls: "a block of DSL declarations", body: "a block of restricted Ruby" }.fetch(sig[:block])
+      block = Docs.block(name) || { nil => "no block", decls: "a block of DSL declarations", body: "a block of restricted Ruby" }.fetch(sig[:block])
       about = Docs.call(name)
       kw_docs = sig[:kw].keys.filter_map { |kw| (text = Docs.keyword(name, kw)) && "  - `#{kw}:` #{text}" }
       ["### `#{name}`", "", *(about ? [about, ""] : []),
@@ -483,7 +483,12 @@ module AxumDsl
       when :num then "number literal"
       when :uint then "non-negative integer literal"
       when :snake then "snake_case symbol"
+      when :column then "snake_case symbol, a Rust keyword allowed (a table column's name)"
       when :camel then "CamelCase symbol"
+      when :camel_or_actions then "CamelCase symbol for every action, or a hash by action, such as { edit: :BotPath, update: :BotUpdate }"
+      when :str_or_actions then "string for every action, or a hash by action, such as { index: \"Chat bots\", new: \"New chat bot\" }"
+      when :model_name then "model name, a symbol such as :Room or a string such as \"Account::Bot\""
+      when :lambda then "lambda, such as `-> { where(...) }` or `->(arg) { where(...) }`"
       when :htypes then "array of helper type symbols, such as [:string, :i64?]"
       when :types then "array of type symbols"
       when :helper_kw then "hash of `name: [type, required]` keyword parameters"
@@ -493,6 +498,7 @@ module AxumDsl
       when :file_checks then "array of check names: #{FILE_CHECKS.map(&:inspect).join(', ')}"
       when :sqlargs then "hash of the query's arguments, such as `{ limit: :i64 }`; each a scalar type"
       when :qreturns then "`list(:Record)`, `:Record?` or a scalar type (`?` for nil-able)"
+      when :creturns then "`list(:Record)`, `:Record?`, `:Record` with `missing:` or a scalar type (`?` for nil-able)"
       when Array then "one of #{kind.map(&:inspect).join(', ')}"
       else kind.to_s
       end

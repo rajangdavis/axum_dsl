@@ -128,7 +128,7 @@ class TestRackDefaults < Minitest::Test
         text("ok")
       end
     RB
-    assert_includes main, "if !engine && !written(headers, \"token\") {"
+    assert_includes main, "if !engine && !unauthenticated && !written(headers, \"token\") {"
     assert_includes main, "if !written(headers, \"_app_session\") && !(engine && !write_session && carried(\"_app_session\").map_or(false, |v| !v.is_empty())) {"
     refute_includes main, "&& !engine && !(status.is_redirection()"
   end
@@ -155,7 +155,7 @@ class TestRackDefaults < Minitest::Test
     assert_includes main, "200 | 201 | 401"
     assert_includes main, "matches!(parts.status.as_u16(), 200 | 201)"
     assert_includes main, "|| status == StatusCode::UNAUTHORIZED) && !named_format"
-    assert_includes main, "(status.as_u16() < 400 || status == StatusCode::UNAUTHORIZED)"
+    assert_includes main, "(status.as_u16() < 400 || status == StatusCode::UNAUTHORIZED || from_action)"
   end
 
   def test_the_public_exceptions_page_leaves_the_layer

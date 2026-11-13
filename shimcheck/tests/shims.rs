@@ -91,6 +91,18 @@ fn str_to_int(s: &str, at: &str) -> Result<i64, String> {
 }
 
 
+fn heck_snake_case(s: &str) -> String {
+    heck::ToSnakeCase::to_snake_case(s)
+}
+
+fn heck_kebab_case(s: &str) -> String {
+    heck::ToKebabCase::to_kebab_case(s)
+}
+
+fn heck_upper_camel_case(s: &str) -> String {
+    heck::ToUpperCamelCase::to_upper_camel_case(s)
+}
+
 #[test]
 fn string_strip_0() {
     let s: &str = "";
@@ -1760,4 +1772,54 @@ fn string_gsub_regex_upcase_3() {
     let s: &str = "h\u{e9}llo";
     let pat: &str = "(?m)\u{e9}";
     assert_eq!(regex::Regex::new(pat).unwrap().replace_all(s, |c: &regex::Captures| c[0].to_uppercase()).into_owned(), "h\u{c9}llo");
+}
+
+#[test]
+fn binding_heck_snake_case_0() {
+    assert_eq!(heck_snake_case("HelloWorld fooBar"), "hello_world_foo_bar");
+}
+
+#[test]
+fn binding_heck_snake_case_1() {
+    assert_eq!(heck_snake_case("already_snake"), "already_snake");
+}
+
+#[test]
+fn binding_heck_snake_case_2() {
+    assert_eq!(heck_snake_case("  spaced   out  "), "spaced_out");
+}
+
+#[test]
+fn binding_heck_snake_case_3() {
+    assert_eq!(heck_snake_case(""), "");
+}
+
+#[test]
+fn binding_heck_kebab_case_0() {
+    assert_eq!(heck_kebab_case("HelloWorld fooBar"), "hello-world-foo-bar");
+}
+
+#[test]
+fn binding_heck_kebab_case_1() {
+    assert_eq!(heck_kebab_case("snake_case_input"), "snake-case-input");
+}
+
+#[test]
+fn binding_heck_kebab_case_2() {
+    assert_eq!(heck_kebab_case(""), "");
+}
+
+#[test]
+fn binding_heck_upper_camel_case_0() {
+    assert_eq!(heck_upper_camel_case("hello_world foo-bar"), "HelloWorldFooBar");
+}
+
+#[test]
+fn binding_heck_upper_camel_case_1() {
+    assert_eq!(heck_upper_camel_case("HelloWorld fooBar"), "HelloWorldFooBar");
+}
+
+#[test]
+fn binding_heck_upper_camel_case_2() {
+    assert_eq!(heck_upper_camel_case(""), "");
 }

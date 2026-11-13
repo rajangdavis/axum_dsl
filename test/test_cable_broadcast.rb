@@ -200,6 +200,64 @@ class TestCableBroadcast < Minitest::Test
     assert_includes rust, 'axum_dsl_cable_broadcast_turbo(&["board"], "remove", "note_1", None, false);'
   end
 
+  # A record with the fields a Global ID names, and a route that reads one, for `broadcast_<action>_to` with a record.
+  ROOM_CLASS = <<~RB
+    record :RoomClass do
+      field :id, :i64
+      field :class_name, :string
+    end
+    query :room_class_for_user, args: { id: :i64 }, returns: :RoomClass?, sql: "SELECT id, type AS class_name FROM rooms WHERE id = :id"
+  RB
+
+  # Two compiles are the same crate: on a difference, only the first lines that differ (clipped) are printed, never a whole main.rs.
+  # Each compile runs in its own temporary directory, and the generated Rust names the source file (the statement
+  # table carries `path:line`), so that directory is taken out before comparing: it is the one difference between
+  # two compiles of the same source.
+  def assert_same_rust(spelled, sugar)
+    a = spelled.gsub(%r{/[^"\s]*/chat\.axum\.rb}, "chat.axum.rb").lines
+    b = sugar.gsub(%r{/[^"\s]*/chat\.axum\.rb}, "chat.axum.rb").lines
+    clip = ->(lines) { lines.first(8).map { |l| l.strip[0, 300] } }
+    assert_equal [], clip.call(a - b) + ["--- sugar only ---"] + clip.call(b - a), "spelled-out and sugar Rust differ" unless a == b
+  end
+
+  def room_route(call)
+    <<~RB
+      get "/n" do
+        seen = room_for_user(id: 1, user_id: 1)
+        return halt(404, "") if seen.nil?
+        room = room_class_for_user(id: 1)
+        return halt(404, "") if room.nil?
+        #{call}
+        "sent"
+      end
+    RB
+  end
+
+  def room_cable = cable('channel "BoardChannel", signed_stream: :secret_key')
+
+  def test_broadcast_remove_to_a_record_lowers_as_the_spelled_out_broadcast_turbo
+    sugar = compile(ROOM_CLASS + room_route('broadcast_remove_to room, :messages, target: "x", app: "campfire"') + room_cable, head: MEMBER_HEAD)
+    spelled = compile(ROOM_CLASS + room_route('broadcast_turbo(global_id_param(room.class_name, room.id, app: "campfire"), :messages, action: :remove, target: "x")') + room_cable, head: MEMBER_HEAD)
+    assert_same_rust spelled, sugar
+    assert_includes sugar, '"remove", "x", None, false);'
+  end
+
+  def test_broadcast_append_to_a_record_with_html_lowers_as_the_spelled_out_broadcast_turbo
+    sugar = compile(ROOM_CLASS + room_route('broadcast_append_to room, :messages, target: "notes", html: render_string(:note, locals: { text: "hi" }), maintain_scroll: true, app: "campfire"') + room_cable,
+                    head: MEMBER_HEAD, views: NOTE)
+    spelled = compile(ROOM_CLASS + room_route('broadcast_turbo(global_id_param(room.class_name, room.id, app: "campfire"), :messages, action: :append, target: "notes", html: render_string(:note, locals: { text: "hi" }), maintain_scroll: true)') + room_cable,
+                      head: MEMBER_HEAD, views: NOTE)
+    assert_same_rust spelled, sugar
+    assert_includes sugar, '"append", "notes", Some('
+  end
+
+  def test_a_string_streamable_is_what_broadcast_turbo_takes_unchanged
+    body = ->(call) { "get \"/n\" do\n  #{call}\n  \"sent\"\nend\n" + cable('channel "BoardChannel", signed_stream: :secret_key') }
+    sugar = compile(body.call('broadcast_update_to "board", :messages, target: "notes", html: render_string(:note, locals: { text: "hi" })'), views: NOTE)
+    spelled = compile(body.call('broadcast_turbo("board", :messages, action: :update, target: "notes", html: render_string(:note, locals: { text: "hi" }))'), views: NOTE)
+    assert_same_rust spelled, sugar
+  end
+
   def test_render_string_follows_the_locals_rule_of_render
     message = refusal(<<~RB + cable('channel "HeartbeatChannel"'), views: NOTE)
       get "/n" do
@@ -263,6 +321,50 @@ class TestCableBroadcast < Minitest::Test
     message = refusal(<<~RB + cable('channel "HeartbeatChannel"'), views: NOTE)
       get "/n" do
         broadcast_turbo("board", action: :remove, target: "n", html: render_string(:note))
+        "sent"
+      end
+    RB
+    assert_match(/a `remove` action carries no template, so it takes no `html:`/, message)
+  end
+
+  def test_a_record_streamable_needs_class_name_and_id
+    message = refusal(<<~RB + room_cable, head: MEMBER_HEAD)
+      get "/n" do
+        room = room_for_user(id: 1, user_id: 1)
+        return halt(404, "") if room.nil?
+        broadcast_remove_to room, :messages, target: "x", app: "campfire"
+        "sent"
+      end
+    RB
+    assert_match(/Room has no field `class_name`/, message)
+  end
+
+  def test_a_record_streamable_needs_app
+    message = refusal(ROOM_CLASS + room_route('broadcast_remove_to room, :messages, target: "x"') + room_cable, head: MEMBER_HEAD)
+    assert_match(/broadcast_remove_to with a record needs `app:`/, message)
+  end
+
+  def test_app_is_for_a_record_streamable
+    message = refusal(<<~RB + cable('channel "BoardChannel", signed_stream: :secret_key'))
+      get "/n" do
+        broadcast_remove_to "board", target: "x", app: "campfire"
+        "sent"
+      end
+    RB
+    assert_match(/`app:` names the GlobalID app of a record streamable/, message)
+  end
+
+  def test_a_sugar_call_takes_no_action_or_remove_html
+    message = refusal(<<~RB + cable('channel "BoardChannel", signed_stream: :secret_key'))
+      get "/n" do
+        broadcast_remove_to "board", action: :remove, target: "x"
+        "sent"
+      end
+    RB
+    assert_match(/unknown keyword `action:` for broadcast_remove_to/, message)
+    message = refusal(<<~RB + cable('channel "BoardChannel", signed_stream: :secret_key'), views: NOTE)
+      get "/n" do
+        broadcast_remove_to "board", target: "x", html: render_string(:note)
         "sent"
       end
     RB

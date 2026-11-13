@@ -40,6 +40,13 @@ page is HTML, so a render answers through axum's `Html`, with `content-type: tex
 render, and `layout: nil` opts out of the default for one render. The layout is a view like any other, and
 `{{ yield }}` is where it writes the markup of the view it wraps:
 
+`set :turbo_frame_layout, :frame` is turbo-rails' `layout "turbo_rails/frame"` for a request with a `Turbo-Frame`
+header (a frame's `src`, or a link prefetched from inside a frame): every render that has a layout answers that
+request in this one instead, with the page's `{{ yield :head }}` region and the page (the other regions are dropped,
+as Rails drops them). A render whose layout is the frame layout, or that has none, is unchanged. `frame_layout: false` on a render
+keeps its layout for that request too: a Rails controller that declares `layout ..., only:` replaces turbo-rails'
+layout, so its other actions keep the application layout.
+
 ```html
 <!doctype html>
 <html lang="en">
@@ -119,8 +126,8 @@ like any other.
 
 `|raw`, `|sanitize` and `|editable` are filters on the first marker, not separate directives. Whitespace inside a marker is optional
 (`{{name}}` is `{{ name }}`), and there are no other forms: no expressions
-(`{{ a + b }}` is refused), no filters beyond `|raw`, `|sanitize` and `|editable` (`{{ name|upcase }}` is refused), no comparisons, no
-negation and no `{% elsif %}`. **The logic lives in the route body**; a view says only where the values go. That
+(`{{ a + b }}` is refused), no filters beyond `|raw`, `|sanitize` and `|editable` (`{{ name|upcase }}` is refused), no computation
+beyond the [conditions](#conditionals) and no `{% elsif %}`. **The logic lives in the route body**; a view says only where the values go. That
 is deliberate: a view that could compute would be a second language to learn, to type-check and to keep in step
 with the body language, which already has the blocks, the conditionals and the helpers. Three forms grew the
 grammar: `partial`, only as far as an attribute list (a name and flat `key: value` arguments), `{% for %}`, only
@@ -190,8 +197,8 @@ markers read. A partial is not a layout, so it has no `{{ yield }}`; one that wr
 
 A partial may declare its arguments once with `{% args %}`, a Ruby keyword-parameter list (parsed as
 `def _(label:, hint: "")`): `label:` is required, `hint: ""` has a default, and a default is a string, an integer
-(negative too) or `true`/`false`. It writes no output, and only a partial may have it (a view rendered with `render`
-or a layout is refused), once per file. The declared names must be exactly the names the markers read; a call
+(negative too) or `true`/`false`. It writes no output, and only a partial or a page may have it (a layout is
+refused; for a page see [Defaults for a page's locals](#defaults-for-a-pages-locals)), once per file. The declared names must be exactly the names the markers read; a call
 must pass every required name, may omit a defaulted one (the default is used) and may not pass an undeclared one.
 A partial without `{% args %}` takes exactly what its markers read, as above.
 
@@ -264,8 +271,45 @@ variable, and the branch is chosen by Ruby truthiness: `nil` and `false` are fal
 - A nil-able field of a loop variable narrows the same way, under the name the marker spells (`{{ task.note }}`).
 - Conditionals nest, and they work inside and around `{% for %}`, in a layout and in a partial. They add no
   marker: both branches' names are still part of the render's `locals:`, as the condition's own name is.
-- There is no `{% elsif %}`, no comparison and no negation: a condition is one name, and a route that must
-  combine tests decides in the body and passes the result.
+- A condition is a **term**, or terms joined by `&&` or by `||` (never both: there are no parentheses), read left
+  to right. A term is `name` (a bool or nil-able), `!name`, `a == b`, `a != b` (a name, a `"string"`, an integer or
+  `true`/`false` on each side; both sides of one type: two integers, two strings or two bool), `a < b`, `a <= b`,
+  `a > b`, `a >= b` (integers), `name.empty?` (a string or a list), `name.any?` (a list), or `name.length` /
+  `name.size` (a string or a list; the length of a string counts characters) in a comparison. A name is a local,
+  `local.field` of a record (see [A record's fields](#a-records-fields)), or a loop variable and its field
+  (`u.name.empty?` is a field and a method). A `f64`, a record, a list compared with `==`, or two types is refused
+  naming both types; a nil-able name is only tested (`{% if name %}`, `{% if !name %}`: nil and `false` are false)
+  and never compared. Only the single `{% if name %}` narrows a nil-able name; a compound condition narrows
+  nothing. Every name is part of the render's `locals:`.
+- Refused, with a message that says what is allowed: parentheses, `&&` mixed with `||`, `!` before a comparison
+  (write `a != b`), two comparisons in one term, `==` between a String and an integer (or any two types), `<`
+  on a string, `.empty?` on an integer, `.any?` on a string, an integer or a literal alone as a term, a
+  comparison or method on a nil-able name, and `{% elsif %}` (nest an `{% if %}` in `{% else %}`).
+
+```html
+{% for u in users %}
+  {% if u.id == user_id %}<b>{{ u.name }}</b>{% else %}{{ u.name }}{% endif %}
+{% endfor %}
+{% if role == "admin" || bell %}…{% endif %}
+{% if !name.empty? && users.length > 20 %}…{% endif %}
+```
+
+These compile to the Rust a person would write over the values in scope: `if role.as_str() == "admin" || bell { … }`,
+`if !name.is_empty() && (users.len() as i64) > 20 { … }` (an `i32` beside an `i64` is widened with `i64::from`).
+
+### A record's fields
+
+`{{ page.name }}`, `{% if page.admin %}`, `{% if page.status == 2 %}`, `{% if page.name.empty? %}` and a partial
+argument `title: page.name` read a field (or a [record method](database.md)) of a local `page` that is a record, as they
+do for a loop variable. The controller passes the record itself (`render :show, locals: { page: page }`, or just the
+route variable `page`, see [Locals without `locals:`](#locals-without-locals)); it does not list its fields. A
+nil-able record (`returns: :Item?`) is read inside `{% if page %}`, which narrows it to the record; a nil-able
+field narrows under its spelled key (`{% if page.note %}{{ page.note }}{% endif %}`). A field is the Rust field
+access (`page.name`), a method a call (`page.label()`). One dot only. An unknown field is refused with the
+record's fields and a "did you mean"; a dotted read of a local that is not a record, or of a nil-able record
+outside its `{% if %}`, is refused. A record local counts as read when any marker reads any of its fields; one
+whose fields no marker reads is "a local no marker reads", refused as any other. `{% for x in page.items %}` is
+not supported (a loop reads a local or a loop variable's field).
 
 The conditional compiles to an `if` statement that writes the taken branch into the render's one buffer:
 `if name { … } else { … }`, with an `if let Some(__if_name) = name` guard where the name is nil-able.
@@ -294,6 +338,215 @@ own position in the DSL file.
 
 The refusal is reported at the declaration that named the view (the position an editor can show, and the one
 `test/refusals/` pins), and the view's own file and line travel inside the message.
+
+### Locals without `locals:`
+
+A render need not write `locals:` for a name the view reads. Every name the view (its layout and partials
+included) reads is bound at compile time, in this order:
+
+1. a key of the render's `locals:`, when it is written;
+2. else a **local variable of the same name** in the route body at the render call;
+3. else a **`view_local`**, a **page local**, or a **layout local** of that name; a controller's entry wins over one
+   declared at the top level.
+
+```ruby
+view_local :vapid_key do      # top level, in a `fragment`, or in a `controller`
+  setting(:vapid_public_key)
+end
+
+get "/account" do
+  user_name = current(:user).name
+  render :account, layout: :app     # reads user_name (a local) and vapid_key (a view_local)
+end
+```
+
+A `view_local` is a named value a view may read. Its block is lowered like a route body, in the route that
+renders: it may call `current(:x)`, `setting`, queries and defs, but it does not see the route's
+local variables (a def's rule). It is computed only by a render whose view reads the name, once, ahead of the
+markup (`let __vl_vapid_key = ...;`); a `view_local` no view reads adds nothing to the crate. A local variable
+binds exactly as `locals: { name: name }` does, so the generated Rust is the explicit form's.
+
+A **`page_locals`** block declares a set of those values at once, scoped to the controller (or the service)
+it is written in:
+
+```ruby
+controller do
+  page_locals do
+    base_url = request_base_url
+    pwa_browser = pwa_browser(user_agent)
+  end
+
+  get "/" do
+    render :account          # base_url and pwa_browser come from the block
+  end
+end
+```
+
+Each line is a `view_local` with an expression instead of a block. A controller's entry is used only by
+that controller's routes and wins over a top-level `view_local` (or page local) of the same name;
+a render that reads no name in the block computes none of it. It is the same `let __vl_...` as a
+`view_local`, so the generated Rust is the explicit `locals:` form's. A name the layout reads belongs in
+`layout_locals` (below); a `page_locals` entry for one is refused. A `layout_locals` written in a `fragment` is the
+service's, which is where an ApplicationController's shared layout context belongs; a controller's is its own.
+
+#### Layout locals
+
+`layout_locals do ... end` is the same block for names the **layout** reads:
+
+```ruby
+controller do
+  layout_locals do
+    account_css = account_custom_styles
+    signed_in = true
+    user_name = current_user.name
+  end
+end
+```
+
+The split is checked per render:
+
+- a `page_locals` entry the layout reads is refused, naming both files: a page value cannot shadow a layout key;
+- a `layout_locals` entry may also feed a page (a frame page, or a page that repeats a layout marker): it is the
+  broader scope, and the common ApplicationController block uses it;
+- a name both read belongs in `layout_locals`;
+- a `layout_locals` entry is also a local in the action: an action that reads it emits the same `let` at the top of
+  the route (`text(account_css)`), once; a `page_locals` entry stays render-only.
+
+A controller's `layout_locals` wins over a top-level one; explicit `locals:` wins over both. The same
+`let __vl_name = ...;` is emitted only for the renders that read the name.
+
+A name no source gives is refused with the view, the line and the name, and says where to declare it. A name
+that is both a local variable of the route and a `view_local` is **ambiguous** and refused, unless `locals:` names
+it (an explicit key wins and nothing else is consulted). `render_string` still takes only `locals:`.
+
+To see where each value comes from, the compiler prints a notice `N-VIEW-LOCALS` at each render that bound a
+name implicitly, such as `views/account.html reads user_name (local variable), vapid_key (view_local, line 3);
+locals: title`. It is an ordinary notice (`AXUM_DSL_NOTICE`, [notifications](notifications.md)), so the language
+server shows it as a diagnostic on the `render` call. A render that passes every name in `locals:` prints
+nothing. (Instance variables, below, do not print it: their source is written at the `@x` itself.)
+
+### Instance variables: `@x` and `{{ @x }}`
+
+Rails hands a view its controller's instance variables; this DSL does the same, by name and with a contract. An
+action assigns `@directs = ...` and the view writes `{{ @directs }}`, like ERB's `<%= @directs %>`. An `@x` lowers to
+the very `let x = ...;` a plain local does, so the emitted Rust is identical; what it adds is that the name is a
+declared view input.
+
+```ruby
+get "/sidebar" do
+  @directs = direct_rooms(user_id)
+  render :sidebar
+end
+```
+
+```html
+{% for room in @directs %}<li>{{ room.name }}</li>{% endfor %}
+```
+
+The rules:
+
+- `@x = expr` is allowed in a route body and in a `layout_locals`/`page_locals` block (`@x = current_user.name`);
+  it is assigned once, like a local, and may be read later in the same body as `@x`. It shares its Rust name with
+  `x`, so an `@x` and a local `x` in one route are refused.
+- **One writer per request path.** An action's `@x` and a `layout_locals`/`page_locals` `@x` of the same name are
+  refused, naming both lines.
+- An action's `@x` that no render of that action reads is refused: make it a plain local or remove it. An unused
+  `layout_locals` entry is fine: the block is shared.
+- A view reading `{{ @x }}` that nothing assigns is refused: assign `@x` in the action, declare it in
+  `layout_locals`/`page_locals`, or pass `locals: { x: ... }`. `{{ @x }}` resolves only to those exported values and
+  to an explicit `locals:` entry, never to a bare local `x`; a bare `{{ x }}` still resolves as before.
+- `@x` is written wherever a marker takes a name: `{{ @x }}`, `{{ @x|raw }}`, `{% if @x %}`, `{% for r in @xs %}`
+  and a `{{ partial :p, key: @x }}` argument. A partial still takes explicit arguments (its `{% args %}` names are
+  bare, like Rails partial locals); instance variables do not leak into partials.
+- The type graph has a node `ivar:Controller#action.x` and an edge `view:<template>.x <- ivar:...` (rule `view
+  input`); hovering the `@x` lists the views that read it.
+
+During the migration to instance variables a bare view name still binds from a plain local of the same name.
+
+### Defaults for a page's locals
+
+A page declares defaults for its own locals with the `{% args %}` a partial uses (once, listing exactly the names the
+page's markers read, in a Ruby keyword list). A name with a default may be left out of `locals:`; a name without one
+(`title:`) stays required.
+
+```html
+{% args title:, hint: "", columns: 2, wide: false %}
+<h1>{{ title }}</h1><small>{{ hint }}</small>{% if wide %}…{% endif %}
+```
+
+```ruby
+render :show, locals: { title: "Rooms" }   # hint, columns and wide take their defaults
+```
+
+The default is a string, an integer or `true`/`false`, emitted as that literal (`""`, `2`, `false`), so the view
+compiles as if the controller had passed it. A local the render does pass (in `locals:`, as a route variable, a `view_local`
+or by `from:`) replaces the default, and must have the default's type: a string default with an integer passed is
+refused ("the default of `n:` in `{% args %}` is String, but this render passes `n` as Integer (i64)"), and a default the
+view uses wrongly (a string looped over, a string tested as a condition) is refused by the view's own type check.
+A layout still takes no `{% args %}` (it reads the page's locals), and a name the page reads but does not declare is
+refused ("`x` is read here but `{% args %}` does not declare it").
+
+### Locals from a record
+
+`from: record` fills the names `locals:` leaves out from the fields of one declared `record`, so a render that
+passes a record's fields one by one does not have to:
+
+```ruby
+render :message_edit, from: message, locals: { room_id: room.id }
+# the same Rust as: locals: { room_id: room.id, id: message.id, body: message.body, ... }, one entry per name
+# the view reads that Message has a field of
+```
+
+A name the view (or its layout) reads is bound from a key of `locals:` first, which always wins; otherwise from a
+field of the `from:` record of the same name. A name that is also a local variable of the route, or a
+`view_local`/`page_locals`/`layout_locals` entry, and a field of the record is a clash and is refused, naming the
+view, the name and the record: pass it in `locals:` (which resolves it) or rename the local. The
+field is read as `locals: { name: record.name }` reads it, so it gets the same type check and the Rust is the
+explicit spelling's: the two are interchangeable. A record field no marker reads is ignored. A name nothing
+gives is refused as a missing local is, with a note that the record has no such field.
+
+`from:` takes one expression whose type is a record; it is evaluated once (a local variable is read where it is,
+any other expression is bound first). A value of another type is refused, and so is `from:` on a view that reads
+no names. `render` and `render_string` take it; `redirect`, `head` and the other responses do not.
+
+## Locales
+
+Rails' i18n, opt-in. A service that has no locale files and never calls `t` emits nothing of it: no runtime
+function, no extra extractor, byte-for-byte the crate it was before. `examples/locales.axum.rb` shows the shape.
+
+The texts are YAML files in `config/locales/*.yml` beside the DSL file (`set :locales, "folder"` names another
+folder, as `set :views` does), one top-level key per locale and nested keys below it, as Rails' are:
+`en: { bots: { index: { title: "Chat bots" } } }` is the key `bots.index.title`. The compiler reads them with
+Ruby's YAML when it runs, so the crate has no YAML parser and no new dependency; each key a body or a view uses
+becomes a generated Rust function holding a `match` over the request's locale. `default_locale :es` names the
+default; without it the default is `:en` when a file holds it, else the only locale there is. A locale name is
+`en`, `es` or `pt-BR` in a file, but `default_locale` takes a snake_case symbol.
+
+`t("bots.index.title")` is the call in a route body or a `before` filter, and `{{ t ".title" }}` the marker in a
+view. A body's `t` is a String, not escaped (write `h(t(...))` where it goes into HTML); a view's is escaped
+exactly as `{{ name }}` is. A literal string stays legal everywhere next to `t`. In a view, the lazy form `".title"`
+is Rails': it resolves against the view's path under the views folder, `bots/index.html` being `bots.index`
+(so the key is `bots.index.title`), and a partial `bots/_form.html` is `bots.form`; a layout is scoped by its own
+file name. A route body has no view to be relative to, so its `t` writes the whole key.
+
+`%{name}` in a text is filled by a keyword, `t("greeting", name: user_name)` or `{{ t "greeting", name: user_name }}`
+(a view's keyword is a local or a loop variable's field, read as `{{ name }}` reads it, and its value is escaped
+with the text). The keywords must be exactly the names the default text uses: a missing one and an extra one are
+compile errors, and so is a text in another locale that interpolates different names.
+
+The request's locale is its `locale` query parameter when a file holds that locale, else the default
+(`?locale=es`; an unknown or empty value is the default). The handler binds it once, as `__locale`, so every `t` of
+the request reads the same one. A key the default locale lacks is a compile error naming the `t` call's file and
+line (a view's own line for a marker) and, when one is close, the key it may have meant; a key another locale lacks
+answers with the default locale's text.
+
+`t` needs a request, so it is refused in a `helper`, a `current`, a binding and the `not_found` and `error`
+filters, and in a sanitizer's partial, which compiles to a function of its own with no request to read the
+locale from. A `t` with no locale files is a compile error that says where to add one.
+
+Not yet: pluralization (`count:`), `l()` for dates and numbers, `_html` keys (a view's `t` is always escaped),
+a locale from `Accept-Language`, a cookie or the session, `pt-BR`-style names in `default_locale`, an expression
+as a marker keyword (a bare local or a loop field only), and editor support (completion and hover).
 
 ## How a view is emitted
 
@@ -441,8 +694,9 @@ Each of these is refused by name and pinned by a fixture under `test/refusals/`:
   a loop variable that shadows a local or an enclosing loop variable, a loop over a local that is not a list, a
   field a record does not have, a nil-able field, and a record written whole where a field is wanted;
 - an `{% if %}` that is never closed, an `{% endif %}` or `{% else %}` with no `{% if %}`, a second `{% else %}`,
-  an `{% elsif %}`, a condition that is an expression or a negation, and a condition that is not a bool or a
-  nil-able value;
+  an `{% elsif %}`, a condition that is an expression or a negation (the one comparison is `a == b` between two
+  names), an `a == b` whose sides are not two names of one type (`i64`, `string` or `bool`), and a condition that
+  is not a bool or a nil-able value;
 - `{% raw %}` with no `{% endraw %}`, and `{% endraw %}` with no `{% raw %}`;
 - `{{ yield }}` in a view rendered with no layout, and a layout that writes no `{{ yield }}`;
 - `{{ yield :name }}` outside a layout (no layout, in the page, in a partial) or with a filter or a non-symbol;

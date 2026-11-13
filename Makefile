@@ -6,7 +6,7 @@
 #   check-e2e    the example services over HTTP
 #   check        all three, for the host
 
-.PHONY: probe test-ruby test-ruby-rust gen-diff test-diff dsl-check rbi rbi-check rbi-helpers rbi-helpers-check typecheck check-fast check-build check-e2e check e2e e2e-add e2e-validate e2e-assets e2e-csrf e2e-method-override e2e-upload e2e-login e2e-login-rails e2e-views e2e-proxy e2e-case e2e-split e2e-hatches e2e-notes e2e-cable e2e-tls e2e-dev golden golden-update gem-test
+.PHONY: schema-check e2e-schema-check probe test-ruby test-ruby-rust test-laws-cargo gen-diff test-diff dsl-check rbi rbi-check rbi-helpers rbi-helpers-check typecheck check-fast check-build check-e2e check e2e e2e-add e2e-validate e2e-assets e2e-csrf e2e-method-override e2e-upload e2e-login e2e-login-rails e2e-views e2e-locales e2e-proxy e2e-case e2e-split e2e-hatches e2e-notes e2e-cable e2e-tls e2e-dev golden golden-update gem-test vet-lock audit deny
 
 # Every cargo invocation shares one target dir, so axum and its dependencies compile once
 # for the whole suite instead of once per generated crate.
@@ -31,9 +31,18 @@ deps:
 test-ruby:
 	ruby -Ilib -Itest -e 'Dir.glob("test/test_*.rb").sort.each { |f| require "./#{f}" }'
 
+# One test file: `make t-db-rel` runs test/test_db_rel.rb (a hook's target= takes lowercase letters, digits and dashes).
+t-%:
+	ruby -Ilib -Itest test/test_$(subst -,_,$*).rb
+
 # L5 in Ruby: build a generated crate and drive it over HTTP.
 test-ruby-rust:
 	AXUM_CARGO=1 ruby -Ilib test/test_routes.rb
+	AXUM_CARGO=1 ruby -Ilib test/test_e2e_pin.rb
+
+# The examples' laws under cargo: they hold, and planted bugs are caught. Not part of `check` (two crates, minutes).
+test-laws-cargo:
+	AXUM_CARGO=1 ruby -Ilib test/test_laws.rb
 
 # L3: generate Rust tests from the same catalog, then run them.
 gen-diff:
@@ -53,9 +62,25 @@ check-build: test-ruby-rust test-diff
 
 # Each e2e target has its own port (the example's `set :port`) and its own out dir, so `make -j check-e2e`
 # runs them concurrently.
-check-e2e: e2e-add e2e-validate e2e-assets e2e-csrf e2e-method-override e2e-upload e2e-views e2e-proxy e2e-case e2e-split e2e-hatches e2e-notes e2e-cable e2e-login e2e-login-rails e2e-tls e2e-dev
+check-e2e: e2e-schema-check e2e-add e2e-validate e2e-assets e2e-csrf e2e-method-override e2e-upload e2e-views e2e-locales e2e-proxy e2e-case e2e-split e2e-hatches e2e-notes e2e-cable e2e-login e2e-login-rails e2e-tls e2e-dev
 
-check: check-fast check-build check-e2e
+check: check-fast check-build check-e2e audit
+
+# Re-resolve the dependency set generated crates are pinned to (lib/axum_dsl/vetted/Cargo.lock, from the examples),
+# then audit it. Run `make check` before committing the new lock.
+vet-lock:
+	ruby bin/vet_lock
+	$(MAKE) audit
+
+# RustSec advisories against the vetted set: every generated crate's lock is a part of it. Needs cargo-audit.
+audit:
+	cargo audit --file lib/axum_dsl/vetted/Cargo.lock
+
+# Licenses, bans and sources (deny.toml) against the vetted set. cargo-deny needs a manifest, not a bare lockfile, so
+# bin/vet_lock --deny emits the examples into its temporary workspace, copies the vetted lock in and runs cargo deny there.
+# Fails with a stale-lock hint if the lock no longer covers the examples (make vet-lock). Needs cargo-deny.
+deny:
+	ruby bin/vet_lock --deny
 
 # Sorbet: regenerate the DSL description from the compiler's SIG table, verify it is current,
 # and typecheck the example services against it (structure only).
@@ -130,6 +155,12 @@ e2e-views:
 	ruby exe/axum_dsl build examples/views.axum.rb -o /tmp/axum_dsl_views-out
 	sh test/e2e_views.sh /tmp/axum_dsl_views-out
 
+# The locales example: Rails-style i18n (config/locales/*.yml read at compile time, `t` in a view and a route, ?locale=es,
+# the English fallback). Port 8088 and its own out dir.
+e2e-locales:
+	ruby exe/axum_dsl build examples/locales.axum.rb -o /tmp/axum_dsl_locales-out
+	sh test/e2e_locales.sh /tmp/axum_dsl_locales-out
+
 # The file-serving example: its own out dir, because a third crate must not clobber the other two, and
 # the script starts the binary with this directory as its working directory — which is what the copied
 # assets and the emitted ServeDir::new("public") are resolved against.
@@ -185,6 +216,17 @@ e2e-notes:
 	ruby exe/axum_dsl build examples/notes.axum.rb -o /tmp/axum_dsl_notes-out
 	sh test/e2e_notes.sh /tmp/axum_dsl_notes-out
 
+# The build-time query check: the binary's --schema-check on a fresh in-memory database, so a wrong column is found with no
+# server and no database file. `make schema-check` runs it over the examples that declare a database; e2e-schema-check also
+# builds apps that must fail and asserts the messages. It needs cargo, so it is not in check-fast.
+schema-check:
+	ruby exe/axum_dsl schema-check examples/notes.axum.rb -o /tmp/axum_dsl_schema_check-notes
+	ruby exe/axum_dsl schema-check examples/login.axum.rb -o /tmp/axum_dsl_schema_check-login
+	ruby exe/axum_dsl schema-check examples/upload.axum.rb -o /tmp/axum_dsl_schema_check-upload
+
+e2e-schema-check:
+	sh test/e2e_schema_check.sh
+
 # The Action Cable example: channels that stream, `perform` and broadcast, and routes that broadcast (`broadcast`,
 # `broadcast_turbo`). Port 8105 and its own out dir; test/e2e_cable.sh starts the service and test/cable_broadcast_check.mjs
 # opens two WebSocket clients and checks the exact frames. It needs node and skips without it.
@@ -222,6 +264,8 @@ GEM_TMP = /tmp/axum_dsl_gem
 LSP_FRAMES = 'Content-Length: 58\r\n\r\n{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}Content-Length: 44\r\n\r\n{"jsonrpc":"2.0","id":2,"method":"shutdown"}Content-Length: 33\r\n\r\n{"jsonrpc":"2.0","method":"exit"}'
 gem-test:
 	rm -rf $(GEM_TMP) && mkdir -p $(GEM_TMP)
+	cd ../r2r-laws && gem build r2r-laws.gemspec --output $(GEM_TMP)/r2r-laws.gem
+	GEM_HOME=$(GEM_TMP)/home gem install --no-document $(GEM_TMP)/r2r-laws.gem
 	gem build axum_dsl.gemspec --output $(GEM_TMP)/axum_dsl.gem
 	GEM_HOME=$(GEM_TMP)/home gem install --no-document $(GEM_TMP)/axum_dsl.gem
 	cd $(GEM_TMP) && GEM_HOME=$(GEM_TMP)/home $(GEM_TMP)/home/bin/axum_dsl --version

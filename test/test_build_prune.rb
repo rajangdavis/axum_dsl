@@ -16,12 +16,13 @@ require "axum_dsl"
 class TestBuildPrune < Minitest::Test
   EXE = File.expand_path("../exe/axum_dsl", __dir__)
 
-  # Write `body` as a server and emit its crate into `out`, without cargo.
+  # Write `body` as a server and emit its crate into `out`, without cargo (the plain `FILE -o DIR` form: `build`
+  # would also pin the crate to the vetted lock, which runs cargo).
   def build(project, out, body)
     FileUtils.mkdir_p(project)
     file = File.join(project, "prune.axum.rb")
     File.write(file, "server \"prune\", version: \"0.1.0\"\nset :port, 8080\n#{body}")
-    _stdout, stderr, status = Open3.capture3(RbConfig.ruby, EXE, "build", file, "-o", out, "--emit-only")
+    _stdout, stderr, status = Open3.capture3(RbConfig.ruby, EXE, file, "-o", out)
     assert status.success?, stderr
     out
   end

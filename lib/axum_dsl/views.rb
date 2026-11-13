@@ -16,10 +16,10 @@ module AxumDsl
   # is true), `{{ csrf_token }}` (the token `use_layer :csrf` puts on the request, for a form's hidden
   # `authenticity_token`) and `{{ asset_path "campfire.css" }}` (the fingerprinted path of a file under a
   # `static ... digest: true` mount). `partial` grows the marker grammar only as far as an attribute list,
-  # `for` only as far as one list name and one new name, and `if` only as far as one name and one optional
-  # `else`. There are no expressions, no filters beyond `|raw` and `|sanitize`, no comparisons, no negation
-  # and no `elsif`: the logic lives in the route body and `locals:` carries its result, so the marker grammar
-  # never has to grow a language behind it.
+  # `for` only as far as one list name and one new name, and `if` as far as a condition: terms joined by `&&` or
+  # by `||`, each a name, a negation, a comparison or one of `.empty?`, `.any?`, `.length` (COND_FORMS below), with
+  # one optional `else`. A name may be `local.field` of a record local. There are no filters beyond `|raw` and
+  # `|sanitize`, no parentheses, no arithmetic and no `elsif`: anything larger is decided in the route body.
   #
   # A page whose `{{ }}` belongs to a client framework (Vue, Handlebars) is not a view but a static asset:
   # the browser evaluates the user data inside a live client template, which HTML escaping cannot prevent.
@@ -38,7 +38,8 @@ module AxumDsl
             "for byte, which is also how a literal `{{` is written), `{{ partial :name, key: value }}` " \
             "(a partial inlined here, whose markers read the arguments), `{% for x in xs %}...{% endfor %}` " \
             "(the body repeated for each element of the list `xs`) or `{% if name %}...{% else %}...{% endif %}` " \
-            "(one of two branches, taken when the bool or nil-able `name` is true), `{{ csrf_token }}` " \
+            "(one of two branches, taken when the bool or nil-able `name` is true; a condition may also compare, " \
+            "negate and join terms), `{{ csrf_token }}` " \
             "(the token of `use_layer :csrf`, written into a form's `authenticity_token`) or " \
             "`{{ asset_path \"campfire.css\" }}` (the fingerprinted path of a file under a `static ... " \
             "digest: true` mount) or `{{ rails_signed_id user_id, purpose: \"user/avatar\", secret: :secret_key }}` " \
@@ -49,6 +50,19 @@ module AxumDsl
     LOOP_VAR = /\A[a-z][a-z0-9_]*\z/
     # A local's name: what a marker can spell, and what a `locals:` key must be to be readable by one.
     NAME = /\A[A-Za-z_][A-Za-z0-9_]*\z/
+    # `{{ @x }}` reads what a controller assigned to `@x` (Rails' `<%= @x %>`). The parser spells such a name
+    # `__iv_x` inside markers, so every marker form that takes a name takes an instance variable with no second grammar;
+    # Body binds `__iv_x` from the exported values only (an action's `@x`, a layout_locals/page_locals `@x`, a `locals:` entry).
+    IVAR_PREFIX = "__iv_"
+    IVAR_TOKEN = /"(?:\\.|[^"\\])*"|'(?:\\.|[^'\\])*'|(?<![A-Za-z0-9_])@([A-Za-z_][A-Za-z0-9_]*)/
+
+    # The marker text with each `@x` (outside string literals) spelled `__iv_x`.
+    def self.mangle(s) = s.gsub(IVAR_TOKEN) { $1 ? "#{IVAR_PREFIX}#{$1}" : $& }
+
+    def self.ivar?(name) = name.to_s.start_with?(IVAR_PREFIX)
+
+    # The name as the template spells it: `@x` for `__iv_x`.
+    def self.show(name) = ivar?(name) ? "@#{name.to_s.delete_prefix(IVAR_PREFIX)}" : name.to_s
     # A name that carries an extension is written `.html`. The extension is where a template engine infers
     # the escaping context from (Askama does); this DSL has one context, so a `.vue`, `.erb` or `.md` file is
     # not a view, and saying so by name beats reading it as HTML.
@@ -126,7 +140,7 @@ module AxumDsl
       if (undeclared = names - declared).any?
         name = undeclared.first
         at = flat(segments).find { |s| reads(s).include?(name) }["line"]
-        bad.call("#{rel}:#{at}: `#{name}` is read here but `{% args %}` (line #{line}) does not declare it; " \
+        bad.call("#{rel}:#{at}: `#{show(name)}` is read here but `{% args %}` (line #{line}) does not declare it; " \
                  "`{% args %}` lists exactly the names the markers read")
       end
       return if (unread = declared - names).empty?
@@ -190,10 +204,21 @@ module AxumDsl
       case seg["kind"]
       when "partial" then seg["names"]
       when "for" then seg["over_field"] ? [] : [seg["over"]]
-      when "if" then seg["var"] ? [] : [seg["name"]]
+      when "if" then if_reads(seg)
       when "text", "yield", "yield_region", "content_for", "args", "csrf", "asset" then []
+      when "t" then seg["args"].values.flat_map { |a| reads(a) }
       else [(seg["var"] ? nil : seg["name"]), seg["host"], seg["mentions"]].compact
       end
+    end
+
+    # The locals an `{% if %}` reads: its one name, the right side of `a == b`, or every name operand of a compound
+    # or literal condition (a loop variable is no local).
+    def self.if_reads(seg)
+      if (cond = seg["cond"])
+        return cond["terms"].flat_map { |t| [t["a"], t["b"]] }.compact.select { |o| o["name"] && !o["var"] }.map { |o| o["name"] }
+      end
+
+      [(seg["var"] ? nil : seg["name"]), (seg["eq"] && !seg["eq"]["var"] ? seg["eq"]["name"] : nil)].compact
     end
 
     # Why a view file is not there. A sibling that differs only in its extension is named, because that is the
@@ -239,7 +264,7 @@ module AxumDsl
           close = close_brace(text, open + 2)
           bad.call("#{rel}:#{line}: the `{{` here is never closed; #{FORMS}") unless close
           flush.call
-          seg = marker(text[(open + 2)...close], rel, line, scope: scope, bad: bad)
+          seg = marker(mangle(text[(open + 2)...close]), rel, line, scope: scope, bad: bad)
           if seg["kind"] == "yield" && !frames.empty?
             bad.call("#{rel}:#{line}: `{{ yield }}` is a layout's child output, written once; it cannot sit inside a `{% for %}` or a `{% if %}`")
           end
@@ -251,7 +276,7 @@ module AxumDsl
         else
           close = text.index("%}", open + 2)
           bad.call("#{rel}:#{line}: the `{%` here is never closed; #{FORMS}") unless close
-          directive = text[(open + 2)...close].strip
+          directive = mangle(text[(open + 2)...close]).strip
           if directive == "raw"
             after, stop = raw_region(text, close + 2)
             if after.nil?
@@ -364,6 +389,8 @@ module AxumDsl
           bad.call("#{rel}:#{seg['line']}: this `{% content_for :#{seg['name']} %}` is never closed; a region ends with `{% endcontent_for %}`")
         elsif frame[:kind] == "if"
           shown = seg["field"] ? "#{seg['name']}.#{seg['field']}" : seg["name"]
+          shown = seg["text"] if seg["cond"]
+          shown = "#{shown} == #{seg['eq']['field'] ? "#{seg['eq']['name']}.#{seg['eq']['field']}" : seg['eq']['name']}" if seg["eq"]
           bad.call("#{rel}:#{seg['line']}: this `{% if #{shown} %}` is never closed; a conditional ends with `{% endif %}`")
         else
           bad.call("#{rel}:#{seg['line']}: this `{% for #{seg['var']} in ... %}` is never closed; a loop ends with `{% endfor %}`")
@@ -437,8 +464,21 @@ module AxumDsl
         bad.call("#{rel}:#{line}: `{% #{directive} %}` has no condition; a conditional is `{% if name %}` " \
                  "... `{% endif %}`, over one bool or nil-able name")
       end
+      tokens = form.scan(COND_TOKEN)
+      if tokens.include?("(") || tokens.include?(")")
+        bad.call("#{rel}:#{line}: `{% if #{form} %}` has parentheses; #{COND_FORMS}")
+      end
+      joins = tokens.select { |t| t == "&&" || t == "||" }.uniq
+      if joins.size > 1
+        bad.call("#{rel}:#{line}: `{% if #{form} %}` mixes `&&` and `||`, and there are no parentheses to say which binds first; #{COND_FORMS}")
+      end
+      return cond_directive(form, tokens, joins.first, rel, line, scope, bad: bad) if joins.any?
+      if form.match?(/\A#{NAMEISH}\s*==\s*#{NAMEISH}\z/) && form.split("==").none? { |s| %w[true false].include?(s.strip) }
+        return equality_directive(form, rel, line, scope, bad: bad)
+      end
+
       test = nil
-      if form.include?("|")
+      if form.include?("|") && tokens.none? { |t| t.start_with?("\"") }
         form, _, test = form.partition("|")
         form = form.strip
         test = test.strip
@@ -463,14 +503,101 @@ module AxumDsl
         return seg
       end
       bad.call("#{rel}:#{line}: `|#{test}` reads a plain local, not a loop variable's field") if test
-      if base.match?(NAME) && !dot.empty? && field.match?(NAME) && scope[:open].include?(base)
-        return { "kind" => "if", "name" => base, "field" => field, "var" => true,
+      outside.call(base) if base.match?(NAME) && scope[:closed].include?(base)
+      if base.match?(NAME) && !dot.empty? && field.match?(NAME) && !tokens.include?("==") && !%w[empty? any? length size].include?(field)
+        return { "kind" => "if", "name" => base, "field" => field, "var" => scope[:open].include?(base),
                  "line" => line, "then" => [], "else" => [] }
       end
-      outside.call(base) if base.match?(NAME) && scope[:closed].include?(base)
-      bad.call("#{rel}:#{line}: `{% if #{form} %}` is not a condition; a condition is one name -- a bool or " \
-               "nil-able local, or a bool or nil-able field of a loop variable -- with no expression, " \
-               "comparison or negation (`{% if name %}...{% endif %}`)")
+      cond_directive(form, tokens, nil, rel, line, scope, bad: bad)
+    end
+
+    # Compare, test and negate: the operators of a condition that is more than one name.
+    COND_TOKEN = /"[^"]*"|-?\d+|[A-Za-z_][A-Za-z0-9_]*\??|==|!=|<=|>=|&&|\|\||[<>!.()]|\S/
+    NAMEISH = /[A-Za-z_][A-Za-z0-9_]*(?:\.[A-Za-z_][A-Za-z0-9_]*)?/
+    COND_FORMS = "a condition is one or more terms joined by `&&` or by `||` (not both: there are no parentheses), left to right; " \
+                 "a term is `name`, `!name`, `a == b` or `a != b` (a name, a \"string\", an integer or true/false on each side), " \
+                 "`a < b`, `a <= b`, `a > b` or `a >= b` (integers), `name.empty?` (string or list), `name.any?` (list) " \
+                 "or `name.length` / `name.size` (string or list) in a comparison; a name is a local, `local.field` of a record, " \
+                 "or a loop variable and its field".freeze
+    COND_METHODS = %w[empty? any? length size].freeze
+
+    # `{% if a != b %}`, `{% if !a %}`, `{% if n > 3 && ok %}` ...: the condition as a list of terms joined by
+    # `join` (`&&`, `||`, or nil for one term). A term is `{ "t" => "test" | "not" | "cmp", "a" =>, "b" =>, "op" => }`
+    # over operands (a name with an optional field and method, or a literal). Types are checked where the locals
+    # are known (Body#cond_expr). The segment has no name of its own: Views.if_reads lists what it reads.
+    def self.cond_directive(form, tokens, join, rel, line, scope, bad:)
+      groups = [[]]
+      tokens.each { |t| join && t == join ? groups << [] : groups.last << t }
+      terms = groups.map { |g| cond_term(g, form, rel, line, scope, bad: bad) }
+      { "kind" => "if", "name" => nil, "field" => nil, "var" => false, "text" => form,
+        "cond" => { "join" => join, "terms" => terms }, "line" => line, "then" => [], "else" => [] }
+    end
+
+    def self.cond_term(tokens, form, rel, line, scope, bad:)
+      no = ->(why) { bad.call("#{rel}:#{line}: `{% if #{form} %}` is not a condition: #{why}; #{COND_FORMS}") }
+      no.call("a term is empty (a `&&`, `||` or comparison with nothing beside it)") if tokens.empty?
+      neg = tokens.first == "!"
+      tokens = tokens.drop(1) if neg
+      cmps = tokens.each_index.select { |i| %w[== != < <= > >=].include?(tokens[i]) }
+      no.call("it has more than one comparison (`==`, `!=`, `<`, `<=`, `>`, `>=`) in one term") if cmps.size > 1
+      if cmps.empty?
+        return { "t" => neg ? "not" : "test", "a" => cond_operand(tokens, form, rel, line, scope, no, bad) }
+      end
+      no.call("`!` cannot be put before a comparison; write the opposite comparison (`a != b`)") if neg
+      i = cmps.first
+      { "t" => "cmp", "op" => tokens[i], "a" => cond_operand(tokens[0...i], form, rel, line, scope, no, bad),
+        "b" => cond_operand(tokens[(i + 1)..], form, rel, line, scope, no, bad) }
+    end
+
+    def self.cond_operand(tokens, form, rel, line, scope, no, bad)
+      one = tokens.first.to_s
+      return { "lit" => "str", "text" => one[1...-1] } if tokens.size == 1 && one.match?(/\A"[^"]*"\z/)
+      return { "lit" => "int", "text" => one } if tokens.size == 1 && one.match?(/\A-?\d+\z/)
+      return { "lit" => "bool", "text" => one } if tokens.size == 1 && %w[true false].include?(one)
+
+      shape = tokens.each_with_index.all? { |t, i| i.odd? ? t == "." : t.match?(/\A[A-Za-z_][A-Za-z0-9_]*\??\z/) }
+      unless shape && tokens.size.odd? && tokens.size <= 5 && !tokens[0].end_with?("?")
+        no.call("`#{tokens.join}` is not a name, a literal (\"text\", an integer, true or false), `local.field` or a method (#{COND_METHODS.join(", ")})")
+      end
+      names = tokens.each_slice(2).map(&:first)
+      base = names[0]
+      no.call("`yield` is a layout's child output, not a local") if base == "yield"
+      if scope[:closed].include?(base)
+        bad.call("#{rel}:#{line}: `#{base}` is a loop variable used outside its `{% for %}`; it exists only between `{% for %}` and `{% endfor %}`")
+      end
+      method = nil
+      method = names.pop if names.size > 1 && COND_METHODS.include?(names.last) && (names.last.end_with?("?") || names.size == 3)
+      if names.size > 2 || names.any? { |n| n.end_with?("?") }
+        no.call("`#{tokens.join}` is not `local`, `local.field` or either followed by a method (#{COND_METHODS.join(", ")})")
+      end
+      { "name" => base, "field" => names[1], "method" => method, "var" => scope[:open].include?(base) }
+    end
+
+    # `{% if a == b %}`: equality between two names, each a local, a loop variable or a field of one. The
+    # segment is the left name as a one-name condition has it, plus `eq`, the right name in the same shape.
+    # Whether the two have one scalar type is checked where the locals are known (Body#if_equality).
+    def self.equality_directive(form, rel, line, scope, bad:)
+      sides = form.split("==", -1)
+      if sides.size != 2
+        bad.call("#{rel}:#{line}: `{% if #{form} %}` has more than one `==`; a condition is one name, or `a == b` between two names")
+      end
+      names = sides.map do |text|
+        text = text.strip
+        base, dot, field = text.partition(".")
+        side =
+          if text.match?(NAME)
+            { "name" => text, "field" => nil, "var" => scope[:open].include?(text) }
+          elsif base.match?(NAME) && !dot.empty? && field.match?(NAME)
+            { "name" => base, "field" => field, "var" => scope[:open].include?(base) }
+          end
+        if base.match?(NAME) && scope[:closed].include?(base)
+          bad.call("#{rel}:#{line}: `#{base}` is a loop variable used outside its `{% for %}`; it exists only between `{% for %}` and `{% endfor %}`")
+        end
+        side or bad.call("#{rel}:#{line}: `{% if #{form} %}`: `#{text}` is not a name; a condition is one name, or `a == b` between " \
+                         "two names (a local, or a loop variable's field `x.field`), with no literal, call, filter or negation")
+      end
+      { "kind" => "if", "name" => names[0]["name"], "field" => names[0]["field"], "var" => names[0]["var"], "eq" => names[1],
+        "line" => line, "then" => [], "else" => [] }
     end
 
     # The end of a raw region: the next `{% endraw %}` after `from`, as [the position after it, the position
@@ -503,6 +630,7 @@ module AxumDsl
       return partial(form, rel, line, scope, bad: bad) if form.match?(/\Apartial\s*:/)
       return { "kind" => "csrf", "line" => line } if form == "csrf_token"
       return asset_path_marker(form, rel, line, bad: bad) if form.match?(/\Aasset_path(\s|\z)/)
+      return t_marker(form, rel, line, scope, bad: bad) if form.match?(/\At\s+"/)
       return signed_global_id_marker(form, rel, line, scope, bad: bad) if form.match?(/\Arails_signed_global_id(\s|\z)/)
       return signed_id_marker(form, rel, line, scope, bad: bad) if form.match?(/\Arails_signed_id(\s|\z)/)
       return variation_marker(form, rel, line, scope, bad: bad) if form.match?(/\Aactive_storage_variation(\s|\z)/)
@@ -548,6 +676,26 @@ module AxumDsl
                  "one of its named regions with `{{ yield :nav }}`, a symbol with no filter")
       end
       { "kind" => "yield_region", "name" => m[1], "line" => line }
+    end
+
+    # One `{{ t ".title" }}` or `{{ t "greeting", name: user_name }}`: Rails' translation lookup, written escaped like any
+    # other string. The key is a double-quoted string (a leading `.` is Rails' lazy form, relative to this view's path),
+    # each keyword is a local or a loop variable's field, read exactly as `{{ name }}` reads it. Whether the key is in the
+    # locale files and the keywords match the text's `%{name}`s is checked where the render is compiled (Body#i18n_call).
+    def self.t_marker(form, rel, line, scope, bad:)
+      rest = form.sub(/\At\s+/, "")
+      name = /[A-Za-z_][A-Za-z0-9_]*(?:\.[A-Za-z_][A-Za-z0-9_]*)?/
+      unless rest.match?(/\A"[^"]+"(?:\s*,\s*[a-z_][a-z0-9_]*:\s*#{name})*\z/)
+        bad.call("#{rel}:#{line}: `t` takes a double-quoted key and keywords naming locals, as in " \
+                 "`{{ t \".title\" }}` or `{{ t \"greeting\", name: user_name }}`")
+      end
+      key = rest[/\A"([^"]+)"/, 1]
+      args = {}
+      rest.scan(/,\s*([a-z_][a-z0-9_]*):\s*(#{name})/) do |arg, value|
+        bad.call("#{rel}:#{line}: `t` passes `#{arg}:` twice") if args.key?(arg)
+        args[arg] = named(value, "escaped", rel, line, scope, bad: bad)
+      end
+      { "kind" => "t", "key" => key, "args" => args, "line" => line }
     end
 
     # One `{{ asset_path "campfire.css" }}`: a file under the one `static ... digest: true` mount. The path
@@ -734,7 +882,13 @@ module AxumDsl
         [{ "kind" => "bool", "text" => m[0] }, s[m.end(0)..] || ""]
       elsif (m = s.match(/\A[A-Za-z_][A-Za-z0-9_]*/))
         rest = s[m.end(0)..] || ""
-        return [{ "kind" => "name", "text" => m[0] }, rest] unless scope[:open].include?(m[0])
+        unless scope[:open].include?(m[0])
+          # `page.name`: a field of a record local.
+          dotted = rest.match(/\A\.([A-Za-z_][A-Za-z0-9_]*)/)
+          return [{ "kind" => "name", "text" => m[0] }, rest] unless dotted
+
+          return [{ "kind" => "name", "text" => m[0], "field" => dotted[1] }, rest[dotted.end(0)..] || ""]
+        end
 
         field = rest.match(/\A\.([A-Za-z_][A-Za-z0-9_]*)/)
         [{ "kind" => "name", "text" => m[0], "var" => true, "field" => field && field[1] }, field ? rest[field.end(0)..] || "" : rest]
@@ -789,6 +943,10 @@ module AxumDsl
         return { "kind" => kind, "name" => name, "field" => nil, "var" => true, "line" => line }
       end
       bad.call(outside) if name.match?(NAME) && scope[:closed].include?(name)
+      if !dot.empty? && base.match?(NAME) && field.match?(NAME)
+        # `{{ page.name }}`: a field of a record local, checked where the locals are known (Body#record_marker).
+        return { "kind" => kind, "name" => base, "field" => field, "var" => false, "line" => line }
+      end
       bad.call("#{rel}:#{line}: `{{ #{name} }}` is not a marker; #{FORMS}") unless name.match?(NAME)
 
       { "kind" => kind, "name" => name, "line" => line }

@@ -91,11 +91,21 @@ module AxumDsl
       end
     end
 
+    # `enabled: :name` (an integer setting read on each request, 0 is off) puts the app behind no front at all, as
+    # Rails' test environment answers without Thruster: no deflate, no cache, no Date.
     def items(ir)
+      enabled = entry(ir)&.[]("enabled")
+      runtime = RUNTIME.lines.map(&:chomp)
+      if enabled
+        runtime = runtime.map { |l| l.sub("async fn axum_dsl_front(request:", "async fn axum_dsl_front_on(request:") }
+        runtime += ["", "async fn axum_dsl_front(request: ::axum::extract::Request, next: ::axum::middleware::Next) -> ::axum::response::Response {",
+                    "    if settings().#{enabled} == 0 {", "        return next.run(request).await;", "    }",
+                    "    axum_dsl_front_on(request, next).await", "}"]
+      end
       [
         "// use_layer :front: Rack::Deflater and Thruster's response cache in front of the app: written by the compiler",
         "const AXUM_DSL_FRONT_CAPACITY: usize = #{cache_mb(ir)} * 1024 * 1024;",
-        *RUNTIME.lines.map(&:chomp),
+        *runtime,
         ""
       ]
     end

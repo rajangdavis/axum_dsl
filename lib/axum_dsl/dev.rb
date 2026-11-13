@@ -8,7 +8,8 @@ module AxumDsl
 
     module_function
 
-    # `emit` is called with the IR and writes the crate. Returns the exit status.
+    # `emit` is called with the IR, writes the crate and answers whether it is pinned (build then runs --locked).
+    # Returns the exit status.
     def run(file, out:, release:, emit:, io: $stderr)
       Session.new(file, out, release, emit, io).run
     end
@@ -65,8 +66,8 @@ module AxumDsl
         @watch = (ir["inputs"].uniq + [@file]).uniq
         @snap = stamps
         AxumDsl::Notify.report
-        @emit.call(ir)
-        AxumDsl::CargoBuild.run(@out, release: @release, io: @io) || (@io.puts("axum_dsl dev: build failed; keeping the running server"); false)
+        locked = @emit.call(ir)
+        AxumDsl::CargoBuild.run(@out, release: @release, locked: locked, io: @io) || (@io.puts("axum_dsl dev: build failed; keeping the running server"); false)
       rescue AxumDsl::CompileError => e
         @io.puts e.message
         false

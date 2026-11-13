@@ -1,0 +1,8 @@
+en:
+  bots:
+    index:
+      title: "Chat bots"
+      welcome: "Welcome, %{name}!"
+      only_in_english: "Bots can post to any room."
+  health:
+    ok: "All good"

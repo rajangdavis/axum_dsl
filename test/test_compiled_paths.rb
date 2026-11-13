@@ -209,8 +209,12 @@ class TestCompiledPaths < Minitest::Test
     assert_includes msg, "writes `{% args %}` once"
   end
 
-  def test_args_in_a_view_rendered_directly_is_refused
-    assert_raises(AxumDsl::CompileError) { compile(%(get "/" do\n  render :home\nend\n), views: { "views/home.html" => "{% args %}x\n" }) }
+  # A page may declare `{% args %}` (defaults for its own locals); like a partial, it then lists exactly the names it reads.
+  def test_args_in_a_view_rendered_directly_lists_what_the_view_reads
+    compile(%(get "/" do\n  render :home\nend\n), views: { "views/home.html" => "{% args %}x\n" })
+    assert_raises(AxumDsl::CompileError) do
+      compile(%(get "/" do\n  render :home, locals: { name: "a" }\nend\n), views: { "views/home.html" => "{% args %}{{ name }}\n" })
+    end
   end
 
   # `{% for %}`: a route that renders `notes` (a database record list) through views/home.html.
@@ -264,6 +268,39 @@ class TestCompiledPaths < Minitest::Test
     refute_includes main, 'db_run("touch_message"', "the execute wrapper is omitted too"
     refute_includes main, "query_count_messages().await?", "inside the block the pooled wrapper is not called"
     assert_includes main, "#[allow(dead_code)]\nasync fn db_run<T: Send + 'static>(", "with no wrapper, db_run is allowed dead"
+  end
+
+  # Writes (a statement that writes, and every `db_tx`) go to ONE writer thread as boxed closures with a oneshot reply,
+  # as once-campfire-rust/crates/db/src/database.rs does: no async lock around them, no pooled connection to check out.
+  def test_writes_run_on_one_writer_thread_with_no_lock_around_interact
+    main = compile(<<~RB)
+      database :sqlite, path: "x.db"
+
+      query :count_messages, args: {}, returns: :i64, sql: "SELECT COUNT(*) FROM messages"
+      execute :touch_message, args: { id: :i64 }, sql: "UPDATE messages SET body = body WHERE id = :id"
+
+      post "/messages" do
+        message_id = transaction do
+          id = count_messages
+          touch_message(id: id)
+          id
+        end
+        touch_message(id: message_id)
+        total = count_messages
+        text(total.to_s)
+      end
+    RB
+    assert_includes main, "type DbWrite = Box<dyn FnOnce(&mut rusqlite::Connection) + Send>;"
+    assert_includes main, "static DB_WRITER: std::sync::OnceLock<std::sync::mpsc::Sender<DbWrite>>"
+    assert_includes main, '.name("db-writer".into())'
+    assert_includes main, "async fn db_write<T: Send + 'static>("
+    assert_includes main, 'db_write("query", name, move |__c| {', "db_run sends a write to the writer"
+    assert_includes main, 'db_write("transaction", name, move |__c| {', "db_tx sends its IMMEDIATE transaction there"
+    assert_includes main, "transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)"
+    assert_includes main, "std::panic::catch_unwind", "a panicking write answers its caller and the writer lives on"
+    refute_includes main, "DB_WRITE_LOCK", "writes queue on the writer thread, not behind an async lock"
+    refute_includes main, ".interact(", "no pooled connection hand-off"
+    refute_includes main, "deadpool_sqlite", "no pool in the emitted code"
   end
 
   # A route rendering views/home.html with the string list `names` and the integer list `ns`.
@@ -351,6 +388,103 @@ class TestCompiledPaths < Minitest::Test
 
   # Inside a transaction a statement's arguments are lowered in the block's `move` closure, after BEGIN, so
   # they may only read what already exists: a local, a field read and `params[...]` pass; a call is refused.
+  # The db_tx closure is `move`, so it would take the outer locals it reads; each one is cloned first, so the body can
+  # still read it after the block (rustc E0382 otherwise: a token stored in the transaction, then set as a cookie).
+  def test_a_transaction_clones_the_outer_locals_it_reads
+    main = compile(<<~RB)
+      database :sqlite, path: "x.db"
+
+      execute :start_session, args: { token: :string }, sql: "INSERT INTO sessions (token) VALUES (:token)"
+
+      post "/session" do
+        token = random_token
+        started = transaction do
+          start_session(token: token)
+        end
+        text("\#{started} \#{token}")
+      end
+    RB
+    assert_includes main, '{ let token = token.clone(); let __out = db_tx("transaction", move |__tx| {'
+    assert_includes main, "query_start_session_on(__tx, token.clone())"
+  end
+
+  # A ternary passed to a query is one argument between commas, so it carries no parens of its own (rustc's
+  # unused_parens, an error under -Dwarnings).
+  def test_a_ternary_query_argument_has_no_parens
+    main = compile(<<~RB)
+      database :sqlite, path: "x.db"
+
+      params :RoleIn do
+        field :role, :string, in: :form
+      end
+
+      execute :set_role, args: { role: :i64 }, sql: "UPDATE users SET role = :role"
+
+      post "/role", params: :RoleIn do
+        set_role(role: params[:role] == "administrator" ? 1 : 0)
+        text("ok")
+      end
+    RB
+    assert_includes main, 'query_set_role(if role == "administrator" { 1 } else { 0 }).await?'
+  end
+
+  # params[:x] is the Rust binding `x`, so a later read past a local named `x` would see the local: refused.
+  def test_a_local_may_not_hide_a_params_field_that_is_read_after_it
+    src = <<~RB
+      params :RoleIn do
+        field :role, :string, in: :form
+      end
+
+      post "/role", params: :RoleIn do
+        role = "admin"
+        text(params[:role] + role)
+      end
+    RB
+    err = assert_raises(AxumDsl::CompileError) { compile(src) }
+    assert_includes err.message, "params[:role] is hidden here by the local `role`"
+    assert_includes compile(src.gsub("role = \"admin\"", "kept = \"admin\"").gsub("+ role)", "+ kept)")), "kept"
+    rebind = compile(src.gsub("role = \"admin\"", "role = params[:role]"))
+    assert_includes rebind, "let role = role;", "rebinding the same value is allowed"
+  end
+
+  # A transaction run only for its effects stands as a statement; its value is dropped (`;`), so no local is left unread.
+  def test_a_transaction_may_stand_as_a_statement
+    main = compile(<<~RB)
+      database :sqlite, path: "x.db"
+
+      execute :touch_note, args: { id: :i64 }, sql: "UPDATE notes SET body = body WHERE id = :id"
+
+      post "/touch" do
+        transaction do
+          touch_note(id: 1)
+          touch_note(id: 2)
+        end
+        text("ok")
+      end
+    RB
+    assert_includes main, 'let __out = db_tx("transaction", move |__tx| { query_touch_note_on(__tx, 1)?; Ok(query_touch_note_on(__tx, 2)?) }).await?; __out };'
+  end
+
+  # Narrowing an upload with `if x.nil? ... else x.store(...) end` binds it; a later read of x keeps it (a clone).
+  def test_an_upload_narrowed_by_nil_is_still_there_afterwards
+    main = compile(<<~RB)
+      params :LogoIn do
+        field :logo, :upload, in: :form
+      end
+
+      post "/logo", params: :LogoIn do
+        logo = params[:logo]
+        key = if logo.nil?
+          ""
+        else
+          logo.store("/tmp")
+        end
+        text("\#{key} \#{logo.nil?}")
+      end
+    RB
+    assert_includes main, "match logo.clone() {"
+  end
+
   def test_a_transaction_statement_argument_may_read_a_local_and_a_field
     main = narrow(NARROW_NOTES + <<~RB)
       params :MessageIn do
@@ -651,6 +785,65 @@ class TestCompiledPaths < Minitest::Test
     RB
     assert_match(/\bif n == 1 \{/, main, "the comparison is the condition")
     refute_match(/\bif \(/, main, "and carries no parentheses")
+  end
+
+  EQ_PARAMS = <<~RB
+    params :U do
+      field :id, :i64
+      field :name, :string
+    end
+
+    params :Q do
+      field :a, :i64
+      field :b, :i64
+      field :s, :string
+      field :t, :string
+      field :f, :bool
+      field :g, :bool
+      field :x, :f64
+      field :users, list(:U)
+    end
+  RB
+
+  # A route that assigns exactly the locals it passes (an assigned local nothing reads is refused).
+  def eq_body(locals)
+    names = locals.scan(/(\w+):/).flatten
+    EQ_PARAMS + "post \"/q\", params: :Q do\n#{names.map { |n| "  #{n} = params[:#{n}]\n" }.join}  render :home, locals: { #{locals} }\nend\n"
+  end
+
+  def eq_route(view, locals)
+    compile(eq_body(locals),
+            views: { "views/home.html" => view })
+  end
+
+  def eq_refusal(view, locals)
+    refusal(eq_body(locals),
+            extra: { "views/home.html" => view })
+  end
+
+  # `{% if a == b %}`: equality between two names, by value, with an `{% else %}` as for a one-name condition.
+  def test_an_if_compares_two_integers_two_strings_and_two_bools
+    assert_match(/\bif a == b \{/, eq_route("{% if a == b %}same{% else %}diff{% endif %}\n", "a: a, b: b"))
+    assert_includes eq_route("{% if s == t %}same{% endif %}\n", "s: s, t: t"), "s.as_str() == t.as_str()"
+    assert_match(/\bif f == g \{/, eq_route("{% if f == g %}same{% endif %}\n", "f: f, g: g"))
+  end
+
+  def test_an_if_compares_a_loop_field_with_a_local
+    main = eq_route("{% for u in users %}{% if u.id == a %}<b>{{ u.name }}</b>{% else %}{{ u.name }}{% endif %}{% endfor %}\n", "users: users, a: a")
+    assert_match(/\bif __it_u\.id == a \{/, main)
+    main = eq_route("{% for u in users %}{% if u.name == s %}x{% endif %}{% endfor %}\n", "users: users, s: s")
+    assert_includes main, "__it_u.name.as_str() == s.as_str()"
+  end
+
+  def test_an_equality_refuses_what_is_not_two_names_of_one_type
+    assert_match(/\bif a != b \{/, eq_route("{% if a != b %}x{% endif %}\n", "a: a, b: b"))
+    assert_match(/\bif a == 1 \{/, eq_route("{% if a == 1 %}x{% endif %}\n", "a: a"))
+    assert_includes eq_refusal("{% if a == b == s %}x{% endif %}\n", "a: a, b: b, s: s"), "more than one comparison"
+    assert_includes eq_refusal("{% if a && b %}x{% endif %}\n", "a: a, b: b"), "a condition is a `bool` or a nil-able value"
+    msg = eq_refusal("{% if a == s %}x{% endif %}\n", "a: a, s: s")
+    assert_includes msg, "Integer (i64)"
+    assert_includes msg, "String"
+    assert_includes eq_refusal("{% if x == x %}x{% endif %}\n", "x: x"), "Float"
   end
 
   # `|sanitize`: a string local goes to the compiler's sanitiser with no escaper around it, and the crate gains
@@ -1035,6 +1228,67 @@ class TestCompiledPaths < Minitest::Test
     RB
     assert_includes message, "but this route skips `:authenticate`"
     assert_includes message, "drop `:authenticate` from the route's `skip:`"
+  end
+
+  MISSING_DECLS = <<~RB
+    database :sqlite, path: "paths.sqlite3"
+    record :Flags do
+      field :id, :i64
+      field :title, :string
+    end
+    query :flags_for, args: { id: :i64 }, returns: :Flags?, sql: "SELECT id, title FROM flags WHERE id = :id"
+  RB
+
+  # `returns: :Record, missing:` is a non-nil current: the reader has the record type (a `.field` read needs no `|| raise`),
+  # an empty body fails the request as `raise` does, and the failure is not cached (the cell is only set on Ok).
+  def test_a_missing_current_reads_non_nil_and_fails_like_raise
+    main = compile(MISSING_DECLS + <<~RB)
+      current :flags, returns: :Flags, reader: :current_flags, missing: "the flags were not read back" do
+        flags_for(id: 1)
+      end
+
+      get "/t" do
+        text(current_flags.title + current(:flags).title)
+      end
+
+      get "/r" do
+        flags = flags_for(id: 2) || raise("the flags were not read back")
+        text(flags.title)
+      end
+    RB
+    assert_includes main, "::tokio::sync::OnceCell<Flags>,", "the cell holds the record, not an Option"
+    assert_includes main, %q{None => Err("the flags were not read back".to_string()),}, "the same Err(String) a raise returns"
+    assert_includes main, "Some(__row) => Ok(__row),"
+    assert_includes main, %q{return Err("the flags were not read back".to_string())}, "raise compiles to the same Err"
+  end
+
+  def test_a_nil_able_current_is_unchanged_beside_missing
+    main = compile(MISSING_DECLS + <<~RB)
+      current :flags, returns: :Flags? do
+        flags_for(id: 1)
+      end
+
+      get "/t" do
+        flags = current(:flags) || raise("gone")
+        text(flags.title)
+      end
+    RB
+    assert_includes main, "::tokio::sync::OnceCell<Option<Flags>>,"
+    refute_includes main, "Some(__row) => Ok(__row)"
+  end
+
+  def test_missing_is_refused_where_it_does_not_apply
+    body = "get \"/t\" do\n  text(current(:flags).to_s)\nend\n"
+    message = refusal(MISSING_DECLS + "current :flags, returns: :Flags do\n  flags_for(id: 1)\nend\n" + body)
+    assert_includes message, "returns: :Flags?"
+    assert_includes message, "returns: :Flags, missing: \"message\""
+    message = refusal(MISSING_DECLS + "current :flags, returns: :Flags?, missing: \"gone\" do\n  flags_for(id: 1)\nend\n" + body)
+    assert_includes message, "`missing:` is for a current that returns a record without `?`"
+    message = refusal(MISSING_DECLS + "current :flags, returns: :Flags, missing: \"gone\", required: :authenticate do\n  flags_for(id: 1)\nend\n" + body)
+    assert_includes message, "says both `missing:` and `required:`"
+    message = refusal(MISSING_DECLS + "current :flags, returns: :Flags, missing: \"gone\" do\n  flags_for(id: 1)\nend\n" +
+                      "cable \"/cable\", authenticate_with: :flags do\n  channel \"HeartbeatChannel\"\nend\n")
+    assert_includes message, "needs a nil-able current"
   end
 
   # The skip is matched at run time, so it may not overlap a route that does not skip the filter.

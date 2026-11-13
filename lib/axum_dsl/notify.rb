@@ -20,7 +20,11 @@ module AxumDsl
               "N-EXEC-INJECTED" => :notice,
               "N-BINDING" => :notice,
               "N-OPENAPI" => :notice,
-              "N-DEPRECATED-FEATURE" => :notice }.freeze
+              "N-DEPRECATED-FEATURE" => :notice,
+              "N-VIEW-LOCALS" => :notice,
+              "N-DESTROY" => :notice,
+              "N-ATTACHED" => :notice,
+              "N-PATH-PARAM-DERIVED" => :notice }.freeze
     GATES = { warning: "AXUM_DSL_WARN", notice: "AXUM_DSL_NOTICE" }.freeze
 
     @notes = []

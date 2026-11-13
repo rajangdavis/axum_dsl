@@ -10,7 +10,9 @@ _See also: [README](../README.md)._
 make check-fast     # dsl-check, rbi-check, test-ruby, typecheck (no Rust builds)
 make check-build    # test-ruby-rust, test-diff (the generated-Rust suites)
 make check-e2e      # the e2e of the example services
-make check          # check-fast, check-build and check-e2e
+make check          # check-fast, check-build, check-e2e and audit
+make vet-lock       # re-resolve lib/axum_dsl/vetted/Cargo.lock from the examples (bin/vet_lock), then audit it
+make audit          # cargo audit on the vetted lock (needs cargo-audit)
 make test-ruby      # Ruby tests: the whole test/test_*.rb glob (shims, goldens, refusals, LSP, Rust::Int)
 make test-ruby-rust # L5 in Ruby: build a generated crate and drive it over HTTP
 make test-diff      # generate a Rust test per catalog and binding example, and run cargo test

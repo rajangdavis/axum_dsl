@@ -26,8 +26,9 @@ module AxumDsl
 
         head = head_before(lines[line0].to_s, utf16_col)
         prefix = tail_word(head)
-        case context_at(lines, line0)
-        when :top then declarations(:top, prefix)
+        context = context_at(lines, line0)
+        case context
+        when :top, :model, :controller then declarations(context, prefix)
         when :params then field_items(head, prefix)
         else []
         end
@@ -67,7 +68,8 @@ module AxumDsl
       end
 
       # The `do ... end` block the cursor sits in, by a line scan: the innermost block is `params` (fields),
-      # `fragment` (declarations at the top level), or a declaration block whose body is Ruby.
+      # `fragment` (declarations at the top level), `model` or `controller` (the declarations each holds), or a
+      # declaration block whose body is Ruby.
       def context_at(lines, line0)
         stack = []
         lines[0...line0].each do |line|
@@ -80,7 +82,10 @@ module AxumDsl
         end
         case stack.last
         when nil, "fragment" then :top
-        when "params", "record" then :params
+        when "model" then :model
+        when "controller" then :controller
+        when "resources", "scope" then :top
+        when "params", "record", "table" then :params
         else :body
         end
       end

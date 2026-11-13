@@ -73,19 +73,16 @@ impl User {
     }
 }
 
-// the database (database :sqlite): the pool, the startup checks and the statements below are written by the compiler
-static DB: std::sync::OnceLock<deadpool_sqlite::Pool> = std::sync::OnceLock::new();
-
-fn db() -> &'static deadpool_sqlite::Pool {
-    DB.get().expect("the database is opened before the server starts")
-}
-
-// Writers queue here, in the process, instead of in SQLite's busy handler (which sleeps 1 to 100 ms between
-// retries): once-campfire-rust/crates/db/src/database.rs runs every write on one thread for the same reason.
-// Taken before a pooled connection, so a waiting writer holds none. DB_WRITES says, per DB_STATEMENTS entry,
-// whether the statement writes (sqlite3_stmt_readonly, so a RETURNING write counts); reads never take it.
-static DB_WRITE_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+// the database (database :sqlite): the writer and reader threads, the startup checks and the statements below are written by the compiler
+// DB_WRITES says, per DB_STATEMENTS entry, whether the statement writes (sqlite3_stmt_readonly, so a RETURNING write counts).
 static DB_WRITES: std::sync::OnceLock<Vec<bool>> = std::sync::OnceLock::new();
+
+// Every write (a statement DB_WRITES marks, and every transaction) is a boxed closure sent to ONE writer thread that owns
+// one connection and runs them in arrival order, back to back, as once-campfire-rust/crates/db/src/database.rs does:
+// writers queue in the process instead of in SQLite's busy handler (which sleeps 1 to 100 ms between retries), and no
+// async lock is held across a thread hand-off. The reply comes back on a oneshot, like a read's.
+type DbWrite = Box<dyn FnOnce(&mut rusqlite::Connection) + Send>;
+static DB_WRITER: std::sync::OnceLock<std::sync::mpsc::Sender<DbWrite>> = std::sync::OnceLock::new();
 
 // Reads run on threads of their own, not tokio's blocking pool, as in once-campfire-rust/crates/db/src/database.rs: there a read
 // that found every connection busy parked a blocking thread, while here a waiting read costs a queue entry and a reader
@@ -114,7 +111,32 @@ fn db_reader(mut __c: rusqlite::Connection) {
     }
 }
 
-// Runs the statement DB_STATEMENTS[index]: a read on a reader thread, a write on a pooled connection; an error names the query.
+// Sends `work` to the writer thread and waits for its answer; an error names the `kind` (query or transaction) and `name`.
+// A panic in `work` is caught on the writer thread (as a reader does), so it answers this caller and the thread lives on.
+async fn db_write<T: Send + 'static>(
+    kind: &'static str,
+    name: &'static str,
+    work: impl FnOnce(&mut rusqlite::Connection) -> rusqlite::Result<T> + Send + 'static,
+) -> Result<T, String> {
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    let job: DbWrite = Box::new(move |__c| {
+        let __out = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| work(__c)));
+        let _ = tx.send(__out);
+    });
+    let Some(writer) = DB_WRITER.get() else {
+        return Err(format!("{kind} `{name}`: the database writer is gone"));
+    };
+    if writer.send(job).is_err() {
+        return Err(format!("{kind} `{name}`: the database writer is gone"));
+    }
+    match rx.await {
+        Ok(Ok(out)) => out.map_err(|e| format!("{kind} `{name}`: {e}")),
+        Ok(Err(_)) => Err(format!("{kind} `{name}`: the write panicked")),
+        Err(_) => Err(format!("{kind} `{name}`: the database writer is gone")),
+    }
+}
+
+// Runs the statement DB_STATEMENTS[index]: a read on a reader thread, a write on the writer thread; an error names the query.
 async fn db_run<T: Send + 'static>(
     index: usize,
     name: &'static str,
@@ -134,16 +156,12 @@ async fn db_run<T: Send + 'static>(
             Err(_) => Err(format!("query `{name}`: the database reader is gone")),
         };
     }
-    let _write = if DB_WRITES.get().is_some_and(|w| w[index]) { Some(DB_WRITE_LOCK.lock().await) } else { None };
-    let conn = db().get().await.map_err(|e| format!("query `{name}`: no database connection: {e}"))?;
-    conn.interact(move |__c| {
+    db_write("query", name, move |__c| {
         let __out = work(__c)?;
         db_after_write(__c);
         Ok::<T, rusqlite::Error>(__out)
     })
     .await
-    .map_err(|e| format!("query `{name}`: {e}"))?
-    .map_err(|e| format!("query `{name}`: {e}"))
 }
 
 async fn db_open() -> Result<(), String> {
@@ -151,23 +169,25 @@ async fn db_open() -> Result<(), String> {
         Ok(value) if !value.is_empty() => value,
         _ => "login.sqlite3".to_string(),
     };
-    let pool = deadpool_sqlite::Config::new(path.clone())
-        .builder(deadpool_sqlite::Runtime::Tokio1)
-        .map_err(|e| format!("database {path}: cannot create the connection pool: {e}"))?
-        .post_create(deadpool_sqlite::Hook::async_fn(|conn, _| {
-            Box::pin(async move {
-                conn.interact(db_connection_setup)
-                    .await
-                    .map_err(|e| deadpool_sqlite::HookError::message(e.to_string()))?
-                    .map_err(deadpool_sqlite::HookError::message)
-            })
-        }))
-        .build()
-        .map_err(|e| format!("database {path}: cannot create the connection pool: {e}"))?;
-    let conn = pool.get().await.map_err(|e| format!("database {path}: cannot open it: {e}"))?;
-    conn.interact(db_startup)
-        .await
-        .map_err(|e| format!("database {path}: {e}"))??;
+    let mut __writer = rusqlite::Connection::open(&path).map_err(|e| format!("database {path}: cannot open it: {e}"))?;
+    db_connection_setup(&mut __writer).map_err(|e| format!("database {path}: {e}"))?;
+    let (__send, __jobs) = std::sync::mpsc::channel::<DbWrite>();
+    std::thread::Builder::new()
+        .name("db-writer".into())
+        .spawn(move || {
+            while let Ok(job) = __jobs.recv() {
+                job(&mut __writer);
+            }
+        })
+        .map_err(|e| format!("database {path}: cannot start the writer: {e}"))?;
+    // The startup checks and migrations run on the writer's connection, as its first job.
+    let (__done, __started) = tokio::sync::oneshot::channel();
+    let __job: DbWrite = Box::new(move |__c| {
+        let _ = __done.send(db_startup(__c));
+    });
+    __send.send(__job).map_err(|_| format!("database {path}: the writer stopped during startup"))?;
+    let _ = DB_WRITER.set(__send);
+    __started.await.map_err(|_| format!("database {path}: the writer stopped during startup"))??;
     let (__wake, __woken) = std::sync::mpsc::sync_channel::<()>(1);
     let mut __checkpointer = rusqlite::Connection::open(&path).map_err(|e| format!("database {path}: cannot open the checkpointer connection: {e}"))?;
     db_connection_setup(&mut __checkpointer).map_err(|e| format!("database {path}: {e}"))?;
@@ -191,7 +211,6 @@ async fn db_open() -> Result<(), String> {
             .spawn(move || db_reader(__reader))
             .map_err(|e| format!("database {path}: cannot start a reader: {e}"))?;
     }
-    let _ = DB.set(pool);
     Ok(())
 }
 
@@ -207,14 +226,15 @@ const DB_STATEMENTS: &[(&str, &str, &str, u8, &[&str])] = &[
     ("end_session", "examples/login.axum.rb:53", DB_SQL_END_SESSION, 0, &[]),
 ];
 
-// Per-connection settings, run on every connection the pool opens (journal_mode=WAL is a property of
+// Per-connection settings, run on the writer's and every reader's connection (journal_mode=WAL is a property of
 // the database file and is set once in db_startup). The statement cache holds every declared statement,
 // at least rusqlite's default of 16, so prepare_cached never evicts one it will need again.
 fn db_connection_setup(__c: &mut rusqlite::Connection) -> Result<(), String> {
     __c.execute_batch("PRAGMA synchronous=NORMAL; PRAGMA cache_size=2000; PRAGMA journal_size_limit=67108864;")
         .map_err(|e| format!("database: cannot set the connection pragmas: {e}"))?;
     __c.set_prepared_statement_cache_capacity(16);
-    __c.wal_hook(Some(db_note_wal_size));
+    __c.wal_hook(Some(db_note_wal_size))
+        .map_err(|e| format!("database: cannot install the WAL hook: {e}"))?;
     Ok(())
 }
 
@@ -230,7 +250,7 @@ static DB_CHECKPOINT_RUNNING: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 // SQLite calls this only for a commit that wrote frames, so a write that changed nothing (an UPDATE whose
 // WHERE matched no row) does not move the response cache's generation.
-fn db_note_wal_size(_: &rusqlite::hooks::Wal, pages: std::os::raw::c_int) -> rusqlite::Result<()> {
+fn db_note_wal_size(_: &mut rusqlite::hooks::Wal, pages: std::os::raw::c_int) -> rusqlite::Result<()> {
     DB_WAL_PAGES.store(pages, std::sync::atomic::Ordering::Relaxed);
     Ok(())
 }
@@ -308,6 +328,164 @@ fn db_startup(__c: &mut rusqlite::Connection) -> Result<(), String> {
     }
     let _ = DB_WRITES.set(__writes);
     Ok(())
+}
+
+// `--schema-check`: the startup path above on a fresh in-memory database, which needs neither the settings nor the
+// writer, reader and checkpointer threads and leaves no file behind. Exit status 0 when every statement prepares
+// and returns its record's columns, 2 with the startup message when not.
+fn db_schema_check() -> i32 {
+    let mut __c = match rusqlite::Connection::open_in_memory() {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("database: cannot open an in-memory database: {e}");
+            return 2;
+        }
+    };
+    match db_connection_setup(&mut __c).and_then(|_| db_startup(&mut __c)) {
+        Ok(()) => {
+            println!("schema-check: ok, {} statement(s) prepared", DB_STATEMENTS.len());
+            0
+        }
+        Err(message) => {
+            eprintln!("{message}");
+            2
+        }
+    }
+}
+
+// `--console DB_PATH` (docs/console.md): a read-only line protocol over the declared statements, for axum_dsl console.
+fn db_console_table() -> &'static [(&'static str, &'static str, &'static str, u8, &'static [&'static str])] {
+    DB_STATEMENTS
+}
+
+fn db_console_applied(c: &rusqlite::Connection) -> std::collections::HashMap<String, String> {
+    let read = || -> rusqlite::Result<std::collections::HashMap<String, String>> {
+        let mut stmt = c.prepare("SELECT version, sha256 FROM axum_dsl_migrations")?;
+        let rows = stmt.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))?;
+        rows.collect()
+    };
+    read().unwrap_or_default()
+}
+
+fn db_console(path: Option<String>) -> i32 {
+    use std::io::{BufRead, Write};
+    let Some(path) = path else {
+        eprintln!("usage: --console DB_PATH");
+        return 2;
+    };
+    if !std::path::Path::new(&path).is_file() {
+        eprintln!("console: no database file at {path}");
+        return 2;
+    }
+    let mut c = match rusqlite::Connection::open(&path) {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("console: cannot open {path}: {e}");
+            return 2;
+        }
+    };
+    if let Err(message) = db_connection_setup(&mut c) {
+        eprintln!("{message}");
+        return 2;
+    }
+    if let Err(e) = c.pragma_update(None, "query_only", true) {
+        eprintln!("console: cannot make the connection query_only: {e}");
+        return 2;
+    }
+    let applied = db_console_applied(&c);
+    let mut pending: Vec<String> = Vec::new();
+    for &(file, sha, _) in DB_MIGRATIONS {
+        match applied.get(file) {
+            None => pending.push(file.to_string()),
+            Some(got) if got.as_str() != sha => pending.push(format!("{file} (changed after it was applied)")),
+            Some(_) => {}
+        }
+    }
+    if !pending.is_empty() {
+        eprintln!("console: {path} has migrations that are not applied: {}; start the server once to apply them", pending.join(", "));
+        return 2;
+    }
+    let mut out = std::io::stdout().lock();
+    let _ = writeln!(out, "{}", ::serde_json::json!({ "ready": true, "statements": db_console_table().len() }));
+    let _ = out.flush();
+    for line in std::io::stdin().lock().lines() {
+        let Ok(line) = line else { break };
+        if line.trim().is_empty() {
+            continue;
+        }
+        let reply = db_console_line(&c, &line).unwrap_or_else(|e| ::serde_json::json!({ "error": e }));
+        if writeln!(out, "{reply}").and_then(|_| out.flush()).is_err() {
+            break;
+        }
+    }
+    0
+}
+
+// One request line: the statement DB_STATEMENTS names, its named parameters bound from `args`, every row as JSON.
+fn db_console_line(c: &rusqlite::Connection, line: &str) -> Result<::serde_json::Value, String> {
+    let req: ::serde_json::Value = ::serde_json::from_str(line).map_err(|e| format!("the request is not JSON: {e}"))?;
+    let name = req.get("stmt").and_then(|v| v.as_str()).ok_or_else(|| "the request needs a \"stmt\" name".to_string())?;
+    let none = ::serde_json::Map::new();
+    let args = match req.get("args") {
+        None | Some(::serde_json::Value::Null) => &none,
+        Some(::serde_json::Value::Object(m)) => m,
+        Some(_) => return Err("\"args\" must be an object".to_string()),
+    };
+    let found: Vec<_> = db_console_table().iter().filter(|s| s.0 == name).collect();
+    if found.is_empty() {
+        return Err(format!("no statement `{name}`"));
+    }
+    for s in &found {
+        let probe = c.prepare(s.2).map_err(|e| format!("statement `{name}`: {e}"))?;
+        if !probe.readonly() {
+            return Err(format!("statement `{name}` writes, and the console is read-only"));
+        }
+    }
+    let started = std::time::Instant::now();
+    let mut stmt = c.prepare(found[0].2).map_err(|e| format!("statement `{name}`: {e}"))?;
+    let mut names: Vec<String> = Vec::new();
+    for i in 1..=stmt.parameter_count() {
+        let pname = stmt
+            .parameter_name(i)
+            .map(|p| p.trim_start_matches([':', '@', '$']).to_string())
+            .ok_or_else(|| format!("statement `{name}` has a positional parameter"))?;
+        let value = args.get(&pname).ok_or_else(|| format!("statement `{name}` needs the argument `{pname}`"))?;
+        let bound = match value {
+            ::serde_json::Value::Null => rusqlite::types::Value::Null,
+            ::serde_json::Value::Bool(b) => rusqlite::types::Value::Integer(i64::from(*b)),
+            ::serde_json::Value::Number(n) => match (n.as_i64(), n.as_f64()) {
+                (Some(i), _) => rusqlite::types::Value::Integer(i),
+                (None, Some(f)) => rusqlite::types::Value::Real(f),
+                _ => return Err(format!("argument `{pname}` is not a number SQLite can bind")),
+            },
+            ::serde_json::Value::String(s) => rusqlite::types::Value::Text(s.clone()),
+            _ => return Err(format!("argument `{pname}` must be a number, a string, a bool or null")),
+        };
+        stmt.raw_bind_parameter(i, bound).map_err(|e| format!("argument `{pname}`: {e}"))?;
+        names.push(pname);
+    }
+    if let Some(extra) = args.keys().find(|k| !names.contains(k)) {
+        return Err(format!("statement `{name}` takes no argument `{extra}`"));
+    }
+    let columns: Vec<String> = stmt.column_names().into_iter().map(|n| n.to_string()).collect();
+    let mut rows = stmt.raw_query();
+    let mut out: Vec<::serde_json::Value> = Vec::new();
+    while let Some(row) = rows.next().map_err(|e| format!("statement `{name}`: {e}"))? {
+        let mut cells = Vec::with_capacity(columns.len());
+        for i in 0..columns.len() {
+            let cell = match row.get_ref(i).map_err(|e| format!("statement `{name}`: {e}"))? {
+                rusqlite::types::ValueRef::Null => ::serde_json::Value::Null,
+                rusqlite::types::ValueRef::Integer(n) => ::serde_json::Value::from(n),
+                rusqlite::types::ValueRef::Real(f) => ::serde_json::Number::from_f64(f).map_or(::serde_json::Value::Null, ::serde_json::Value::Number),
+                rusqlite::types::ValueRef::Text(t) => ::serde_json::Value::String(String::from_utf8_lossy(t).into_owned()),
+                rusqlite::types::ValueRef::Blob(b) => ::serde_json::Value::String(format!("<blob, {} bytes>", b.len())),
+            };
+            cells.push(cell);
+        }
+        out.push(::serde_json::Value::Array(cells));
+    }
+    let ms = (started.elapsed().as_secs_f64() * 100_000.0).round() / 100.0;
+    Ok(::serde_json::json!({ "columns": columns, "rows": out, "ms": ms }))
 }
 
 fn db_columns(at: &str, name: &str, got: &[String], fields: &[&str]) -> Result<(), String> {
@@ -707,6 +885,12 @@ fn disable_transparent_huge_pages() {
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     disable_transparent_huge_pages();
+    if std::env::args().nth(1).as_deref() == Some("--console") {
+        std::process::exit(db_console(std::env::args().nth(2)));
+    }
+    if std::env::args().nth(1).as_deref() == Some("--schema-check") {
+        std::process::exit(db_schema_check());
+    }
     match load_settings() {
         Ok(loaded) => {
             let _ = SETTINGS.set(loaded);

@@ -93,7 +93,7 @@ instead. `axum_dsl skill` writes the complete, generated reference; the outline:
   `trim`, `strip` (the same as `trim`, with notice `N-STR-STRIP-RUST`), `to_lowercase`, `to_uppercase`,
   `len` (bytes), `lines`, `split(pat)`, `contains(pat)`, `starts_with?(pat)` and `replace(from, to)`;
   `to_s` leaves it for a plain string, which a body must do before returning it.
-- **Response helpers.** `text(s)`, `html(s)`, `json(value)`, `redirect(path)`, `halt(status, body)` and
+- **Response helpers.** `text(s)`, `html(s)`, `json(value)`, `redirect(path)`, `halt(status, body)`, `head(status)` and
   `render(name, locals: {...})` are values, and the body's last expression is the response; a render
   answers with a view, a `.html` file the compiler reads and compiles into the Rust (see [Views](views.md)).
   `redirect` answers 302 by default and takes `status:` (301, 302, 303, 307, 308); `text`, `html`, `json`
@@ -115,7 +115,8 @@ instead. `axum_dsl skill` writes the complete, generated reference; the outline:
   a request whose `If-None-Match` lists the value (comma-separated, compared after trimming) is answered
   304 with no body and the ETag still set. Only a strong, exact tag matches today: `If-None-Match: *` and a
   weak `W/"v1"` are not matched, and a non-GET request with a matching tag still answers 304 rather than
-  412. `headers` stays literal; `etag` is the computed header, and a body sets it once. A body that ends in
+  412. An empty value writes no ETag (Rails' `stale?(etag: nil)`).
+  `headers` stays literal; `etag` is the computed header, and a body sets it once. A body that ends in
   a plain string is a 200 text response. `send_file(path, content_type: "image/webp")` is the response for
   bytes chosen while the request runs: it awaits `tokio::fs::read` on the path (a string expression), puts the
   bytes on the response with the literal Content-Type, and answers a plain 500 if the read fails. The file is
@@ -162,7 +163,16 @@ instead. `axum_dsl skill` writes the complete, generated reference; the outline:
   `plain_text(html)` is Action Text's `to_plain_text` of a stored body (the conversion a sanitizer's `attachments:` uses, with the
   trailing newlines removed). `request_body` is the whole request body as UTF-8 text (`request.body.read.force_encoding("UTF-8")`),
   for a route; the route cannot also read params `in: :body` or `in: :form` (a friendly compile error), because axum lets one
-  extractor consume the body. `request_path` is the URI path, for a `before` filter. `request_method` is the HTTP method
+  extractor consume the body. `request_upload(:attachment)` is the file part of that name in a multipart body, read like
+  an `:upload` field, or nil (not multipart, malformed, no such file): it reads the same bytes, so a route may read both
+  (Rack's `params[:attachment]` beside `raw_request_body`). `image_variant(path, filename, width, height)` is Active
+  Storage's `variant(resize_to_limit: [width, height])` of the image at `path`, made with libvips as ImageProcessing::Vips
+  makes it (autorot, `thumbnail_image` with `size: :down`, its sharpen mask, the saver `filename`'s extension picks), as an
+  `:upload` value named `filename`: `.store(root)` writes it, and its `size`, `checksum` and `metadata` are the variant
+  blob's. It is nil when the image cannot be read, or when libvips (`libvips.so.42`, opened at run time) is missing; with
+  the same libvips the bytes are Rails' (fuzzed in Campfire's `test/differential/fuzz_image_variant`). `action_text_html(html)` is the body Action Text stores when
+  given `html` (stripped, parsed as an HTML5 fragment and serialized back: `&` becomes `&amp;`, CRLF becomes LF), with
+  scraper's `deterministic` feature so attributes keep their source order, as Nokogiri's do. `request_path` is the URI path, for a `before` filter. `request_method` is the HTTP method
   in upper case (`"GET"`, `"POST"`), for a route and a `before` filter (Rails' `request.get?`/`request.head?`), and it sees
   `use_layer :method_override`'s rewrite. A route's `headers` value may be a string
   expression (`headers "X-Total-Count" => count.to_s`), computed before the response is built like `etag(value)`; an empty
@@ -175,6 +185,22 @@ instead. `axum_dsl skill` writes the complete, generated reference; the outline:
   statements for a route, a `before` filter or a channel callback, never wait for a socket, and need a `cable` declaration (see
   [Action Cable](cable.md)). `close_remote_connections(user.id, reconnect: true)` (Rails' `User#close_remote_connections`) makes every open
   connection of that user id send `{"type":"disconnect","reason":"remote","reconnect":true}` and close; it is a statement of the same kind. `render_string(:view, locals: {...})` renders a view to a String, with no layout, instead of answering with it.
+  `opengraph_unfurl(url)` is Campfire's `Opengraph::Metadata.from_url(url)` as UnfurlLinksController#create answers
+  it: the metadata's JSON when it validates, nil (Rails' `head :no_content`) when it does not. It fetches only http(s)
+  URLs that resolve to a public address (pinned, no proxy), follows at most 10 redirects, reads at most 5 MB of a 200
+  text/html document, keeps the og: title, url, image and description, and checks the image with a HEAD; it is async,
+  so it belongs to a route body.
+  `web_push(endpoint, p256dh, auth, payload, vapid_public, vapid_private, subject)` is one Web Push delivery as
+  Campfire's WebPush::Pool sends it (RFC 8291 aes128gcm, a VAPID ES256 JWT, pinned to the endpoint's public address):
+  1 when the subscription is to be invalidated (404, 410, or a key that is not a P-256 point), else 0.
+  `webhook_post(url, payload)` is Campfire's Webhook#deliver for one bot: the JSON payload POSTed with seven-second
+  timeouts and no proxy, and the reply text the bot posts back (a 200 text/html or text/plain body, or "Failed to
+  respond within 7 seconds" on a timeout), nil otherwise. A `json_object` value may be nil-able (nil is JSON's null),
+  and the crate's serde_json keeps the keys in the order they are written, as Ruby's `to_json` does.
+  `later do ... end` runs its statements after the route has answered, as a spawned task (Rails' `perform_later`
+  jobs and thread pools): locals, queries, transactions, broadcasts, `each` loops and conditional calls, but no
+  response; the task owns clones of the locals, params fields and request values it reads, and a failure is logged
+  with the block's line.
 
 - **Escaping.** `h(value)` escapes `&`, `<`, `>`, `"` and `'` and gives a string: it is what a page
   interpolates, inside `html(...)` or a string. `raw(value)` is the same value with no escaping, and is

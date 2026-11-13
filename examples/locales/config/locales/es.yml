@@ -1,0 +1,7 @@
+es:
+  bots:
+    index:
+      title: "Bots de chat"
+      welcome: "Bienvenido, %{name}!"
+  health:
+    ok: "Todo bien"

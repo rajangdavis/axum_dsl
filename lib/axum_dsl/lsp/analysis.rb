@@ -21,15 +21,24 @@ module AxumDsl
 
       ROW = /\A(.+?):(\d+):(\d+): (.*)\z/
 
-      attr_reader :path, :text, :lines, :diagnostics
+      # real: the document's canonical path. root: the root file this document is spliced into, or nil when it is
+      # compiled on its own. ir: the compiler's result, when the compile succeeded.
+      attr_reader :path, :real, :root, :text, :lines, :diagnostics, :ir, :graph
 
-      def initialize(path, text)
+      # root: the file to compile from when this document is a fragment that a root splices in (Root finds it).
+      # The buffer stands in for the document's file, so the root reads it, and only the diagnostics that belong
+      # to this document are kept.
+      def initialize(path, text, root: nil)
         @path = path
         @real = AxumDsl.canon(path)
+        @root = root
         @text = text.to_s
         @lines = @text.split("\n", -1)
         @diagnostics = []
         @ok = false
+        @ir = nil
+        @collector = nil
+        @graph = TypeGraph.new # how the types derive (hover, definition and references read it)
         compile
       end
 
@@ -37,10 +46,27 @@ module AxumDsl
 
       def line_text(line) = @lines[line - 1].to_s
 
+      # The file the compiler was started on: the root of a fragment, else the document itself.
+      def compile_path = @root || @path
+
+      # What `check --types` would report, for every file of the compile (each entry has its :file, absolute),
+      # as far as the compiler got: a compile that stopped on an error keeps what it had typed.
+      def all_entries = (@all_entries ||= @collector ? @collector.all_entries : [])
+
+      # The entries of this document alone.
+      def entries = (@entries ||= all_entries.select { |e| e[:file] == @real })
+
+      # The DSL files the compile read (the document included), absolute.
+      def dsl_files
+        files = @ir ? @ir["inputs"].to_a : all_entries.map { |e| e[:file] }
+        ([*files, @real].select { |f| f.end_with?(AxumSource::GLOB.delete_prefix("*")) }).uniq
+      end
+
       private
 
       def compile
-        Sources.with(@path, @text) { AxumDsl.read(@path) }
+        @collector = TypeNames::Collector.new(compile_path)
+        Sources.with(@path, @text) { @ir = AxumDsl.read(compile_path, types: @collector, graph: @graph) }
         @ok = true
         @diagnostics = visible_notes
       rescue CompileError => e
@@ -82,14 +108,29 @@ module AxumDsl
         end
         rows = [{ file: @path, line: 1, col: 1, message: error.message.to_s }] if rows.empty?
         last = rows.size - 1
-        rows.each_with_index.map do |row, i|
+        elsewhere = false
+        rows.each_with_index.filter_map do |row, i|
           ours = AxumDsl.canon(row[:file]) == @real
+          if @root && !ours
+            # Compiled from a root: another file's error is not this document's. One note says where it stopped.
+            next if elsewhere
+
+            elsewhere = true
+            next stopped_elsewhere(row)
+          end
           line = ours ? row[:line] : use_dsl_line(row[:file])
           message = ours ? row[:message] : "#{row[:file]}:#{row[:line]}:#{row[:col]}: #{row[:message]}"
           Diagnostic.new(line: line, col: ours ? row[:col] : 1,
                          end_col: ours ? token_end(line, row[:col]) : line_text(line).bytesize + 1,
                          message: message, suggestions: i == last ? Array(error.suggestions) : [])
         end
+      end
+
+      # An information note at line 1: the compile from the root stopped on an error in another file.
+      def stopped_elsewhere(row)
+        Diagnostic.new(line: 1, col: 1, end_col: token_end(1, 1), severity: 3,
+                       message: "compiling #{File.basename(@root)} stopped in #{row[:file]}:#{row[:line]}:#{row[:col]}: " \
+                                "#{row[:message].lines.first.to_s.strip}")
       end
 
       # The line of this document that pulls `file` in, or 1 when nothing names it (a fragment that comes in

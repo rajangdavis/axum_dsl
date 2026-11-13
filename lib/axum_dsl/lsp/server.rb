@@ -35,6 +35,7 @@ module AxumDsl
         @input = input
         @output = output
         @documents = {}
+        @roots = Root.new(glob: AxumSource::GLOB, includes: AxumSource.method(:includes), root: AxumSource.method(:root?))
         @shutdown = false
         @exit = false
         @input.binmode if @input.respond_to?(:binmode)
@@ -136,6 +137,8 @@ module AxumDsl
           when "initialize" then initialize_result
           when "shutdown" then (@shutdown = true) && nil
           when "textDocument/hover" then hover(params)
+          when "textDocument/definition" then definition(params)
+          when "textDocument/references" then references(params)
           when "textDocument/completion" then completion(params)
           else
             if EMPTY_ANSWERS_RESULT.key?(method)
@@ -153,6 +156,7 @@ module AxumDsl
         when "exit" then @exit = true
         when "textDocument/didOpen"
           doc = params["textDocument"] || {}
+          @roots.forget(uri_to_path(doc["uri"])) if doc["uri"]
           store(doc["uri"], doc["text"], doc["version"])
         when "textDocument/didChange"
           changes = Array(params["contentChanges"])
@@ -179,6 +183,8 @@ module AxumDsl
           capabilities: {
             textDocumentSync: { openClose: true, change: 1, save: { includeText: false } },
             hoverProvider: true,
+            definitionProvider: true,
+            referencesProvider: true,
             completionProvider: { triggerCharacters: [":"] }
           },
           serverInfo: { name: "axum_dsl", version: AxumDsl::VERSION }
@@ -209,8 +215,10 @@ module AxumDsl
       # or a rust_file is read from its buffer too, then puts the shared table back.
       def analyse(uri)
         doc = @documents[uri]
+        path = uri_to_path(uri)
         table = @documents.to_h { |u, d| [uri_to_path(u), d.text] }
-        analysis = Sources.with_all(table) { Analysis.new(uri_to_path(uri), doc.text) }
+        # A fragment is compiled from the root that splices it in (Root), with the open buffers over the files.
+        analysis = Sources.with_all(table) { Analysis.new(path, doc.text, root: @roots.find(path)) }
         Document.new(doc.text, doc.version, analysis)
       end
 
@@ -268,7 +276,7 @@ module AxumDsl
         return doc.analysis if doc
 
         path = uri_to_path(uri)
-        Analysis.new(path, Sources[path] || File.read(path, encoding: "UTF-8"))
+        Analysis.new(path, Sources[path] || File.read(path, encoding: "UTF-8"), root: @roots.find(path))
       rescue SystemCallError
         nil
       end
@@ -279,6 +287,23 @@ module AxumDsl
 
         position = params["position"] || {}
         guarded(nil) { Hover.at(analysis, position["line"].to_i, position["character"].to_i) }
+      end
+
+      def definition(params)
+        analysis = analysis_for(params.dig("textDocument", "uri"))
+        return nil if analysis.nil?
+
+        position = params["position"] || {}
+        guarded(nil) { Definition.at(analysis, position["line"].to_i, position["character"].to_i) }
+      end
+
+      # What takes its type from the column or expr under the cursor (TypeGraph), as locations; [] anywhere else.
+      def references(params)
+        analysis = analysis_for(params.dig("textDocument", "uri"))
+        return [] if analysis.nil?
+
+        position = params["position"] || {}
+        guarded([]) { Definition.references(analysis, position["line"].to_i, position["character"].to_i) }
       end
 
       def completion(params)

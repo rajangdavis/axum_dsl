@@ -1,4 +1,4 @@
-# expect: is declared but no route uses it
+# expect: is declared but no route or law uses it
 server "refuse", version: "0.1.0"
 set :port, 8080
 

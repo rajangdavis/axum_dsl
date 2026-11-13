@@ -40,10 +40,15 @@ module AxumDsl
     DISK_PATH = "active_storage_disk_path"
     VERIFIED_ID = "active_storage_verified_id"
     VERIFIED_KEY = "active_storage_verified_key"
-    STORAGE = [DISK_PATH, VERIFIED_ID, VERIFIED_KEY].freeze
+    # Direct uploads: DiskService#url_for_direct_upload (DIRECT_URL) and DiskController#update (DISK_UPLOAD).
+    DIRECT_URL = "active_storage_direct_upload_url"
+    DISK_UPLOAD = "active_storage_disk_upload"
+    STORAGE = [DISK_PATH, VERIFIED_ID, VERIFIED_KEY, DIRECT_URL, DISK_UPLOAD].freeze
+    # `active_storage_key`: a fresh blob key (`has_secure_token :key, length: 28`).
+    NEW_KEY = "active_storage_key"
     # `inline_disposition(filename)`: the Content-Disposition a disk URL's signed key carries, and the disk route serves.
     INLINE = "inline_disposition"
-    BUILTINS = [VERIFY, GENERATE, EXPIRING, TURBO, TURBO_VERIFY, GID, SGID, URLSAFE, VARIATION, *STORAGE, INLINE].freeze
+    BUILTINS = [VERIFY, GENERATE, EXPIRING, TURBO, TURBO_VERIFY, GID, SGID, URLSAFE, VARIATION, *STORAGE, INLINE, NEW_KEY].freeze
 
     def used?(ir) = (ir["builtins"].to_a & BUILTINS).any?
 
@@ -56,6 +61,8 @@ module AxumDsl
       lines = ["base64 = \"0.22\""]
       lines.unshift("hmac = \"0.12\"", "sha2 = \"0.10\"", "pbkdf2 = \"0.12\"") if flag?(ir, VERIFY, GENERATE, EXPIRING, TURBO, TURBO_VERIFY, VARIATION, SGID, *STORAGE)
       lines.push("sha1 = \"0.10\"") if flag?(ir, VARIATION, SGID, *STORAGE)
+      lines.push("md-5 = \"0.10\"") if flag?(ir, DISK_UPLOAD)
+      lines.push("rand = \"0.9\"") if flag?(ir, NEW_KEY)
       lines.map { |line| "\n#{line}" }.join
     end
 
@@ -71,9 +78,13 @@ module AxumDsl
       out.concat(iso8601_items) if flag?(ir, VERIFY, EXPIRING, *STORAGE)
       out.concat(expiring_items) if flag?(ir, EXPIRING)
       out.concat(storage_sign_items) if flag?(ir, VARIATION, *STORAGE)
-      out.concat(storage_verify_items) if flag?(ir, VERIFIED_ID, VERIFIED_KEY)
+      out.concat(storage_verify_items) if flag?(ir, VERIFIED_ID, VERIFIED_KEY, DISK_UPLOAD)
       out.concat(disposition_items) if flag?(ir, DISK_PATH, INLINE)
+      out.concat(path_segment_items) if flag?(ir, DISK_PATH, DIRECT_URL)
       out.concat(storage_disk_items) if flag?(ir, DISK_PATH)
+      out.concat(direct_url_items) if flag?(ir, DIRECT_URL)
+      out.concat(disk_upload_items) if flag?(ir, DISK_UPLOAD)
+      out.concat(new_key_items) if flag?(ir, NEW_KEY)
       out.concat(turbo_key_items) if flag?(ir, TURBO, TURBO_VERIFY)
       out.concat(turbo_items) if flag?(ir, TURBO)
       out.concat(turbo_verify_items) if flag?(ir, TURBO_VERIFY)
@@ -204,18 +215,6 @@ module AxumDsl
     # (ActionDispatch::Http::ContentDisposition) and the path segments percent-encoded.
     def storage_disk_items
       <<~'RS'.lines.map(&:chomp)
-        fn axum_dsl_path_segment(text: &str) -> String {
-            let mut out = String::new();
-            for b in text.bytes() {
-                if b.is_ascii_alphanumeric() || b"-._~!$&'()*+,;=:@".contains(&b) {
-                    out.push(b as char);
-                } else {
-                    out.push_str(&format!("%{:02X}", b));
-                }
-            }
-            out
-        }
-
         fn axum_dsl_active_storage_disk_path(secret: &[u8], key: &str, filename: &str, content_type: &str) -> String {
             let now = ::std::time::SystemTime::now()
                 .duration_since(::std::time::UNIX_EPOCH)
@@ -230,6 +229,97 @@ module AxumDsl
             let expires = axum_dsl_iso8601_ms(now.saturating_add(300_000));
             let token = axum_dsl_active_storage_sign_until(secret, &data, "blob_key", Some(&expires));
             format!("/rails/active_storage/disk/{}/{}", axum_dsl_path_segment(&token), axum_dsl_path_segment(filename))
+        }
+
+      RS
+    end
+
+    # A URL path segment as Rails' route helpers escape one (Journey's escape_segment).
+    def path_segment_items
+      <<~'RS'.lines.map(&:chomp)
+        fn axum_dsl_path_segment(text: &str) -> String {
+            let mut out = String::new();
+            for b in text.bytes() {
+                if b.is_ascii_alphanumeric() || b"-._~!$&'()*+,;=:@".contains(&b) {
+                    out.push(b as char);
+                } else {
+                    out.push_str(&format!("%{:02X}", b));
+                }
+            }
+            out
+        }
+
+      RS
+    end
+
+    # DiskService#url_for_direct_upload: `/rails/active_storage/disk/<encoded token>`, the token being
+    # `ActiveStorage.verifier.generate({key:, content_type:, content_length:, checksum:, service_name:},
+    # expires_in: 5.minutes, purpose: :blob_token)`.
+    def direct_url_items
+      <<~'RS'.lines.map(&:chomp)
+        fn axum_dsl_active_storage_direct_upload_url(secret: &[u8], key: &str, content_type: &str, content_length: i64, checksum: &str) -> String {
+            let now = ::std::time::SystemTime::now()
+                .duration_since(::std::time::UNIX_EPOCH)
+                .map_or(0, |elapsed| i64::try_from(elapsed.as_millis()).unwrap_or(0));
+            let json = |text: &str| ::serde_json::to_string(text).unwrap_or_default();
+            let data = format!(
+                "{{\"key\":{},\"content_type\":{},\"content_length\":{},\"checksum\":{},\"service_name\":\"local\"}}",
+                json(key),
+                json(content_type),
+                content_length,
+                json(checksum)
+            );
+            let expires = axum_dsl_iso8601_ms(now.saturating_add(300_000));
+            let token = axum_dsl_active_storage_sign_until(secret, &data, "blob_token", Some(&expires));
+            format!("/rails/active_storage/disk/{}", axum_dsl_path_segment(&token))
+        }
+
+      RS
+    end
+
+    # DiskController#update: 404 unless the token verifies (purpose :blob_token, not expired); 422 unless the request's
+    # Content-Type (its media type) and Content-Length are the token's (acceptable_content?), or when the body's MD5 is
+    # not the token's checksum (DiskService#upload's ensure_integrity_of: the file is removed); otherwise the body is
+    # written at <root>/<key[0,2]>/<key[2,2]>/<key> and the answer is 204. A key that is not alphanumeric is refused
+    # (DiskService#path_for's InvalidKeyError) with the 422.
+    def disk_upload_items
+      <<~'RS'.lines.map(&:chomp)
+        async fn axum_dsl_active_storage_disk_upload(secret: &[u8], token: &str, headers: &::axum::http::HeaderMap, body: &[u8], root: &str) -> i64 {
+            use ::md5::Digest;
+            let Some(data) = axum_dsl_active_storage_verified(secret, token, "blob_token") else { return 404 };
+            let field = |name: &str| data.get(name).and_then(|value| value.as_str()).unwrap_or_default().to_owned();
+            let (key, content_type, checksum) = (field("key"), field("content_type"), field("checksum"));
+            let header = |name: ::axum::http::header::HeaderName| headers.get(name).and_then(|value| value.to_str().ok()).unwrap_or_default().to_owned();
+            let media_type = header(::axum::http::header::CONTENT_TYPE).split(';').next().unwrap_or_default().trim().to_ascii_lowercase();
+            let content_length = header(::axum::http::header::CONTENT_LENGTH).trim().parse::<i64>().unwrap_or(0);
+            if media_type != content_type.to_ascii_lowercase() || Some(content_length) != data.get("content_length").and_then(|value| value.as_i64()) {
+                return 422;
+            }
+            if key.len() < 4 || !key.bytes().all(|b| b.is_ascii_alphanumeric()) {
+                return 422;
+            }
+            let digest = ::base64::Engine::encode(&::base64::engine::general_purpose::STANDARD, ::md5::Md5::digest(body));
+            if digest != checksum {
+                return 422;
+            }
+            let dir = ::std::path::Path::new(root).join(&key[0..2]).join(&key[2..4]);
+            if ::tokio::fs::create_dir_all(&dir).await.is_err() || ::tokio::fs::write(dir.join(&key), body).await.is_err() {
+                return 500;
+            }
+            204
+        }
+
+      RS
+    end
+
+    # `has_secure_token :key, length: 28`: SecureRandom.base36, 28 lowercase letters and digits.
+    def new_key_items
+      <<~'RS'.lines.map(&:chomp)
+        fn axum_dsl_active_storage_key() -> String {
+            use ::rand::Rng;
+            const ALPHABET: &[u8; 36] = b"0123456789abcdefghijklmnopqrstuvwxyz";
+            let mut rng = ::rand::rng();
+            (0..28).map(|_| char::from(ALPHABET[rng.random_range(0..36)])).collect()
         }
 
       RS

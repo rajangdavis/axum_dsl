@@ -1,0 +1,36 @@
+name: ci
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      # Ruby comes from .tool-versions; Rust is the stable toolchain (the project pins none).
+      - uses: ruby/setup-ruby@v1
+        with:
+          bundler-cache: true
+      - uses: dtolnay/rust-toolchain@stable
+      # Not `make check`: its check-e2e slice starts the example services and needs a host set up for them,
+      # and its audit step needs cargo-audit, which the supply-chain job runs.
+      - run: make check-fast check-build
+
+  supply-chain:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ruby/setup-ruby@v1
+        with:
+          bundler-cache: true
+      - uses: dtolnay/rust-toolchain@stable
+      # Installed with cargo rather than rustsec/audit-check or cargo-deny-action: the vetted lockfile
+      # is not at the repo root, and the Makefile targets already point both tools at it.
+      - run: cargo install --locked cargo-audit cargo-deny
+      - run: make audit
+      - run: make deny

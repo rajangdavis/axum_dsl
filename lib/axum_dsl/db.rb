@@ -2,6 +2,10 @@
 
 require_relative "db/sql"
 require_relative "db/sqlite"
+require_relative "db/schema"
+require_relative "db/models"
+require_relative "db/rel"
+require_relative "db/chain"
 
 module AxumDsl
   # SQL state: `database`, `record`, `query`, `execute` and `migrations` (docs/database.md). The SQL a service
@@ -10,6 +14,10 @@ module AxumDsl
   module Db
     # The scalar types a query takes as arguments and a record holds as fields: the columns SQLite stores.
     SCALARS = %w[string i64 f64 bool].freeze
+
+    # What a record or a table field holds: a scalar, or a `:time`, a Rails timestamp stored as text and held as a
+    # String (docs/database.md, "Time fields"). A query argument or a scalar result is a SCALARS type only.
+    COLUMNS = (SCALARS + %w[time]).freeze
 
     # database's first argument => the module that emits for it. Only :sqlite is built.
     ADAPTERS = { "sqlite" => Sqlite }.freeze

@@ -4,11 +4,11 @@ module AxumDsl
   module Db
     # The SQLite backend: everything that is specific to the database lives here, and the emitter reaches it
     # through four narrow calls (`deps`, `items`, `start_lines` and, from Db, `fn_name`), so a later adapter
-    # is another module with the same four. The pool is deadpool-sqlite over rusqlite; a statement runs on a
-    # pooled connection through `interact`, and the user's SQL is a constant in the crate, byte for byte,
-    # bound with rusqlite's named parameters.
+    # is another module with the same four. Plain rusqlite connections: one writer thread and a few reader threads,
+    # each owning a connection, fed boxed closures through a queue; the user's SQL is a constant in the crate, byte
+    # for byte, bound with rusqlite's named parameters.
     module Sqlite
-      RUST = { "i64" => "i64", "string" => "String", "f64" => "f64", "bool" => "bool" }.freeze
+      RUST = { "i64" => "i64", "string" => "String", "f64" => "f64", "bool" => "bool", "time" => "String" }.freeze
 
       # How startup checks a prepared statement (the number in DB_STATEMENTS): 0 only that the SQL prepares,
       # 1 that it returns at least one column, 2 that its column names are the record's field names.
@@ -18,8 +18,7 @@ module AxumDsl
 
       # The Cargo.toml dependency lines this backend needs.
       def deps
-        ["rusqlite = { version = \"0.40\", features = [\"bundled\", \"hooks\", \"functions\"] }",
-         "deadpool-sqlite = { version = \"0.14\", features = [\"bundled\"] }"]
+        ["rusqlite = { version = \"0.42\", features = [\"bundled\", \"hooks\", \"functions\"] }"]
       end
 
       # The statements at the top of main that open the database before anything is served. A database that
@@ -32,19 +31,36 @@ module AxumDsl
          "    }"]
       end
 
+      # The first statements of main when the binary is started with `--schema-check`: the startup checks on a fresh
+      # in-memory database, then exit, before the settings are read or anything is bound (db_schema_check).
+      def schema_check_lines
+        ["    if std::env::args().nth(1).as_deref() == Some(\"--schema-check\") {",
+         "        std::process::exit(db_schema_check());",
+         "    }"]
+      end
+
       # The Rust items of a service with a database, as [declaration, what, lines] triples: the declaration
       # carries the DSL line the emitter maps the lines back to (nil for the shared runtime).
       def items(ir)
-        [*ir["records"].to_a.map { |r| [r, "record `#{r['name']}`", record_lines(r)] },
+        offsets = statement_offsets(ir["queries"].to_a)
+        [*ir["records"].to_a.map { |r| [r, "record `#{r['name']}`", record_lines(r, eq: ir["law_record_eq"])] },
          [nil, nil, runtime_lines(ir)],
          *ir["queries"].to_a.each_with_index.map { |q, i|
            in_tx = ir["queries_in_tx"].to_a.include?(q["name"])
            outside = ir["queries_outside"].to_a.include?(q["name"])
-           [q, "#{q['kind']} `#{q['name']}`", statement_lines(q, i, wrapper: !in_tx || outside, fills: list_fills(ir, q))]
+           [q, "#{q['kind']} `#{q['name']}`", statement_lines(q, offsets[i], wrapper: !in_tx || outside, fills: list_fills(ir, q),
+                                       law_only: ir["law_only_queries"].to_a.include?(q["name"]))]
          }]
       end
 
       def sql_const(q) = "DB_SQL_#{q['name'].upcase}"
+
+      # The SQL constants of a statement, one for each statement it runs: a `destroy` with dependents carries
+      # `sqls` (every DELETE, in the order they run); any other statement is its one `sql`.
+      def sql_consts(q) = q["sqls"] ? q["sqls"].each_index.map { |i| "#{sql_const(q)}_#{i + 1}" } : [sql_const(q)]
+
+      # Where each statement's first row is in DB_STATEMENTS (and DB_WRITES): a destroy has a row per DELETE.
+      def statement_offsets(queries) = queries.each_with_object([0]) { |q, a| a << a.last + sql_consts(q).size }
 
       def field_rust(f)
         return "Vec<#{CompositeTypes.object_list_name(f['type'])}>" if f["from"]
@@ -55,10 +71,10 @@ module AxumDsl
       # A record is a plain struct that is Serialize (json(...) writes it) and Clone (a body clones what it
       # reads), filled from a row by column name, so the order of the SELECT does not matter. A list field is no
       # column: from_row leaves it empty and the statement fills it, one sub-query per row (list_fills).
-      def record_lines(r)
+      def record_lines(r, eq: false)
         name = r["name"]
         gets = r["fields"].map { |f| f["from"] ? "#{f['name']}: Vec::new()" : "#{f['name']}: __r.get(#{AxumDsl.rstr(f['name'])})?" }
-        ["#[derive(Clone, serde::Serialize)]",
+        ["#[derive(Clone, #{eq ? 'PartialEq, ' : ''}serde::Serialize)]", # a law that compares two statements' results needs PartialEq
          "struct #{name} {",
          *r["fields"].map { |f| "    #{f['name']}: #{field_rust(f)}," },
          "}",
@@ -67,7 +83,20 @@ module AxumDsl
          "    fn from_row(__r: &rusqlite::Row<'_>) -> rusqlite::Result<#{name}> {",
          "        Ok(#{name} { #{gets.join(', ')} })",
          "    }",
+         *r["methods"].to_a.flat_map { |m| method_lines(m) },
          "}"]
+      end
+
+      # A record method (docs/database.md, "Record methods"): a function of the row, read like a field. Nothing may
+      # call it (a method no view or body reads), so it carries the allowance rather than a rustc warning.
+      def method_lines(m)
+        ret = m["optional"] ? "Option<#{RUST.fetch(m['type'])}>" : RUST.fetch(m["type"])
+        ["",
+         "    #[allow(dead_code)]",
+         "    fn #{m['name']}(&self) -> #{ret} {",
+         *m["locals"].map { |l| "        #{l}" },
+         "        #{m['expr']}",
+         "    }"]
       end
 
       # The Rust return type of a statement.
@@ -91,7 +120,7 @@ module AxumDsl
         end
       end
 
-      def statement_lines(q, index, wrapper: true, fills: [])
+      def statement_lines(q, index, wrapper: true, fills: [], law_only: false)
         params = q["args"].map { |n, t| "#{n}: #{RUST.fetch(t)}" }.join(", ")
         binds =
           if q["args"].empty? then "rusqlite::params![]"
@@ -146,18 +175,22 @@ module AxumDsl
                "__out"]
             end
           else
-            ["let mut __stmt = __c.prepare_cached(#{sql_const(q)})?;",
+            # A destroy runs its earlier DELETEs for their effect, then the root's, whose row count is the answer.
+            consts = sql_consts(q)
+            [*consts[0...-1].flat_map { |c| ["{", "    let mut __stmt = __c.prepare_cached(#{c})?;", "    __stmt.execute(#{binds})?;", "}"] },
+             "let mut __stmt = __c.prepare_cached(#{consts.last})?;",
              "let __out = __stmt.execute(#{binds}).map(|__n| __n as i64);",
              "__out"]
           end
         args = q["args"].map(&:first).join(", ")
-        lines = ["const #{sql_const(q)}: &str = #{AxumDsl.rstr(q['sql'])};",
+        lines = [*sql_consts(q).zip(q["sqls"] || [q["sql"]]).map { |c, sql| "const #{c}: &str = #{AxumDsl.rstr(sql)};" },
                  "",
                  "fn #{Db.on_name(q)}(__c: &rusqlite::Connection#{params.empty? ? '' : ", #{params}"}) -> rusqlite::Result<#{return_rust(q)}> {",
                  *body.map { |l| "    #{l}" },
                  "}"]
         if wrapper
           lines += ["",
+                    *(law_only ? ["#[cfg_attr(not(test), allow(dead_code))]"] : []), # only a law calls it: compiled, but uncalled, in release
                     "async fn #{Db.fn_name(q)}(#{params}) -> Result<#{return_rust(q)}, String> {",
                     "    db_run(#{index}, #{AxumDsl.rstr(q['name'])}, move |__c| #{Db.on_name(q)}(__c#{args.empty? ? '' : ", #{args}"}))",
                     "    .await",
@@ -166,12 +199,12 @@ module AxumDsl
         lines
       end
 
-      # The pool, how a statement reaches a connection, and what happens at startup: open the pool, then on one
-      # connection set journal_mode=WAL, apply the migrations, and prepare every declared statement.
+      # The writer and reader threads, how a statement reaches a connection, and what happens at startup: open the
+      # writer's connection, then on it set journal_mode=WAL, apply the migrations, and prepare every declared statement.
       def runtime_lines(ir)
         db = ir["database"]
         queries = ir["queries"].to_a
-        # With every statement called inside a transaction, no pooled wrapper is emitted and db_run itself
+        # With every statement called inside a transaction, no wrapper is emitted and db_run itself
         # would be dead; keep the -D warnings gate while allowing only that shared helper.
         wrappers = queries.any? do |q|
           !ir["queries_in_tx"].to_a.include?(q["name"]) || ir["queries_outside"].to_a.include?(q["name"])
@@ -187,19 +220,16 @@ module AxumDsl
             ["    let path = #{AxumDsl.rstr(db['path'])}.to_string();"]
           end
         [
-          "// the database (database :#{db['adapter']}): the pool, the startup checks and the statements below are written by the compiler",
-          "static DB: std::sync::OnceLock<deadpool_sqlite::Pool> = std::sync::OnceLock::new();",
-          "",
-          "fn db() -> &'static deadpool_sqlite::Pool {",
-          "    DB.get().expect(\"the database is opened before the server starts\")",
-          "}",
-          "",
-          "// Writers queue here, in the process, instead of in SQLite's busy handler (which sleeps 1 to 100 ms between",
-          "// retries): once-campfire-rust/crates/db/src/database.rs runs every write on one thread for the same reason.",
-          "// Taken before a pooled connection, so a waiting writer holds none. DB_WRITES says, per DB_STATEMENTS entry,",
-          "// whether the statement writes (sqlite3_stmt_readonly, so a RETURNING write counts); reads never take it.",
-          "static DB_WRITE_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());",
+          "// the database (database :#{db['adapter']}): the writer and reader threads, the startup checks and the statements below are written by the compiler",
+          "// DB_WRITES says, per DB_STATEMENTS entry, whether the statement writes (sqlite3_stmt_readonly, so a RETURNING write counts).",
           "static DB_WRITES: std::sync::OnceLock<Vec<bool>> = std::sync::OnceLock::new();",
+          "",
+          "// Every write (a statement DB_WRITES marks, and every transaction) is a boxed closure sent to ONE writer thread that owns",
+          "// one connection and runs them in arrival order, back to back, as once-campfire-rust/crates/db/src/database.rs does:",
+          "// writers queue in the process instead of in SQLite's busy handler (which sleeps 1 to 100 ms between retries), and no",
+          "// async lock is held across a thread hand-off. The reply comes back on a oneshot, like a read's.",
+          "type DbWrite = Box<dyn FnOnce(&mut rusqlite::Connection) + Send>;",
+          "static DB_WRITER: std::sync::OnceLock<std::sync::mpsc::Sender<DbWrite>> = std::sync::OnceLock::new();",
           "",
           "// Reads run on threads of their own, not tokio's blocking pool, as in once-campfire-rust/crates/db/src/database.rs: there a read",
           "// that found every connection busy parked a blocking thread, while here a waiting read costs a queue entry and a reader",
@@ -228,7 +258,32 @@ module AxumDsl
           "    }",
           "}",
           "",
-          "// Runs the statement DB_STATEMENTS[index]: a read on a reader thread, a write on a pooled connection; an error names the query.",
+          "// Sends `work` to the writer thread and waits for its answer; an error names the `kind` (query or transaction) and `name`.",
+          "// A panic in `work` is caught on the writer thread (as a reader does), so it answers this caller and the thread lives on.",
+          "async fn db_write<T: Send + 'static>(",
+          "    kind: &'static str,",
+          "    name: &'static str,",
+          "    work: impl FnOnce(&mut rusqlite::Connection) -> rusqlite::Result<T> + Send + 'static,",
+          ") -> Result<T, String> {",
+          "    let (tx, rx) = tokio::sync::oneshot::channel();",
+          "    let job: DbWrite = Box::new(move |__c| {",
+          "        let __out = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| work(__c)));",
+          "        let _ = tx.send(__out);",
+          "    });",
+          "    let Some(writer) = DB_WRITER.get() else {",
+          "        return Err(format!(\"{kind} `{name}`: the database writer is gone\"));",
+          "    };",
+          "    if writer.send(job).is_err() {",
+          "        return Err(format!(\"{kind} `{name}`: the database writer is gone\"));",
+          "    }",
+          "    match rx.await {",
+          "        Ok(Ok(out)) => out.map_err(|e| format!(\"{kind} `{name}`: {e}\")),",
+          "        Ok(Err(_)) => Err(format!(\"{kind} `{name}`: the write panicked\")),",
+          "        Err(_) => Err(format!(\"{kind} `{name}`: the database writer is gone\")),",
+          "    }",
+          "}",
+          "",
+          "// Runs the statement DB_STATEMENTS[index]: a read on a reader thread, a write on the writer thread; an error names the query.",
           *(wrappers ? [] : ["#[allow(dead_code)]"]),
           "async fn db_run<T: Send + 'static>(",
           "    index: usize,",
@@ -249,38 +304,36 @@ module AxumDsl
           "            Err(_) => Err(format!(\"query `{name}`: the database reader is gone\")),",
           "        };",
           "    }",
-          "    let _write = if DB_WRITES.get().is_some_and(|w| w[index]) { Some(DB_WRITE_LOCK.lock().await) } else { None };",
-          "    let conn = db().get().await.map_err(|e| format!(\"query `{name}`: no database connection: {e}\"))?;",
-          "    conn.interact(move |__c| {",
+          "    db_write(\"query\", name, move |__c| {",
           "        let __out = work(__c)?;",
           "        db_after_write(__c);",
           "        Ok::<T, rusqlite::Error>(__out)",
           "    })",
           "    .await",
-          "    .map_err(|e| format!(\"query `{name}`: {e}\"))?",
-          "    .map_err(|e| format!(\"query `{name}`: {e}\"))",
           "}",
           "",
           *(ir["transactions"] ? transaction_lines : []),
           "async fn db_open() -> Result<(), String> {",
           *path,
-          "    let pool = deadpool_sqlite::Config::new(path.clone())",
-          "        .builder(deadpool_sqlite::Runtime::Tokio1)",
-          "        .map_err(|e| format!(\"database {path}: cannot create the connection pool: {e}\"))?",
-          "        .post_create(deadpool_sqlite::Hook::async_fn(|conn, _| {",
-          "            Box::pin(async move {",
-          "                conn.interact(db_connection_setup)",
-          "                    .await",
-          "                    .map_err(|e| deadpool_sqlite::HookError::message(e.to_string()))?",
-          "                    .map_err(deadpool_sqlite::HookError::message)",
-          "            })",
-          "        }))",
-          "        .build()",
-          "        .map_err(|e| format!(\"database {path}: cannot create the connection pool: {e}\"))?;",
-          "    let conn = pool.get().await.map_err(|e| format!(\"database {path}: cannot open it: {e}\"))?;",
-          "    conn.interact(db_startup)",
-          "        .await",
-          "        .map_err(|e| format!(\"database {path}: {e}\"))??;",
+          "    let mut __writer = rusqlite::Connection::open(&path).map_err(|e| format!(\"database {path}: cannot open it: {e}\"))?;",
+          "    db_connection_setup(&mut __writer).map_err(|e| format!(\"database {path}: {e}\"))?;",
+          "    let (__send, __jobs) = std::sync::mpsc::channel::<DbWrite>();",
+          "    std::thread::Builder::new()",
+          "        .name(\"db-writer\".into())",
+          "        .spawn(move || {",
+          "            while let Ok(job) = __jobs.recv() {",
+          "                job(&mut __writer);",
+          "            }",
+          "        })",
+          "        .map_err(|e| format!(\"database {path}: cannot start the writer: {e}\"))?;",
+          "    // The startup checks and migrations run on the writer's connection, as its first job.",
+          "    let (__done, __started) = tokio::sync::oneshot::channel();",
+          "    let __job: DbWrite = Box::new(move |__c| {",
+          "        let _ = __done.send(db_startup(__c));",
+          "    });",
+          "    __send.send(__job).map_err(|_| format!(\"database {path}: the writer stopped during startup\"))?;",
+          "    let _ = DB_WRITER.set(__send);",
+          "    __started.await.map_err(|_| format!(\"database {path}: the writer stopped during startup\"))??;",
           "    let (__wake, __woken) = std::sync::mpsc::sync_channel::<()>(1);",
           "    let mut __checkpointer = rusqlite::Connection::open(&path).map_err(|e| format!(\"database {path}: cannot open the checkpointer connection: {e}\"))?;",
           "    db_connection_setup(&mut __checkpointer).map_err(|e| format!(\"database {path}: {e}\"))?;",
@@ -304,21 +357,21 @@ module AxumDsl
           "            .spawn(move || db_reader(__reader))",
           "            .map_err(|e| format!(\"database {path}: cannot start a reader: {e}\"))?;",
           "    }",
-          "    let _ = DB.set(pool);",
           *(ResponseCache.used?(ir) ? [ResponseCache.open_line(ir)] : []),
           "    Ok(())",
           "}",
           "",
           *migration_lines(migrations),
           *statement_table(queries),
-          "// Per-connection settings, run on every connection the pool opens (journal_mode=WAL is a property of",
+          "// Per-connection settings, run on the writer's and every reader's connection (journal_mode=WAL is a property of",
           "// the database file and is set once in db_startup). The statement cache holds every declared statement,",
           "// at least rusqlite's default of 16, so prepare_cached never evicts one it will need again.",
           "fn db_connection_setup(__c: &mut rusqlite::Connection) -> Result<(), String> {",
           "    __c.execute_batch(\"PRAGMA synchronous=NORMAL; PRAGMA cache_size=2000; PRAGMA journal_size_limit=67108864;\")",
           "        .map_err(|e| format!(\"database: cannot set the connection pragmas: {e}\"))?;",
-          "    __c.set_prepared_statement_cache_capacity(#{[16, queries.size].max});",
-          "    __c.wal_hook(Some(db_note_wal_size));",
+          "    __c.set_prepared_statement_cache_capacity(#{[16, statement_offsets(queries).last].max});",
+          "    __c.wal_hook(Some(db_note_wal_size))",
+          "        .map_err(|e| format!(\"database: cannot install the WAL hook: {e}\"))?;",
           *(Sanitize.attachable_ids_sql?(ir) ? [
             "    // SQL function `action_text_attachable_ids(html, 'User')`: a JSON array of the ids the sgids of a body's",
             "    // <action-text-attachment>s name (docs/database.md).",
@@ -340,6 +393,31 @@ module AxumDsl
           *(queries.empty? ? [] : check_loop(queries)),
           "    Ok(())",
           "}",
+          "",
+          "// `--schema-check`: the startup path above on a fresh in-memory database, which needs neither the settings nor the",
+          "// writer, reader and checkpointer threads and leaves no file behind. Exit status 0 when every statement prepares",
+          "// and returns its record's columns, 2 with the startup message when not.",
+          "fn db_schema_check() -> i32 {",
+          "    let mut __c = match rusqlite::Connection::open_in_memory() {",
+          "        Ok(c) => c,",
+          "        Err(e) => {",
+          "            eprintln!(\"database: cannot open an in-memory database: {e}\");",
+          "            return 2;",
+          "        }",
+          "    };",
+          "    match db_connection_setup(&mut __c).and_then(|_| db_startup(&mut __c)) {",
+          "        Ok(()) => {",
+          "            println!(\"schema-check: ok, {} statement(s) prepared\", DB_STATEMENTS.len());",
+          "            0",
+          "        }",
+          "        Err(message) => {",
+          "            eprintln!(\"{message}\");",
+          "            2",
+          "        }",
+          "    }",
+          "}",
+          "",
+          *Console.rust_lines(ir), # `--console` (docs/console.md): its own file, so it can move with the framework extraction
           *(queries.any? { |q| CHECK.fetch(q["shape"]) == 2 } ? ["", *columns_fn] : [])
         ]
       end
@@ -347,16 +425,15 @@ module AxumDsl
       # The transaction helper, written only into a crate whose bodies open `transaction do ... end`: an
       # unused private fn would be dead code, and the generated crate builds with warnings denied.
       def transaction_lines
-        ["// Runs `work` on one pooled connection inside a SQLite transaction, opened IMMEDIATE so a write never",
+        ["// Runs `work` on the writer thread inside a SQLite transaction, opened IMMEDIATE so a write never",
          "// starts as a reader that cannot upgrade (as Rails does, once-campfire-rust/crates/db/src/database.rs): it",
-         "// commits when `work` returns Ok and rolls back when it returns Err (dropping the transaction). An error names the transaction.",
+         "// commits when `work` returns Ok and rolls back when it returns Err (dropping the transaction; a panic unwinds",
+         "// through the same drop). An error names the transaction.",
          "async fn db_tx<T: Send + 'static>(",
          "    name: &'static str,",
          "    work: impl FnOnce(&rusqlite::Connection) -> rusqlite::Result<T> + Send + 'static,",
          ") -> Result<T, String> {",
-         "    let _write = DB_WRITE_LOCK.lock().await; // before the pooled connection, as in db_run",
-         "    let conn = db().get().await.map_err(|e| format!(\"transaction `{name}`: no database connection: {e}\"))?;",
-         "    conn.interact(move |__c| {",
+         "    db_write(\"transaction\", name, move |__c| {",
          "        let mut __tx = __c.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;",
          "        let __out = work(&__tx)?;",
          "        __tx.commit()?;",
@@ -364,14 +441,12 @@ module AxumDsl
          "        Ok::<T, rusqlite::Error>(__out)",
          "    })",
          "    .await",
-         "    .map_err(|e| format!(\"transaction `{name}`: {e}\"))?",
-         "    .map_err(|e| format!(\"transaction `{name}`: {e}\"))",
          "}",
          ""]
       end
 
-      # Checkpoints off the committing request, adapted from once-campfire-rust/crates/db/src/database.rs to a
-      # pool: every connection's WAL hook (which replaces the per-commit auto-checkpoint) notes the WAL size, a
+      # Checkpoints off the committing request, adapted from once-campfire-rust/crates/db/src/database.rs, run
+      # after each write on the writer thread: every connection's WAL hook (which replaces the per-commit auto-checkpoint) notes the WAL size, a
       # write that committed wakes a checkpointer thread per 1,000 pages, and at 10,000 runs RESTART itself.
       def checkpoint_lines(cache)
         ["// Checkpoints run off the committing request (once-campfire-rust/crates/db/src/database.rs, measured in",
@@ -386,7 +461,7 @@ module AxumDsl
          "",
          "// SQLite calls this only for a commit that wrote frames, so a write that changed nothing (an UPDATE whose",
          "// WHERE matched no row) does not move the response cache's generation.",
-         "fn db_note_wal_size(_: &rusqlite::hooks::Wal, pages: std::os::raw::c_int) -> rusqlite::Result<()> {",
+         "fn db_note_wal_size(_: &mut rusqlite::hooks::Wal, pages: std::os::raw::c_int) -> rusqlite::Result<()> {",
          *(cache ? ["    axum_dsl_cache_note_commit();"] : []),
          "    DB_WAL_PAGES.store(pages, std::sync::atomic::Ordering::Relaxed);",
          "    Ok(())",
@@ -470,9 +545,11 @@ module AxumDsl
       def statement_table(queries)
         return [] if queries.empty?
 
-        rows = queries.map do |q|
+        rows = queries.flat_map do |q|
           fields = (q["fields"] || []).map { |f| AxumDsl.rstr(f) }.join(", ")
-          "    (#{AxumDsl.rstr(q['name'])}, #{AxumDsl.rstr(q['at'])}, #{sql_const(q)}, #{CHECK.fetch(q['shape'])}, &[#{fields}]),"
+          sql_consts(q).map do |c|
+            "    (#{AxumDsl.rstr(q['name'])}, #{AxumDsl.rstr(q['at'])}, #{c}, #{CHECK.fetch(q['shape'])}, &[#{fields}]),"
+          end
         end
         ["const DB_STATEMENTS: &[(&str, &str, &str, u8, &[&str])] = &[", *rows, "];", ""]
       end

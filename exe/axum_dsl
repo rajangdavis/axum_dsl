@@ -10,13 +10,20 @@ require "axum_dsl"
 # axum_dsl build FILE.rb [-o DIR] [--release] [--emit-only]
 #                                              write the crate, then cargo build it
 # axum_dsl run FILE.rb [-o DIR] [--release]    build, then run the service (it listens on its port)
+# axum_dsl test FILE.rb [-o DIR]               build, then check every law (cargo test); AXUM_DSL_SEED=<u64> explores other inputs
+# axum_dsl schema-check FILE.rb [-o DIR]      build, then run the binary with --schema-check: migrations and every statement on a fresh in-memory database; exit 2 and the startup message on a mismatch
+# axum_dsl console FILE.rb [-o DIR] [--db PATH]  build (when stale), then a read-only line console over the declared queries (docs/console.md)
 # axum_dsl dev FILE.rb [-o DIR] [--release]    build and run the service, watch the inputs; on a change re-emit, rebuild, restart
 # axum_dsl FILE.rb -o DIR | --dump-ir | --check   the original form, kept as is
 # axum_dsl rbi FILE... [-o DIR]               write DIR/dsl_helpers.rbi (default sorbet/rbi/axum_dsl): Sorbet signatures for the helpers
 # axum_dsl init NAME [-o DIR] [--force] [--no-bindings]
 #                                              write NAME.axum.rb and a bindings/ folder
+# axum_dsl emit-diff FILE.rb (--against DIR | --overlay FILE.json|-) [--summary] [--raw]
+#                                              what a change does to the generated crate, compared in memory (no cargo, nothing written); exit 0 identical, 1 differs, 2 error
+# axum_dsl graph FILE.rb [--why NODE | --impact NODE] [--format json]
+#                                              how the types derive: the graph of what takes its type from what; --why NODE is one derivation, --impact NODE what a change reaches (docs/cli.md)
 # axum_dsl lsp                                 run a language server on stdin/stdout (diagnostics, hover and completion from the compiler)
-SUBCOMMANDS = %w[check build run dev init skill rbi lsp].freeze
+SUBCOMMANDS = %w[check build run test schema-check console dev init skill rbi lsp emit-diff graph].freeze
 
 cmd = SUBCOMMANDS.include?(ARGV.first) ? ARGV.shift : nil
 out = nil
@@ -29,14 +36,26 @@ types = false
 force = false
 no_bindings = false
 print_inputs = false
+against = nil
+overlay = nil
+summary = false
+raw = false
+why = nil
+impact = nil
+db = nil
 parser = OptionParser.new do |o|
   o.banner = "usage: axum_dsl check FILE.rb [--format json]\n" \
              "       axum_dsl build FILE.rb [-o DIR] [--release] [--emit-only]\n" \
              "       axum_dsl run FILE.rb [-o DIR] [--release]\n" \
+             "       axum_dsl test FILE.rb [-o DIR]\n" \
+             "       axum_dsl schema-check FILE.rb [-o DIR]\n" \
+             "       axum_dsl console FILE.rb [-o DIR] [--db PATH]\n" \
              "       axum_dsl dev FILE.rb [-o DIR] [--release]\n" \
              "       axum_dsl init NAME [-o DIR] [--force] [--no-bindings]\n" \
              "       axum_dsl skill [-o DIR]\n" \
              "       axum_dsl rbi FILE... [-o DIR]\n" \
+             "       axum_dsl emit-diff FILE.rb (--against DIR | --overlay FILE.json|-) [--summary] [--raw]\n" \
+             "       axum_dsl graph FILE.rb [--why NODE | --impact NODE] [--format json]\n" \
              "       axum_dsl lsp\n" \
              "       axum_dsl FILE.rb -o DIR   |   axum_dsl FILE.rb --dump-ir   |   axum_dsl FILE.rb --check"
   o.on("-o", "--out DIR", "write DIR/Cargo.toml and DIR/src/main.rs (build, run, dev: default build/NAME; skill: parent of the axum-dsl/ skill folder, default .; rbi: the folder for dsl_helpers.rbi, default sorbet/rbi/axum_dsl)") { |v| out = v }
@@ -50,10 +69,29 @@ parser = OptionParser.new do |o|
   o.on("--format FMT", %w[text json], "check: text (default) or json, one document on stdout") { |v| format = v }
   o.on("--types", "check --format json: add `types`, the inferred type of every parameter, local and expression") { types = true }
   o.on("--print-inputs", "print the file paths the compiler read (the DSL file and its use_bindings, rust_file, file, view and asset inputs), one per line, and exit") { print_inputs = true }
+  o.on("--against DIR", "emit-diff: compare the tree on disk with the crate an earlier `axum_dsl FILE.rb -o DIR` wrote into DIR") { |v| against = v }
+  o.on("--overlay FILE", "emit-diff: compare the tree on disk with the same tree where the files in this JSON object ({path: text}; - is stdin) are replaced") { |v| overlay = v }
+  o.on("--summary", "emit-diff: print only the changed units") { summary = true }
+  o.on("--why NODE", "graph: the derivation of one node (e.g. field:RoomFlag.flag), down to what it takes its type from") { |v| why = v }
+  o.on("--impact NODE", "graph: every node that takes its type from NODE, directly or not (e.g. column:rooms.id)") { |v| impact = v }
+  o.on("--db PATH", "console: the SQLite file to open (default: the variable the app's `database` names when set, else its path, relative to DIR)") { |v| db = v }
+  o.on("--raw", "emit-diff: the plain unified diff, lines neither split nor masked for DSL positions") { raw = true }
   o.on("--warn SPEC", "all|none|CODE,CODE: which warnings to print (sets AXUM_DSL_WARN)") { |v| ENV["AXUM_DSL_WARN"] = v }
   o.on("--notice SPEC", "all|none|CODE,CODE: which notices to print (sets AXUM_DSL_NOTICE)") { |v| ENV["AXUM_DSL_NOTICE"] = v }
 end
 parser.parse!
+if cmd == "emit-diff" # exit 2 for a usage error, so a caller can tell it from a difference (1)
+  root = ARGV.shift
+  if root.nil? || !ARGV.empty? || [out, dump, check, release, emit_only, force, no_bindings, print_inputs, types].any? ||
+     format != "text" || against.nil? == overlay.nil?
+    warn parser.to_s
+    exit 2
+  end
+  exit AxumDsl::EmitDiff.run(root, against: against, overlay: overlay, summary: summary, raw: raw)
+end
+abort parser.to_s if against || overlay || summary || raw
+abort parser.to_s if db && cmd != "console"
+abort parser.to_s if (why || impact) && (cmd != "graph" || (why && impact))
 if cmd != "init" && (force || no_bindings)
   abort parser.to_s
 end
@@ -69,6 +107,8 @@ abort parser.to_s if (cmd == "skill" ? !file.nil? : file.nil?) || !ARGV.empty?
 json = format == "json"
 abort parser.to_s if types && !(cmd == "check" && json)
 case cmd
+when "graph"
+  abort parser.to_s if out || dump || check || release || emit_only || print_inputs || types
 when "check"
   abort parser.to_s if out || dump || check || release || emit_only
   check = true
@@ -82,8 +122,8 @@ when "skill"
 when "init"
   abort parser.to_s if dump || check || release || emit_only || json
   out ||= "."
-when "run", "dev"
-  abort parser.to_s if dump || check || emit_only || json
+when "run", "dev", "test", "schema-check", "console"
+  abort parser.to_s if dump || check || emit_only || json || (%w[test schema-check console].include?(cmd) && release)
   out ||= File.join("build", File.basename(file, ".rb"))
 else
   abort parser.to_s if ([out, dump, check].count { |m| m } != 1 && !print_inputs) || release || emit_only || json
@@ -112,7 +152,8 @@ end
 # unchanged Cargo.toml is not rewritten. Only build, run and dev pass it, so -o output stays exactly what
 # the e2e scripts build. A build first removes the files the previous build into DIR emitted and this
 # one does not, then records its own file set in DIR/.axum_dsl-files; files the compiler did not write are
-# left alone (AxumDsl::Manifest).
+# left alone (AxumDsl::Manifest). With `workspace:` (build, run, test, dev) the crate is also pinned to the vetted
+# dependency set and the answer is whether it is, which is whether cargo runs with --locked.
 def write_crate(ir, file, out, workspace: false)
   files = AxumDsl::Emit.files(ir, file)
   # Prune before writing, so a path that changes from an emitted file into a directory (or back) is not
@@ -129,6 +170,21 @@ def write_crate(ir, file, out, workspace: false)
     File.write(path, text)
   end
   AxumDsl::Manifest.record(out, files.keys)
+  pin_crate(ir, out) if workspace
+end
+
+# Cargo.lock is the vetted set trimmed to this crate (cargo drops what it does not use); --locked then makes cargo
+# refuse to move off it. A crate with its own rust_crate (or a binding's `crate`) leaves the vetted set: it is not
+# pinned, cargo runs without --locked, and the warning says so. Answers whether the crate is pinned.
+def pin_crate(ir, out)
+  crates = ir["crates"].to_a
+  unless crates.empty?
+    warn "axum_dsl: rust_crate #{crates.map { |c| c['name'] }.join(', ')} is outside the vetted dependency set, " \
+         "so dependencies are not pinned and cargo runs without --locked"
+    return false
+  end
+  AxumDsl::Lockfile.pin(out, AxumDsl::Emit::VETTED_LOCK)
+  true
 end
 
 # "FILE:LINE:COL: message" -> fields, for editors; anything else keeps just the message.
@@ -204,9 +260,26 @@ if cmd == "dev"
   exit AxumDsl::Dev.run(file, out: out, release: release, emit: ->(ir) { write_crate(ir, file, out, workspace: true) })
 end
 
+if cmd == "graph"
+  begin
+    graph = AxumDsl::TypeGraph.new
+    AxumDsl.read(file, graph: graph)
+    puts graph.report(why: why, impact: impact, json: json)
+    exit 0
+  rescue AxumDsl::CompileError => e
+    warn e.message
+    exit 1
+  rescue AxumDsl::TypeGraph::UnknownNode, SystemCallError => e
+    warn "axum_dsl: #{e.message}"
+    exit 1
+  end
+end
+
+locked = true
 begin
   collector = AxumDsl::TypeNames::Collector.new(file) if types
-  ir = AxumDsl.read(file, types: collector)
+  graph = AxumDsl::TypeGraph.new if cmd == "console"
+  ir = AxumDsl.read(file, types: collector, graph: graph)
   if print_inputs
     puts ir["inputs"].uniq
     exit 0
@@ -224,15 +297,31 @@ begin
       puts "#{file}: ok"
     end
   else
-    write_crate(ir, file, out, workspace: !cmd.nil?)
+    locked = write_crate(ir, file, out, workspace: !cmd.nil?)
   end
   AxumDsl::Notify.report unless json
+  if cmd == "schema-check"
+    # The binary checks the migrations and every statement on a fresh in-memory database and exits (Db::Sqlite#schema_check_lines).
+    abort "axum_dsl: #{file} declares no database, so there is nothing to check" unless ir["database"]
+    exit 1 unless AxumDsl::CargoBuild.run(out, release: false, locked: locked)
+    exec(*AxumDsl::CargoBuild.cargo("run"), "--quiet", *("--locked" if locked), "--", "--schema-check", chdir: out)
+  end
+  if cmd == "console"
+    # The binary in its `--console` mode over the declared queries; builds only when the crate is newer than the binary (docs/console.md).
+    abort "axum_dsl: #{file} declares no database, so there is nothing to query" unless ir["database"]
+    exit AxumDsl::Console.run(ir, out: out, db: db, locked: locked, graph: graph)
+  end
+  if cmd == "test"
+    # The laws (and any other #[cfg(test)] test the crate has): a failure names the law, its DSL line and the
+    # minimal failing input.
+    exec(*AxumDsl::CargoBuild.cargo("test"), "--quiet", *("--locked" if locked), chdir: out)
+  end
   if (cmd == "build" && !emit_only) || cmd == "run"
     # Errors in generated code are reported at the DSL line that produced them.
-    exit 1 unless AxumDsl::CargoBuild.run(out, release: release)
+    exit 1 unless AxumDsl::CargoBuild.run(out, release: release, locked: locked)
     # run replaces this process so the server owns stdin and stdout; the build above makes
     # this a no-op rebuild.
-    exec("cargo", "run", "--quiet", *("--release" if release), chdir: out) if cmd == "run"
+    exec(*AxumDsl::CargoBuild.cargo("run", release: release), "--quiet", *("--locked" if locked), *("--release" if release), chdir: out) if cmd == "run"
   end
 rescue AxumDsl::CompileError => e
   if json

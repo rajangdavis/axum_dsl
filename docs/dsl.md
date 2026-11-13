@@ -34,10 +34,35 @@ end
   type from a `rust_file` in place of the TCP listener, which is the hook for TLS; `set :log, :json` (or
   `:text`, the default) picks the log format (see [Deploying the emitted crate](cli.md#deploying-the-emitted-crate)).
 - **Routes** are `get`/`post`/`put`/`patch`/`delete`/`options`/`head` with a path, an optional
-  `params:` naming a params group, an optional `description:`, and a required block — the body language.
+  `params:` naming a params group, an optional `description:`, and a block — the body language. A route in a
+  controller may instead name `action:` and use that controller's `def` as its body; a route outside a
+  controller may name `controller:` and `action:` (a routes file). A route with neither a block nor `action:` is
+  refused.
   A path uses Sinatra's `:name` capture syntax (`"/users/:id"`), translated to axum 0.8's `{name}`; axum
   has no optional segments and no patterns beyond one named capture, so anything else is refused. The
   last expression of the block is the response.
+- **Resources and scopes.** `resources :rooms, only: %i[show edit], params: :RoomPath` declares Rails'
+  resource routes at `/rooms`, each reaching the controller's matching `def` (`controller:` names a
+  different controller); `cache:` applies to every generated route, `description:` and `params:` to every route
+  or, as a hash by action (`description: { index: "Chat bots", new: "New chat bot" }`, `params: { edit: :BotPath,
+  create: :BotForm }`), to the ones it names (a hash group reaches `create` too), and `update`
+  answers PATCH and PUT. A member route captures `:id`, which is derived from the table of the model declared with `table: :rooms`
+  (see Path params below); without such a model `show`/`edit`/`update`/`destroy` need a
+  `params:` group with an `id` field `in: :path`. The resource declares `rooms_path`, `room_path(id)`,
+  `new_room_path`, `edit_room_path(id)` and their `_url` forms. `scope path: "rooms/opens" do ... end`
+  prefixes the routes in its block, and blocks nest. Nested `resources` are not implemented yet, and
+  `create`/`update` take a form group only through an explicit route (Track RB4).
+- **Path params of a resource are derived** (Track RR6). `resources :rooms` captures `:id` on its member routes; the
+  type is the `id` (primary key) column of the table of the model declared `model :Room, table: :rooms`. Nothing is read
+  from the URL or guessed from a plural: the resource name is the table name, unless `model:` names the model
+  (`resources :bots, model: :User` for the bots, which are rows of `users`; `namespace :rooms do resources :opens, model: :Room end`
+  in Rails). Each derived capture is a node of the type graph, `param:GET /rooms/:id.id`, taking its type from
+  `column:rooms.id` by the rule `resources :rooms`. A route with no `params:` gets a group of its
+  own (`RoomsMemberPath`); a group given with `params:` gets the `id` field in front when it does not declare one. A declared
+  `id` field of another type is refused, naming both sources; one that repeats the derivation gets the notice
+  `N-PATH-PARAM-DERIVED` (the line can go unless another route uses the group). Where the compiler is asked for types
+  (`check --types`) the derived field carries `rooms.id via resources :rooms`. Nested resources and explicit
+  `get "/x/:id"` routes are not derived yet and keep their declared fields.
 - **Fields** take `description:`, `optional:`, `default:`, and JSON schema constraints: `min:`/`max:` and
   `exclusive_min:`/`exclusive_max:`/`multiple_of:` on numbers, `min_length:`/`max_length:`/`pattern:`/`enum:`
   on strings, `min_items:`/`max_items:` on lists. The generated service also enforces the constraints and
@@ -74,6 +99,10 @@ end
   its text parts (into the group's other `in: :form` fields, bracketed `name:` keys included; a repeated name keeps
   its last value) and its file parts (into the `:upload` fields by `name:`, else by field name). A group with neither
   an `:upload` nor a list field keeps axum's `Form` and answers a multipart body 415.
+  **Rails' merged params.** `set :merge_query_params, true` reads a form field the body lacks from the query string,
+  as Rails' `params` is `query_parameters.merge(request_parameters)`: a key the body carries is the body's alone (a list
+  included), and an empty or missing body leaves the query's pairs. It applies to every `in: :form` group, urlencoded or
+  multipart; without it a form field reads the body only.
   **Repeated keys.** A `:string_list`, `:i64_list` or `:f64_list` field `in: :form` (`field :user_ids, list(:i64),
   in: :form, name: "user_ids[]", default: []`) collects every occurrence of its key, in order, from a urlencoded
   or a multipart body, as Rack does for `name[]`: `user_ids[]=1&user_ids[]=2` is `[1, 2]`. A value that does not
@@ -83,9 +112,13 @@ end
   its urlencoded body with the same code as a multipart one (2 MiB, else 413). A file input nobody chose a file in sends a
   part with an empty filename; Rack drops it, so the field is nil, as is a missing one. The whole body is held in
   memory (128 MiB, else 413), at most 4096 parts and 128 files (413), and a body that is not well formed is 400.
-  In the body the field is an object with `filename`, `content_type`, `size` (bytes), `checksum` (Active Storage's:
-  the base64 MD5) and `metadata` (the blob's analyzed JSON: `{"identified":true,"width":W,"height":H,"analyzed":true}` for
-  a JPEG, PNG, GIF or WebP, read from its header without EXIF rotation; `{"identified":true,"analyzed":true}` otherwise), read like a nested object (`avatar&.filename`, or `unless avatar.nil?` on a local first), and
+  In the body the field is an object with `filename`, `content_type` (Active Storage's identified type:
+  `Marcel::MimeType.for(first 4 KB, name:, declared_type:)` with Marcel 1.1's whole magic, extension and parent tables, so
+  a JPEG sent as `application/octet-stream` is `image/jpeg`), `size` (bytes), `checksum` (Active Storage's: the base64
+  MD5) and `metadata` (the blob's analyzed JSON: `{"identified":true,"width":W,"height":H,"analyzed":true}` for a JPEG,
+  PNG, GIF, WebP, TIFF or simple SVG, read from its header and swapped for the EXIF orientations ImageAnalyzer::Vips
+  swaps; `{"identified":true,"analyzed":true}` otherwise; fuzzed against Rails in Campfire's
+  `test/differential/fuzz_identify`), read like a nested object (`avatar&.filename`, or `unless avatar.nil?` on a local first), and
   `avatar.store(root)` writes the file the way Active Storage's Disk service does: under a new 28-character lowercase
   base36 key, at `<root>/<key[0,2]>/<key[2,2]>/<key>`, and gives the key back. The `active_storage_blobs` and
   `active_storage_attachments` rows are the app's own `execute` statements (`key`, `filename`, `content_type`,
@@ -102,7 +135,9 @@ end
   under `use_layer :trace, forwarded: true`) in front of the path. The response has an empty body and `Content-Type: text/html; charset=utf-8`, as Rails' `redirect_to` does.
   A body may not combine `status(...)` with a helper's `status:`;
   `render :signup, locals: { ... }` answers with a view (see below and [Views](views.md)); and
-  `halt(status, body)` stops with that status (or `halt(status)` with no body). They are values, so they
+  `halt(status, body)` stops with that status (or `halt(status)` with no body); `head(status)` is Rails'
+  `head :forbidden` from an action: an empty `text/html` response that `:rack_defaults` still refreshes the
+  session cookies on, even for a 4xx. They are values, so they
   can be the body's last expression. `text`, `html`, `json` and `render` also take `status: 401` and
   `content_type: "text/vnd.turbo-stream.html"` (a string literal), which ride on the returned value, so
   `return render(:x, status: 201, content_type: "text/html", locals: { ... })` keeps both; a body may not
@@ -142,7 +177,9 @@ end
   match a route, a `serve_file` that does not skip it or the OpenAPI document is refused. `current :user, returns:
   :User?, required: :authenticate` reads `current(:user)` at its non-nil type in routes that do not skip the
   filter, and refuses a route that skips it and still reads the current. `not_found do ... end` answers a
-  request that matched no route (axum's fallback). `error do ... end` answers a route body that raised;
+  request that matched no route (axum's fallback); `not_found skip: [:authenticate] do ... end` lets such a request
+  bypass the named filters, as Rails routes a request before any controller filter (an unknown path is a 404 even
+  signed out). `error do ... end` answers a route body that raised;
   without one, the raised message becomes a plain 500.
 - **Middleware.** `use_layer :compression`, `use_layer :cors, origins: ["https://example.com"]`,
   `use_layer :timeout, secs: 5`, `use_layer :trace`, `use_layer :private_cache` (with its optional `except:` list) and
@@ -158,7 +195,11 @@ end
   whole number of seconds. `use_layer :trace, forwarded: true` logs the visitor's `X-Forwarded-For`
   address instead of the peer's (see [Deploying the emitted crate](cli.md#deploying-the-emitted-crate)).
   `:rate_limit` needs a positive `per:` (the window in seconds) and `burst:` (requests per window);
-  `path:` counts one exact path, and without it every route is counted. Past the burst the answer is 429
+  `path:` counts one exact path, and without it every route is counted; `enabled: :name` names a declared
+  integer setting read on each request, and 0 lets every request through (Rails' `rate_limit` on a `:null_store`
+  cache, as in its test environment). A layer counts before every filter; where Rails' callbacks before its
+  `rate_limit` (a ban check, say) must decide first, uncounted, use the `rate_limited?("name", to:, within:)` check in
+  a filter or route body instead (it renders whatever rejection the app writes). Past the burst the answer is 429
   `rate limit exceeded`, counted per client address (the same address `request_ip` reads). The map is
   process-wide and uses only std: no crate, and a restart clears it. The window is fixed and anchored to
   the epoch, so a client can spend `burst:` at the end of one window and again at the start of the next;
@@ -181,7 +222,9 @@ end
   `X-Permitted-Cross-Domain-Policies: none`, `Referrer-Policy: strict-origin-when-cross-origin`) on every
   response, whatever its type, that has none of its own, except a Live one: a route that writes
   `headers "X-Rack-Defaults" => "live"` (Rails' ActionController::Live controllers, such as an avatar's
-  `send_file`, which skip `default_headers`) gets none; the marker is removed before the response leaves.
+  `send_file`, which skip `default_headers`) gets none; `"unauthenticated"` (an action under Rails'
+  `allow_unauthenticated_access`, which never resumes the session) leaves the `refresh_cookies` unwritten; the
+  marker is removed before the response leaves.
   `halt(204, "")` (also 205 and 304) sends no `Content-Type`, as Rails' `head :no_content` does. `version: :app_version` and
   `revision: :git_revision` name declared settings written as `X-Version` and `X-Rev` (an empty revision writes
   none, and both still apply to a file response); `etag: true` is Rack::ETag (a weak ETag over a 200 HTML,
@@ -209,6 +252,12 @@ end
   layers it wraps the finished router rather than being a `.layer(..)` on it, because axum's `Router::layer`
   runs after the route is matched: it is outside every other layer, so `:csrf` and `:fetch_metadata` see the
   rewritten method (a `DELETE` is still a write), and `:trace` logs it.
+  `use_layer :format_extension` is Rails' optional `(.:format)` on every route: a path whose last segment ends in an
+  extension, that no route, static mount or served file answers as sent (a segment capture takes no `.`, as in Rails)
+  but a route answers without the extension, is routed without it, with `format=<format>` added to the query (a params
+  field `format` reads it); for `.turbo_stream`, `.json`, `.html`, `.js`, `.xml`, `.csv`, `.txt` and the other Rails
+  Mime type extensions the format's MIME type becomes the Accept header, so the format wins over Accept as in Rails. A route declared with the extension (`/feed.json`) is left alone.
+  It takes no keywords, and it wraps the finished router as `:method_override` does.
   `use_layer :front` is what Rack::Deflater and Thruster (the proxy in front of a Rails app) do to every
   response, as one middleware outside all the others but `:trace` (so `:rack_defaults`' ETag is over the identity
   body). It gzips a response for a client whose `Accept-Encoding` allows gzip, whatever its size or type (not
@@ -218,7 +267,9 @@ end
   `max-age` above 0 (and no `no-cache`) in memory until it expires, and answers a request with the same method,
   path, query, host and `Vary`ing headers from it with `X-Cache: hit` (a 304 when `If-None-Match` names its
   ETag); the first response is `X-Cache: miss`, and a request that cannot be cached (not GET/HEAD, an
-  upgrade, a `Range`, a URI over 2048 bytes) goes through with `X-Cache: bypass`. `cache_mb:` is the cache's
+  upgrade, a `Range`, a URI over 2048 bytes) goes through with `X-Cache: bypass`. `enabled: :name` names a declared integer setting, read on
+  each request: 0 answers without the front (no deflate, cache or Date), as Rails' test environment answers
+  without Thruster. `cache_mb:` is the cache's
   size (64; 0 turns it off); a response over 1 MB is not kept, and when the cache is full the entries nearest
   their expiry go first. Not carried over from Thruster: zstd and the BREACH padding. A gzipped response is
   buffered whole (up to 64 MiB). It adds the `flate2` crate.
@@ -232,6 +283,12 @@ end
   may only call helpers declared above it. Keyword parameters are `kw: { limit: [:i32, false] }` with a
   literal default in the block. A helper that nothing calls is refused. See
   [The body language](body-language.md).
+- **Controllers.** `controller "Accounts::Bots" do ... end` groups routes with their own `before :def, only:/except:`
+  filters and `def` methods, expanded inline where they are called (a `return` in one answers the request). Top-level
+  defs are shared by every route. See [Controllers](controllers.md).
+- **Laws.** `law :name, forall: :Params, cases: 256 do |a, b| <bool> end` is a property over a params group's
+  fields, generated within their constraints, compiled to a seeded proptest test that `axum_dsl test FILE` runs. See
+  [Laws](laws.md).
 - **Settings** are values the service reads from its environment when it starts:
   `setting :base_url, env: "API_URL", default: "https://api.example.com"`, `setting :token, env:
   "API_TOKEN", secret: true`, also `optional: true`, `description:` and `type:`. A route or a filter body
@@ -245,7 +302,7 @@ end
   cookies (`format: :rails` writes Rails' classic MessageVerifier value and `:rails7` the JSON/`_rails`
   value a default Rails 7/8 app reads), bodies read one with `cookie(:name)` (or
   `signed: false` for a plain one) and a route writes one with `set_cookie` / `delete_cookie`;
-  `random_token`, `request_ip`, `request_base_url`, `request_path`, `request_method`, `user_agent`, `turbo_frame_request?`
+  `random_token`, `request_ip`, `request_base_url`, `request_path`, `request_query`, `request_method`, `user_agent`, `request_referrer`, `turbo_frame_request?`, `turbo_stream_request?`
   (`set :trust_forwarded_for, true` makes `request_ip` read `X-Forwarded-For` without the trace layer); `current :user, returns: :User? do ... end`, a per-request value
   read with `current(:user)`; the built-in `Bcrypt.verify` / `Bcrypt.hash`; `use_layer :fetch_metadata`, which
   answers 403 to a cross-site write; `use_layer :csrf`, the signed-token check behind it (it needs

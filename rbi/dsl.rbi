@@ -23,6 +23,53 @@ class ChannelScope
   def perform(action, &blk); end
 end
 
+class ControllerScope
+  sig { params(name: Symbol, blk: T.proc.bind(ParamsScope).void).void }
+  def params(name, &blk); end
+
+  sig { params(path: String, params: T.nilable(Symbol), description: T.nilable(String), skip: T.nilable(T::Array[Symbol]), cache: T.nilable(Symbol), also: T.nilable(T::Array[Symbol]), action: T.nilable(Symbol), controller: T.nilable(String), blk: T.untyped).void }
+  def get(path, params: nil, description: nil, skip: nil, cache: nil, also: nil, action: nil, controller: nil, &blk); end
+
+  sig { params(path: String, params: T.nilable(Symbol), description: T.nilable(String), skip: T.nilable(T::Array[Symbol]), cache: T.nilable(Symbol), also: T.nilable(T::Array[Symbol]), action: T.nilable(Symbol), controller: T.nilable(String), blk: T.untyped).void }
+  def post(path, params: nil, description: nil, skip: nil, cache: nil, also: nil, action: nil, controller: nil, &blk); end
+
+  sig { params(path: String, params: T.nilable(Symbol), description: T.nilable(String), skip: T.nilable(T::Array[Symbol]), cache: T.nilable(Symbol), also: T.nilable(T::Array[Symbol]), action: T.nilable(Symbol), controller: T.nilable(String), blk: T.untyped).void }
+  def put(path, params: nil, description: nil, skip: nil, cache: nil, also: nil, action: nil, controller: nil, &blk); end
+
+  sig { params(path: String, params: T.nilable(Symbol), description: T.nilable(String), skip: T.nilable(T::Array[Symbol]), cache: T.nilable(Symbol), also: T.nilable(T::Array[Symbol]), action: T.nilable(Symbol), controller: T.nilable(String), blk: T.untyped).void }
+  def patch(path, params: nil, description: nil, skip: nil, cache: nil, also: nil, action: nil, controller: nil, &blk); end
+
+  sig { params(path: String, params: T.nilable(Symbol), description: T.nilable(String), skip: T.nilable(T::Array[Symbol]), cache: T.nilable(Symbol), also: T.nilable(T::Array[Symbol]), action: T.nilable(Symbol), controller: T.nilable(String), blk: T.untyped).void }
+  def delete(path, params: nil, description: nil, skip: nil, cache: nil, also: nil, action: nil, controller: nil, &blk); end
+
+  sig { params(path: String, params: T.nilable(Symbol), description: T.nilable(String), skip: T.nilable(T::Array[Symbol]), cache: T.nilable(Symbol), also: T.nilable(T::Array[Symbol]), action: T.nilable(Symbol), controller: T.nilable(String), blk: T.untyped).void }
+  def options(path, params: nil, description: nil, skip: nil, cache: nil, also: nil, action: nil, controller: nil, &blk); end
+
+  sig { params(path: String, params: T.nilable(Symbol), description: T.nilable(String), skip: T.nilable(T::Array[Symbol]), cache: T.nilable(Symbol), also: T.nilable(T::Array[Symbol]), action: T.nilable(Symbol), controller: T.nilable(String), blk: T.untyped).void }
+  def head(path, params: nil, description: nil, skip: nil, cache: nil, also: nil, action: nil, controller: nil, &blk); end
+
+  sig { params(name: T.nilable(Symbol), only: T.nilable(T::Array[Symbol]), except: T.nilable(T::Array[Symbol]), provides: T.nilable(Symbol), blk: T.untyped).void }
+  def before(name = nil, only: nil, except: nil, provides: nil, &blk); end
+
+  sig { void }
+  def private(); end
+
+  sig { params(name: Symbol, args: T::Array[Symbol], returns: Symbol, kw: T.nilable(T::Hash[Symbol, T.untyped]), async: T.nilable(T::Boolean), blk: T.untyped).void }
+  def helper(name, args:, returns:, kw: nil, async: nil, &blk); end
+
+  sig { params(name: Symbol, forall: T.nilable(Symbol), cases: T.nilable(Integer), blk: T.untyped).void }
+  def law(name, forall: nil, cases: nil, &blk); end
+
+  sig { params(name: Symbol, blk: T.untyped).void }
+  def view_local(name, &blk); end
+
+  sig { params(blk: T.untyped).void }
+  def page_locals(&blk); end
+
+  sig { params(blk: T.untyped).void }
+  def layout_locals(&blk); end
+end
+
 class ParamsScope
   sig { params(field_name: Symbol, type: T.any(Symbol, T.class_of(AxumDsl::Opaque)), description: T.nilable(String), optional: T.nilable(T::Boolean), default: T.nilable(T.any(String, Integer, Float, T::Boolean, T::Array[T.any(String, Integer, Float)])), min: T.nilable(T.any(Integer, Float)), max: T.nilable(T.any(Integer, Float)), exclusive_min: T.nilable(T.any(Integer, Float)), exclusive_max: T.nilable(T.any(Integer, Float)), multiple_of: T.nilable(T.any(Integer, Float)), min_length: T.nilable(Integer), max_length: T.nilable(Integer), pattern: T.nilable(String), enum: T.nilable(T::Array[String]), format: T.nilable(Symbol), min_items: T.nilable(Integer), max_items: T.nilable(Integer), in: T.nilable(Symbol), name: T.nilable(String), from: T.nilable(Symbol)).void }
   def field(field_name, type, description: nil, optional: nil, default: nil, min: nil, max: nil, exclusive_min: nil, exclusive_max: nil, multiple_of: nil, min_length: nil, max_length: nil, pattern: nil, enum: nil, format: nil, min_items: nil, max_items: nil, in: nil, name: nil, from: nil); end
@@ -37,6 +84,60 @@ end
 class RecordScope
   sig { params(field_name: Symbol, type: T.any(Symbol, T.class_of(AxumDsl::Opaque)), description: T.nilable(String), optional: T.nilable(T::Boolean), default: T.nilable(T.any(String, Integer, Float, T::Boolean, T::Array[T.any(String, Integer, Float)])), min: T.nilable(T.any(Integer, Float)), max: T.nilable(T.any(Integer, Float)), exclusive_min: T.nilable(T.any(Integer, Float)), exclusive_max: T.nilable(T.any(Integer, Float)), multiple_of: T.nilable(T.any(Integer, Float)), min_length: T.nilable(Integer), max_length: T.nilable(Integer), pattern: T.nilable(String), enum: T.nilable(T::Array[String]), format: T.nilable(Symbol), min_items: T.nilable(Integer), max_items: T.nilable(Integer), in: T.nilable(Symbol), name: T.nilable(String), from: T.nilable(Symbol)).void }
   def field(field_name, type, description: nil, optional: nil, default: nil, min: nil, max: nil, exclusive_min: nil, exclusive_max: nil, multiple_of: nil, min_length: nil, max_length: nil, pattern: nil, enum: nil, format: nil, min_items: nil, max_items: nil, in: nil, name: nil, from: nil); end
+end
+
+class TableScope
+  sig { params(column_name: Symbol, type: T.any(Symbol, T.class_of(AxumDsl::Opaque)), optional: T.nilable(T::Boolean)).void }
+  def field(column_name, type, optional: nil); end
+end
+
+class ModelScope
+  sig { params(name: Symbol, body: T.untyped).void }
+  def scope(name, body); end
+
+  sig { params(name: Symbol).void }
+  def include(name); end
+
+  sig { params(name: Symbol, through: T.nilable(Symbol), dependent: T.nilable(Symbol), table: T.nilable(Symbol), model: T.nilable(T.any(Symbol, String)), foreign_key: T.nilable(Symbol), as: T.nilable(Symbol)).void }
+  def has_many(name, through: nil, dependent: nil, table: nil, model: nil, foreign_key: nil, as: nil); end
+
+  sig { params(name: Symbol, body: T.untyped, through: T.nilable(Symbol), dependent: T.nilable(Symbol), table: T.nilable(Symbol), model: T.nilable(T.any(Symbol, String)), foreign_key: T.nilable(Symbol), as: T.nilable(Symbol)).void }
+  def has_one(name, body = nil, through: nil, dependent: nil, table: nil, model: nil, foreign_key: nil, as: nil); end
+
+  sig { params(name: Symbol, through: T.nilable(Symbol), dependent: T.nilable(Symbol), table: T.nilable(Symbol), model: T.nilable(T.any(Symbol, String)), foreign_key: T.nilable(Symbol), as: T.nilable(Symbol)).void }
+  def belongs_to(name, through: nil, dependent: nil, table: nil, model: nil, foreign_key: nil, as: nil); end
+
+  sig { params(name: Symbol).void }
+  def has_one_attached(name); end
+
+  sig { params(name: Symbol, args: T::Array[Symbol], returns: Symbol, kw: T.nilable(T::Hash[Symbol, T.untyped]), async: T.nilable(T::Boolean), blk: T.untyped).void }
+  def helper(name, args:, returns:, kw: nil, async: nil, &blk); end
+
+  sig { params(name: Symbol, forall: T.nilable(Symbol), cases: T.nilable(Integer), blk: T.untyped).void }
+  def law(name, forall: nil, cases: nil, &blk); end
+
+  sig { params(name: Symbol, returns: Symbol, required: T.nilable(Symbol), reader: T.nilable(Symbol), missing: T.nilable(String), blk: T.untyped).void }
+  def current(name, returns:, required: nil, reader: nil, missing: nil, &blk); end
+
+  sig { params(name: Symbol, blk: T.proc.bind(RecordScope).void).void }
+  def record(name, &blk); end
+
+  sig { params(name: Symbol, blk: T.proc.bind(TableScope).void).void }
+  def table(name, &blk); end
+
+  sig { params(name: Symbol, args: T::Hash[Symbol, Symbol], returns: T.untyped, sql: T.nilable(String), blk: T.untyped).void }
+  def query(name, args:, returns:, sql: nil, &blk); end
+
+  sig { params(name: Symbol, args: T::Hash[Symbol, Symbol], sql: T.nilable(String), blk: T.untyped).void }
+  def execute(name, args:, sql: nil, &blk); end
+
+  sig { params(name: Symbol, type: Symbol, sql: String, of: T.nilable(Symbol), args: T.nilable(T::Hash[Symbol, Symbol])).void }
+  def expr(name, type:, sql:, of: nil, args: nil); end
+end
+
+class ConcernScope
+  sig { params(name: Symbol, type: Symbol, sql: String, of: T.nilable(Symbol), args: T.nilable(T::Hash[Symbol, Symbol])).void }
+  def expr(name, type:, sql:, of: nil, args: nil); end
 end
 
 sig { returns(T::Hash[T.any(Symbol, String), T.untyped]) }
@@ -54,14 +155,17 @@ def html(value, status: nil, content_type: nil); end
 sig { params(value: T.untyped, status: T.nilable(Integer), content_type: T.nilable(String)).returns(T.untyped) }
 def json(value, status: nil, content_type: nil); end
 
-sig { params(path: String, status: T.nilable(Integer)).returns(T.untyped) }
-def redirect(path, status: nil); end
+sig { params(path: String, status: T.nilable(Integer), notice: T.nilable(Symbol), alert: T.nilable(Symbol)).returns(T.untyped) }
+def redirect(path, status: nil, notice: nil, alert: nil); end
 
 sig { params(status: T.any(Integer, Symbol), body: T.untyped).returns(T.untyped) }
 def halt(status, body = nil); end
 
-sig { params(name: T.any(Symbol, String), locals: T.untyped, layout: T.nilable(T.any(Symbol, String)), status: T.nilable(Integer), content_type: T.nilable(String)).returns(T.untyped) }
-def render(name, locals: nil, layout: nil, status: nil, content_type: nil); end
+sig { params(status: T.any(Integer, Symbol, String), params: T.nilable(Symbol), description: T.nilable(String), skip: T.nilable(T::Array[Symbol]), cache: T.nilable(Symbol), also: T.nilable(T::Array[Symbol]), action: T.nilable(Symbol), blk: T.untyped).returns(T.untyped) }
+def head(status, params: nil, description: nil, skip: nil, cache: nil, also: nil, action: nil, &blk); end
+
+sig { params(name: T.any(Symbol, String), locals: T.untyped, layout: T.nilable(T.any(Symbol, String)), status: T.nilable(Integer), content_type: T.nilable(String), frame_layout: T.nilable(T::Boolean)).returns(T.untyped) }
+def render(name, locals: nil, layout: nil, status: nil, content_type: nil, frame_layout: nil); end
 
 sig { params(path: String, status: T.nilable(Integer), content_type: T.nilable(String), disposition: T.nilable(Symbol)).returns(T.untyped) }
 def send_file(path, status: nil, content_type: nil, disposition: nil); end
@@ -99,6 +203,21 @@ def close_remote_connections(user, reconnect: nil); end
 sig { params(parts: T.any(String, Symbol), action: Symbol, target: String, html: T.nilable(String), maintain_scroll: T.nilable(T::Boolean)).void }
 def broadcast_turbo(*parts, action:, target:, html: nil, maintain_scroll: nil); end
 
+sig { params(streamable: T.untyped, parts: T.any(String, Symbol), target: String, html: String, maintain_scroll: T.nilable(T::Boolean), app: T.nilable(String)).void }
+def broadcast_append_to(streamable, *parts, target:, html:, maintain_scroll: nil, app: nil); end
+
+sig { params(streamable: T.untyped, parts: T.any(String, Symbol), target: String, html: String, maintain_scroll: T.nilable(T::Boolean), app: T.nilable(String)).void }
+def broadcast_prepend_to(streamable, *parts, target:, html:, maintain_scroll: nil, app: nil); end
+
+sig { params(streamable: T.untyped, parts: T.any(String, Symbol), target: String, html: String, maintain_scroll: T.nilable(T::Boolean), app: T.nilable(String)).void }
+def broadcast_replace_to(streamable, *parts, target:, html:, maintain_scroll: nil, app: nil); end
+
+sig { params(streamable: T.untyped, parts: T.any(String, Symbol), target: String, html: String, maintain_scroll: T.nilable(T::Boolean), app: T.nilable(String)).void }
+def broadcast_update_to(streamable, *parts, target:, html:, maintain_scroll: nil, app: nil); end
+
+sig { params(streamable: T.untyped, parts: T.any(String, Symbol), target: String, maintain_scroll: T.nilable(T::Boolean), app: T.nilable(String)).void }
+def broadcast_remove_to(streamable, *parts, target:, maintain_scroll: nil, app: nil); end
+
 sig { params(name: T.any(Symbol, String), locals: T.untyped).returns(String) }
 def render_string(name, locals: nil); end
 
@@ -114,6 +233,24 @@ def urlsafe_decode64(text); end
 sig { params(text: String).returns(T.nilable(String)) }
 def qr_code_svg(text); end
 
+sig { params(path: String, filename: String, width: Integer, height: Integer).returns(T.untyped) }
+def image_variant(path, filename, width, height); end
+
+sig { params(name: Symbol, owner_id: Integer, stored: T.untyped, fresh: T.nilable(T::Boolean)).returns(Integer) }
+def attach(name, owner_id, stored, fresh: nil); end
+
+sig { params(url: String).returns(T.nilable(String)) }
+def opengraph_unfurl(url); end
+
+sig { params(endpoint: String, p256dh: String, auth: String, payload: String, vapid_public: String, vapid_private: String, subject: String).returns(Integer) }
+def web_push(endpoint, p256dh, auth, payload, vapid_public, vapid_private, subject); end
+
+sig { params(url: String, payload: String).returns(T.nilable(String)) }
+def webhook_post(url, payload); end
+
+sig { params(blk: T.untyped).void }
+def later(&blk); end
+
 sig { params(key: String, filename: String, content_type: String, secret: Symbol).returns(String) }
 def active_storage_disk_path(key, filename, content_type, secret:); end
 
@@ -122,6 +259,18 @@ def active_storage_verified_id(token, secret:); end
 
 sig { params(token: String, secret: Symbol).returns(T.nilable(String)) }
 def active_storage_verified_key(token, secret:); end
+
+sig { params(key: String, content_type: String, byte_size: Integer, checksum: String, secret: Symbol).returns(String) }
+def active_storage_direct_upload_url(key, content_type, byte_size, checksum, secret:); end
+
+sig { params(token: String, root: String, secret: Symbol).returns(Integer) }
+def active_storage_disk_upload(token, root, secret:); end
+
+sig { params(id: Integer, secret: Symbol).returns(String) }
+def active_storage_blob_id(id, secret:); end
+
+sig { returns(String) }
+def active_storage_key; end
 
 sig { params(filename: String).returns(String) }
 def inline_disposition(filename); end
@@ -187,6 +336,9 @@ sig { returns(String) }
 def request_base_url; end
 
 sig { returns(String) }
+def request_query; end
+
+sig { returns(String) }
 def request_path; end
 
 sig { returns(String) }
@@ -195,14 +347,41 @@ def request_method; end
 sig { returns(String) }
 def request_body; end
 
+sig { params(html: String).returns(String) }
+def action_text_html(html); end
+
+sig { params(name: Symbol).returns(T.untyped) }
+def request_upload(name); end
+
 sig { returns(String) }
 def user_agent; end
+
+sig { params(name: Symbol, value: String, format: T.nilable(Symbol), signed: T.nilable(T::Boolean)).returns(String) }
+def cookie_header(name, value, format: nil, signed: nil); end
+
+sig { params(method: Symbol, path: String, body: T.nilable(String), headers: T.nilable(T::Hash[String, String])).returns(T.untyped) }
+def respond(method, path, body: nil, headers: nil); end
+
+sig { params(name: String, to: Integer, within: Integer).returns(T::Boolean) }
+def rate_limited?(name, to:, within:); end
+
+sig { returns(String) }
+def request_referrer; end
 
 sig { returns(T::Boolean) }
 def turbo_frame_request?; end
 
-sig { params(name: Symbol, returns: T.untyped, required: T.nilable(Symbol), blk: T.untyped).returns(T.untyped) }
-def current(name, returns: nil, required: nil, &blk); end
+sig { returns(T::Boolean) }
+def turbo_stream_request?; end
+
+sig { params(name: Symbol, returns: T.untyped, required: T.nilable(Symbol), reader: T.nilable(Symbol), blk: T.untyped).returns(T.untyped) }
+def current(name, returns: nil, required: nil, reader: nil, &blk); end
+
+sig { returns(T.untyped) }
+def take_flash; end
+
+sig { params(key: String, args: T.untyped).returns(String) }
+def t(key, **args); end
 
 sig { params(name: String, version: String).void }
 def server(name, version:); end
@@ -226,35 +405,47 @@ sig { returns(T::Hash[T.any(Symbol, String), T.untyped]) }
 sig { params(name: Symbol, blk: T.proc.bind(ParamsScope).void).void }
 def params(name, &blk); end
 
-sig { params(name: Symbol, origins: T.nilable(T::Array[String]), secs: T.nilable(Integer), forwarded: T.nilable(T::Boolean), per: T.nilable(Integer), burst: T.nilable(Integer), path: T.nilable(String), except: T.nilable(T::Array[String]), security_headers: T.nilable(T::Boolean), version: T.nilable(Symbol), revision: T.nilable(Symbol), etag: T.nilable(T::Boolean), vary_accept: T.nilable(T::Boolean), preload: T.nilable(T::Array[String]), refresh_cookies: T.nilable(T::Array[String]), session_cookie: T.nilable(String), cache_mb: T.nilable(Integer)).void }
-def use_layer(name, origins: nil, secs: nil, forwarded: nil, per: nil, burst: nil, path: nil, except: nil, security_headers: nil, version: nil, revision: nil, etag: nil, vary_accept: nil, preload: nil, refresh_cookies: nil, session_cookie: nil, cache_mb: nil); end
+sig { params(name: Symbol, origins: T.nilable(T::Array[String]), secs: T.nilable(Integer), forwarded: T.nilable(T::Boolean), per: T.nilable(Integer), burst: T.nilable(Integer), path: T.nilable(String), enabled: T.nilable(Symbol), except: T.nilable(T::Array[String]), security_headers: T.nilable(T::Boolean), version: T.nilable(Symbol), revision: T.nilable(Symbol), etag: T.nilable(T::Boolean), vary_accept: T.nilable(T::Boolean), preload: T.nilable(T::Array[String]), refresh_cookies: T.nilable(T::Array[String]), session_cookie: T.nilable(String), cache_mb: T.nilable(Integer)).void }
+def use_layer(name, origins: nil, secs: nil, forwarded: nil, per: nil, burst: nil, path: nil, enabled: nil, except: nil, security_headers: nil, version: nil, revision: nil, etag: nil, vary_accept: nil, preload: nil, refresh_cookies: nil, session_cookie: nil, cache_mb: nil); end
 
-sig { params(path: String, params: T.nilable(Symbol), description: T.nilable(String), skip: T.nilable(T::Array[Symbol]), cache: T.nilable(Symbol), blk: T.untyped).void }
-def get(path, params: nil, description: nil, skip: nil, cache: nil, &blk); end
+sig { params(name: Symbol, only: T.nilable(T::Array[Symbol]), except: T.nilable(T::Array[Symbol]), controller: T.nilable(String), params: T.nilable(T.any(Symbol, T::Hash[Symbol, Symbol])), description: T.nilable(T.any(String, T::Hash[Symbol, String])), cache: T.nilable(Symbol), model: T.nilable(T.any(Symbol, String)), blk: T.untyped).void }
+def resources(name, only: nil, except: nil, controller: nil, params: nil, description: nil, cache: nil, model: nil, &blk); end
 
-sig { params(path: String, params: T.nilable(Symbol), description: T.nilable(String), skip: T.nilable(T::Array[Symbol]), cache: T.nilable(Symbol), blk: T.untyped).void }
-def post(path, params: nil, description: nil, skip: nil, cache: nil, &blk); end
+sig { params(path: String, blk: T.untyped).void }
+def scope(path:, &blk); end
 
-sig { params(path: String, params: T.nilable(Symbol), description: T.nilable(String), skip: T.nilable(T::Array[Symbol]), cache: T.nilable(Symbol), blk: T.untyped).void }
-def put(path, params: nil, description: nil, skip: nil, cache: nil, &blk); end
+sig { params(path: String, params: T.nilable(Symbol), description: T.nilable(String), skip: T.nilable(T::Array[Symbol]), cache: T.nilable(Symbol), also: T.nilable(T::Array[Symbol]), action: T.nilable(Symbol), controller: T.nilable(String), blk: T.untyped).void }
+def get(path, params: nil, description: nil, skip: nil, cache: nil, also: nil, action: nil, controller: nil, &blk); end
 
-sig { params(path: String, params: T.nilable(Symbol), description: T.nilable(String), skip: T.nilable(T::Array[Symbol]), cache: T.nilable(Symbol), blk: T.untyped).void }
-def patch(path, params: nil, description: nil, skip: nil, cache: nil, &blk); end
+sig { params(path: String, params: T.nilable(Symbol), description: T.nilable(String), skip: T.nilable(T::Array[Symbol]), cache: T.nilable(Symbol), also: T.nilable(T::Array[Symbol]), action: T.nilable(Symbol), controller: T.nilable(String), blk: T.untyped).void }
+def post(path, params: nil, description: nil, skip: nil, cache: nil, also: nil, action: nil, controller: nil, &blk); end
 
-sig { params(path: String, params: T.nilable(Symbol), description: T.nilable(String), skip: T.nilable(T::Array[Symbol]), cache: T.nilable(Symbol), blk: T.untyped).void }
-def delete(path, params: nil, description: nil, skip: nil, cache: nil, &blk); end
+sig { params(path: String, params: T.nilable(Symbol), description: T.nilable(String), skip: T.nilable(T::Array[Symbol]), cache: T.nilable(Symbol), also: T.nilable(T::Array[Symbol]), action: T.nilable(Symbol), controller: T.nilable(String), blk: T.untyped).void }
+def put(path, params: nil, description: nil, skip: nil, cache: nil, also: nil, action: nil, controller: nil, &blk); end
 
-sig { params(path: String, params: T.nilable(Symbol), description: T.nilable(String), skip: T.nilable(T::Array[Symbol]), cache: T.nilable(Symbol), blk: T.untyped).void }
-def options(path, params: nil, description: nil, skip: nil, cache: nil, &blk); end
+sig { params(path: String, params: T.nilable(Symbol), description: T.nilable(String), skip: T.nilable(T::Array[Symbol]), cache: T.nilable(Symbol), also: T.nilable(T::Array[Symbol]), action: T.nilable(Symbol), controller: T.nilable(String), blk: T.untyped).void }
+def patch(path, params: nil, description: nil, skip: nil, cache: nil, also: nil, action: nil, controller: nil, &blk); end
 
-sig { params(path: String, params: T.nilable(Symbol), description: T.nilable(String), skip: T.nilable(T::Array[Symbol]), cache: T.nilable(Symbol), blk: T.untyped).void }
-def head(path, params: nil, description: nil, skip: nil, cache: nil, &blk); end
+sig { params(path: String, params: T.nilable(Symbol), description: T.nilable(String), skip: T.nilable(T::Array[Symbol]), cache: T.nilable(Symbol), also: T.nilable(T::Array[Symbol]), action: T.nilable(Symbol), controller: T.nilable(String), blk: T.untyped).void }
+def delete(path, params: nil, description: nil, skip: nil, cache: nil, also: nil, action: nil, controller: nil, &blk); end
 
-sig { params(name: T.nilable(Symbol), blk: T.untyped).void }
-def before(name = nil, &blk); end
+sig { params(path: String, params: T.nilable(Symbol), description: T.nilable(String), skip: T.nilable(T::Array[Symbol]), cache: T.nilable(Symbol), also: T.nilable(T::Array[Symbol]), action: T.nilable(Symbol), controller: T.nilable(String), blk: T.untyped).void }
+def options(path, params: nil, description: nil, skip: nil, cache: nil, also: nil, action: nil, controller: nil, &blk); end
 
-sig { params(blk: T.untyped).void }
-def not_found(&blk); end
+sig { params(name: T.nilable(Symbol), only: T.nilable(T::Array[Symbol]), except: T.nilable(T::Array[Symbol]), provides: T.nilable(Symbol), blk: T.untyped).void }
+def before(name = nil, only: nil, except: nil, provides: nil, &blk); end
+
+sig { params(name: T.nilable(String), blk: T.proc.bind(ControllerScope).void).void }
+def controller(name = nil, &blk); end
+
+sig { params(name: T.nilable(T.any(Symbol, String)), table: T.nilable(Symbol), blk: T.proc.bind(ModelScope).void).void }
+def model(name = nil, table: nil, &blk); end
+
+sig { params(name: Symbol, blk: T.proc.bind(ConcernScope).void).void }
+def concern(name, &blk); end
+
+sig { params(skip: T.nilable(T::Array[Symbol]), blk: T.untyped).void }
+def not_found(skip: nil, &blk); end
 
 sig { params(blk: T.untyped).void }
 def error(&blk); end
@@ -262,11 +453,29 @@ def error(&blk); end
 sig { params(name: Symbol, args: T::Array[Symbol], returns: Symbol, kw: T.nilable(T::Hash[Symbol, T.untyped]), async: T.nilable(T::Boolean), blk: T.untyped).void }
 def helper(name, args:, returns:, kw: nil, async: nil, &blk); end
 
+sig { params(name: Symbol, forall: T.nilable(Symbol), cases: T.nilable(Integer), blk: T.untyped).void }
+def law(name, forall: nil, cases: nil, &blk); end
+
 sig { params(secret: Symbol, format: T.nilable(Symbol)).void }
 def cookies(secret:, format: nil); end
 
 sig { params(name: Symbol, tags: T::Array[String], attributes: T::Array[String], link_rel: T.nilable(T::Boolean), autolink_target: T.nilable(String), attachments: T.nilable(T::Hash[String, T.untyped]), sounds: T.nilable(T::Hash[String, T.untyped]), sound_partials: T.nilable(T::Hash[String, T.untyped])).void }
 def sanitizer(name, tags:, attributes:, link_rel: nil, autolink_target: nil, attachments: nil, sounds: nil, sound_partials: nil); end
+
+sig { params(name: Symbol, blk: T.untyped).void }
+def view_local(name, &blk); end
+
+sig { params(blk: T.untyped).void }
+def page_locals(&blk); end
+
+sig { params(blk: T.untyped).void }
+def layout_locals(&blk); end
+
+sig { params(cookie: String, notice: T.nilable(T::Hash[String, T.untyped]), alert: T.nilable(T::Hash[String, T.untyped])).void }
+def flash(cookie:, notice: nil, alert: nil); end
+
+sig { params(locale: Symbol).void }
+def default_locale(locale); end
 
 sig { params(adapter: Symbol, path: String, env: T.nilable(String)).void }
 def database(adapter, path:, env: nil); end
@@ -277,11 +486,17 @@ def migrations(path); end
 sig { params(name: Symbol, blk: T.proc.bind(RecordScope).void).void }
 def record(name, &blk); end
 
-sig { params(name: Symbol, args: T::Hash[Symbol, Symbol], returns: T.untyped, sql: String).void }
-def query(name, args:, returns:, sql:); end
+sig { params(name: Symbol, blk: T.proc.bind(TableScope).void).void }
+def table(name, &blk); end
 
-sig { params(name: Symbol, args: T::Hash[Symbol, Symbol], sql: String).void }
-def execute(name, args:, sql:); end
+sig { params(name: Symbol, args: T::Hash[Symbol, Symbol], returns: T.untyped, sql: T.nilable(String), blk: T.untyped).void }
+def query(name, args:, returns:, sql: nil, &blk); end
+
+sig { params(name: Symbol, args: T::Hash[Symbol, Symbol], sql: T.nilable(String), blk: T.untyped).void }
+def execute(name, args:, sql: nil, &blk); end
+
+sig { params(name: Symbol, type: Symbol, sql: String, of: T.nilable(Symbol), args: T.nilable(T::Hash[Symbol, Symbol])).void }
+def expr(name, type:, sql:, of: nil, args: nil); end
 
 sig { params(name: Symbol).void }
 def use_bindings(name); end

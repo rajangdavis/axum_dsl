@@ -134,8 +134,9 @@ module AxumDsl
         # Rack::ETag tags a 200/201 with a body whatever the method; only the 304 below is ConditionalGet's, for GET and HEAD.
         # The failed login (401) is a rendered page too, in the layout: it is read for the preload Link, and never tagged.
         out << "    if matches!(response.status().as_u16(), 200 | 201 | 401) && !response.headers().contains_key(header::CONTENT_ENCODING)"
-        # Rack::ETag also tags a Turbo Stream answer (GET /rooms/:id/refresh); file bodies stay unbuffered, as Rack skips to_path bodies.
-        out << "        && (content_type.starts_with(\"text/html\") || content_type.starts_with(\"text/vnd.turbo-stream.html\") || content_type.starts_with(\"application/json\"))"
+        # Rack::ETag also tags a Turbo Stream answer (GET /rooms/:id/refresh) and a rendered script (the service worker);
+        # file bodies stay unbuffered, as Rack skips to_path bodies.
+        out << "        && (content_type.starts_with(\"text/html\") || content_type.starts_with(\"text/vnd.turbo-stream.html\") || content_type.starts_with(\"application/json\") || content_type.starts_with(\"text/javascript\"))"
         out << "    {"
         out << "        let (#{e['etag'] ? 'mut ' : ''}parts, body) = response.into_parts();"
         out << "        let bytes = match ::axum::body::to_bytes(body, #{BODY_LIMIT}).await {"
@@ -181,7 +182,12 @@ module AxumDsl
       out << "    let live = marker.split(',').any(|token| token.trim() == \"live\");"
       out << "    let engine = marker.split(',').any(|token| token.trim() == \"engine\");"
       out << "    let write_session = marker.split(',').any(|token| token.trim() == \"write_session\");"
-      out << "    let _ = (live, engine, write_session);"
+      # `head(status)` (body.rb head_response) answered from the action, so a 4xx still refreshes the cookies.
+      out << "    let from_action = marker.split(',').any(|token| token.trim() == \"head\");"
+      # `unauthenticated`: an action Rails runs under allow_unauthenticated_access, which never resumes the session,
+      # so the refresh_cookies are not written back (the session cookie still is, as Rails' session middleware does).
+      out << "    let unauthenticated = marker.split(',').any(|token| token.trim() == \"unauthenticated\");"
+      out << "    let _ = (live, engine, write_session, from_action, unauthenticated);"
       if e["security_headers"]
         # Rails' config.action_dispatch.default_headers are on every response, whatever its type, except a Live one.
         out << "    if !live {"
@@ -229,10 +235,10 @@ module AxumDsl
       end
       unless cookies.empty? && !e["session_cookie"]
         redirect_to_login = "(status.is_redirection() && headers.get(header::LOCATION).and_then(|v| v.to_str().ok()).map_or(false, |l| l.ends_with(\"/session/new\")))"
-        out << "    if (status.as_u16() < 400 || status == StatusCode::UNAUTHORIZED) && !#{redirect_to_login} {"
+        out << "    if (status.as_u16() < 400 || status == StatusCode::UNAUTHORIZED || from_action) && !#{redirect_to_login} {"
         out << "        let written = |headers: &::axum::http::HeaderMap, name: &str| headers.get_all(header::SET_COOKIE).iter().any(|v| v.to_str().map_or(false, |v| v.starts_with(&format!(\"{name}=\"))));"
         cookies.each do |name|
-          out << "        if !engine && !written(headers, #{s.(name)}) {"
+          out << "        if !engine && !unauthenticated && !written(headers, #{s.(name)}) {"
           out << "            if let Some(value) = carried(#{s.(name)}) {"
           out << "                if let Ok(line) = HeaderValue::from_str(&format!(\"{}={}; Path=/; Max-Age=#{PERMANENT_MAX_AGE}; SameSite=Lax; HttpOnly\", #{s.(name)}, value)) {"
           out << "                    headers.append(header::SET_COOKIE, line);"

@@ -7,12 +7,16 @@ module AxumDsl
   # filters and the typed helpers all sit at the top level, and there is no enclosing block.
   class Reader
     include Diag
+    include RelationQueries
+    include TypeGraph::Sites
 
-    def initialize(path, types: nil)
+    def initialize(path, types: nil, graph: nil)
       @path = path
+      @graph = graph # a TypeGraph when `axum_dsl graph` or the language server asks how the types derive
       @regexes = []
       @types = types # a TypeNames::Collector when `check --types` asks for the inferred types
       @flags = types ? { "types" => types } : {}
+      @flags["graph"] = graph if graph
       @bindings = {}         # use_bindings name => BindingFile
       @binding_modules = {}  # module name (Heck) => BindingFile
       @binding_nodes = {}
@@ -59,7 +63,7 @@ module AxumDsl
               "crates" => [], "items" => [], "item_lines" => [], "externs" => {}, "modules" => [],
               "files" => [], "subprocs" => [], "binding_fns" => [], "opaque_types" => [],
               "statics" => [], "serve_files" => [], "assets" => [], "layers" => [], "views" => nil, "layout" => nil,
-              "database" => nil, "migrations" => nil, "records" => [], "queries" => [],
+              "database" => nil, "migrations" => nil, "records" => [], "tables" => [], "models" => [], "exprs" => [], "queries" => [],
               "cookies" => nil, "currents" => [], "builtins" => [], "sanitizers" => [], "cable" => nil }
       @helper_table = {}   # helpers compiled so far, in declaration order: name -> record
       @helper_decls = {}   # helper name -> its DSL node (for messages)
@@ -67,23 +71,36 @@ module AxumDsl
       current_nodes = []
       route_nodes = []
       cable_nodes = []
+      law_nodes = []
       filters = []
       # One declaration of the file, from this file or from a fragment use_dsl splices in at its line.
       declare = lambda do |n, p, k, b|
+        next add_def(n, nil) if n.is_a?(Prism::DefNode) # a top-level def: a model or concern method any route may call
         case n.name
         when :use_dsl then splice(n, p[0], srv, &declare)
         when :server then server_decl(n, p, k, srv)
         when :set then add_set(n, p, srv)
         when :params then srv["params"] << params_decl(n, p, b, srv)
         when :helper then helper_nodes << [n, p, k, b]
+        when :law then law_nodes << [n, p, k, b]
+        when :controller then controller_decl(n, p, b, srv, route_nodes, declare)
+        when :model then model_decl(n, p, k, b, declare)
+        when :concern then concern_decl(n, p, b, srv)
+        when :expr then add_expr(n, p, k, srv)
+        when :flash then add_flash(n, k, srv)
+        when :default_locale then default_locale_decl(n, p)
         when :setting then add_setting(n, p, k, srv)
         when :cookies then add_cookies(n, k, srv)
         when :sanitizer then add_sanitizer(n, p, k, srv)
         when :current then current_nodes << [n, p, k, b]
+        when :view_local then view_local_decl(n, p, b)
+        when :page_locals then page_locals_decl(n, b)
+        when :layout_locals then layout_locals_decl(n, b)
         when :database then add_database(n, p, k, srv)
         when :migrations then add_migrations(n, p, srv)
         when :record then add_record(n, p, b, srv)
-        when :query, :execute then add_query(n, p, k, srv)
+        when :table then add_table(n, p, b, srv)
+        when :query, :execute then add_query(n, p, k, srv, b)
         when :rust_crate then add_crate(n, p, srv, k)
         when :rust_item then add_item(n, p, srv)
         when :rust_fn then add_extern(n, p, k, srv)
@@ -98,12 +115,16 @@ module AxumDsl
         when :cmd_fn then add_cmd(n, p, k, srv)
         when :script_fn then add_script(n, p, k, srv)
         when :before, :not_found, :error then filters << [n, p, k, b]
-        when :get, :post, :put, :patch, :delete, :options, :head then route_nodes << [n, p, k, b]
+        when :resources then resources_decl(n, p, k, b, srv, route_nodes)
+        when :scope then scope_decl(n, k, b, declare)
+        when :get, :post, :put, :patch, :delete, :options, :head then route_nodes << [n, prefixed_pos(p), k, b, nil]
         when :fragment then bad(n, "`fragment` is only written in a file use_dsl includes; this file is built directly")
         else bad(n, "unexpected declaration `#{n.name}`")
         end
       end
       nodes.each do |n|
+        next declare.call(n, nil, nil, nil) if n.is_a?(Prism::DefNode)
+
         p, k, b = call(n, :top)
         declare.call(n, p, k, b)
       end
@@ -118,25 +139,43 @@ module AxumDsl
       check_listener(srv)
       check_cookies(srv)
       check_database(srv)
+      check_models(srv)
+      check_attached(srv)
+      check_relation_queries(srv)
+      announce_attached(srv)
+      @helper_names = helper_nodes.map { |_n, p, _k, _b| p[0].to_s } # a record method may not call one
       check_queries(srv)
       @helper_async = resolve_helper_async(helper_nodes, srv)
       @helper_blocks = helper_nodes.to_h { |_n, p, _k, b| [p[0].to_s, b] } # a cached route is refused when a helper it calls is not repeatable
       helper_nodes.each { |n, p, k, b| helper_decl(n, p, k, b, srv) }
       srv["user_helpers"] = @helper_table.values
+      ((@global_defs || {}).merge(*(@controller_defs || {}).values)).each do |dname, dnode|
+        bad(dnode, "def `#{dname}` has the name of a helper, which it would hide") if @helper_table.key?(dname)
+      end
       current_nodes.each { |n, p, k, b| current_decl(n, p, k, b, srv) }
+      check_current_readers(srv)
       filters.each { |n, p, k, b| filter_decl(n, p, k, b, srv) }
       check_required_currents(srv)
       check_static_skips(srv)
-      route_nodes.each do |n, p, k, b|
-        decl = route_decl(n, p, k, b, srv)
+      route_nodes.each do |n, p, k, b, verb|
+        decl = route_decl(n, p, k, b, srv, verb: verb)
         srv["routes"] << decl
         (@route_decl_nodes ||= []) << [decl, n]
       end
       cable_nodes.each { |n, p, k, b| add_cable(n, p, k, b, srv) } # after the routes, the currents and the queries it names
+      srv["laws"] = []
+      # Laws compile last, so the checked arithmetic and to_i runtime only they add is known: the release build has no
+      # caller for it.
+      runtime_before = [(@flags["checked"] || {}).keys, (@flags["helpers"] || {}).keys]
+      outside_before = (@flags["queries_outside"] || {}).keys
+      law_nodes.each { |n, p, k, b| law_decl(n, p, k, b, srv) } # after every helper: a law calls helpers by name
+      srv["law_only_runtime"] = ((@flags["checked"] || {}).keys - runtime_before[0]) + ((@flags["helpers"] || {}).keys - runtime_before[1])
+      srv["law_only_queries"] = (@flags["queries_outside"] || {}).keys - outside_before # statements whose pooled wrapper only laws call
       check_broadcast_sites(srv)
       check_private_cache_except(srv) # statics and routes are both complete now
       check_rack_defaults(srv)
       check_response_cache(srv)
+      check_rate_limit(srv)
       check_filter_skips(srv)
       # The response cache finds its routes by the same run-time path match a `skip:` uses.
       srv["filter_skips"] = true if srv["routes"].any? { |r| r["skip"].to_a.any? || r["cache"] } || srv["statics"].any? { |s| s["skip"].to_a.any? } || srv["serve_files"].any? { |f| f["skip"].to_a.any? } || (srv["cable"] && srv["before"].any? { |f| f["name"] })
@@ -145,6 +184,9 @@ module AxumDsl
       lower_bindings(srv)
       srv["checked"] = (@flags["checked"] || {}).keys.sort
       srv["helpers"] = (@flags["helpers"] || {}).keys.sort
+      srv["law_only_helpers"] = law_only_helpers
+      srv["route_laws"] = true if @flags["route_laws"] # a law sends requests or runs a query: main's startup and router become functions
+      srv["law_record_eq"] = true if @flags["law_record_eq"] # a law compares query results, so the records derive PartialEq
       srv["html_escape"] = true if @flags["html_escape"] # a body used h(...), so the crate gets the escaper
       srv["html_escape_into"] = true if @flags["html_escape_into"] # a view escaped a value into its buffer
       srv["transactions"] = true if @flags["transactions"] # a body opened a transaction, so the crate gets db_tx
@@ -156,6 +198,12 @@ module AxumDsl
       srv["sanitize_renderers"] = @flags["sanitize_renderers"] || {} # the Rust each one's attachment and sound partials compile to
       srv["editable_profiles"] = (@flags["editable_profiles"] || {}).keys.sort # the sanitizers a view named with `|editable`
       srv["required_current"] = true if @flags["required_current"] # a route read a `required:` current at its non-nil type
+      srv["flash_used"] = true if @flags["flash_used"] # a body called take_flash or redirect(..., notice:/alert:)
+      # A file that calls `t` carries its locale functions; one that never does has no "i18n" key, so it emits as it always did.
+      if @flags["i18n_used"] && !@flags["i18n_used"].empty?
+        srv["i18n"] = Locales.ir(@flags["i18n_table"], @flags["i18n_used"])
+        srv["inputs"].concat(@flags["i18n_table"].files.reject { |p| srv["inputs"].include?(p) })
+      end
       srv["builtins"] = (@flags["builtins"] || {}).keys.sort # random_token, request_ip, user_agent, Bcrypt.*: the runtime each needs
       srv["cookies"].merge!((@flags["cookie_use"] || {}).transform_keys(&:to_s)) if srv["cookies"]
       # Every view the compiler read is an input of the compile, like a binding or a rust_file, so
@@ -199,11 +247,36 @@ module AxumDsl
       AxumDsl.register_source(res.value, shown, real)
       srv["inputs"] << real
       top = res.value.statements.body
-      unless top.size == 1 && top[0].is_a?(Prism::CallNode) && top[0].name == :fragment
-        bad(top[1] || top[0] || res.value, "expected exactly one top-level `fragment` call in a file use_dsl includes")
+      unless top.size == 1 && top[0].is_a?(Prism::CallNode) && FILE_KINDS.include?(top[0].name)
+        bad(top[1] || top[0] || res.value, "expected exactly one top-level `fragment`, `model` or `controller` call in a file use_dsl includes")
       end
-      _, _, blk = call(top[0], :top)
+      pos, kw, blk = call(top[0], :top)
+      # A model or a controller file is that one declaration; a fragment's block holds what a file holds.
+      return yield(top[0], pos, kw, blk) unless top[0].name == :fragment
+
       each_child(blk, :top) { |n, p, k, b| yield n, p, k, b }
+    end
+
+    # The calls a file use_dsl includes may hold: `fragment` (anything a file holds: concerns, settings),
+    # `model` (records, SQL, model methods), `concern` (the exprs several models share) and `controller` (routes and their filters).
+    FILE_KINDS = %i[fragment model concern controller].freeze
+
+    # The name of a `model do` or `controller do` that does not write one: the path of its file under `models/` or
+    # `controllers/` (the folder beside the file being built), camelized as Rails does, `::` between folders. A file
+    # elsewhere names its model or controller.
+    def inferred_name(node, kind)
+      folder = "#{kind}s"
+      root = File.realpath(File.dirname(File.expand_path(@path)))
+      file = AxumDsl.real_file_of(node) || File.realpath(File.expand_path(@path))
+      rel = file.delete_prefix(root + File::SEPARATOR)
+      parts = rel.delete_suffix(".axum.rb").split(File::SEPARATOR)
+      unless rel != file && parts.size > 1 && parts[0] == folder && rel.end_with?(".axum.rb")
+        example = kind == :model ? 'models/room.axum.rb is "Room"' : 'controllers/accounts/bots.axum.rb is "Accounts::Bots"'
+        bad(node, "`#{kind} do` takes its name from a file under #{folder}/ (#{example}); this one is #{rel}, so name it: `#{kind} \"Name\" do`")
+      end
+      name = parts.drop(1).map { |seg| seg.split("_").map(&:capitalize).join }.join("::")
+      bad(node, "#{rel} does not name a #{kind} (#{name.inspect}); name the file in snake_case, or write `#{kind} \"Name\" do`") unless name.match?(CONTROLLER_NAME)
+      name
     end
     # The folder of the file a node was read from: the root, or the fragment that holds it. A relative path in
     # a declaration (rust_file, file, openapi, use_dsl) resolves against it.
@@ -279,6 +352,12 @@ module AxumDsl
       end
       reject_unused_files(srv)
       called_queries = @flags["used_queries"] || {}
+      # The statements a `has_one_attached` derives are made for `attach` to run: one nothing calls is dropped, not refused.
+      srv["queries"].reject! do |q|
+        dropped = q["derived"] && !called_queries[q["name"]]
+        @graph&.forget("query:#{q['name']}") if dropped
+        dropped
+      end
       srv["queries"].each do |q|
         next if called_queries[q["name"]]
 
@@ -315,11 +394,13 @@ module AxumDsl
           [CompositeTypes.nested_struct_name(t), CompositeTypes.object_list_name(t), CompositeTypes.object_map_name(t)].compact
         end
       end
-      used = srv["routes"].filter_map { |r| r["params"] } + srv["params"].flat_map { |p| referenced.call(p["fields"]) }
+      # A law's forall: group counts too: the emitted structs are the routes', so a law-only group writes no struct.
+      used = srv["routes"].filter_map { |r| r["params"] } + srv["params"].flat_map { |p| referenced.call(p["fields"]) } +
+             srv["laws"].to_a.filter_map { |l| l["forall"] }
       srv["params"].each do |p|
         next if used.include?(p["name"])
 
-        bad(@params_nodes.fetch(p["name"]), "params `#{p['name']}` is declared but no route uses it; remove it or add a route")
+        bad(@params_nodes.fetch(p["name"]), "params `#{p['name']}` is declared but no route or law uses it; remove it or add a route")
       end
     end
     # A `file` nothing reads, or an entry nothing names, is refused like any unused declaration. An entry that
@@ -565,13 +646,25 @@ module AxumDsl
       bad(node, "`#{name}` is reserved; pick another current name") if RESERVED_HELPERS.include?(name) || name.start_with?("__")
       ret = current_returns(node, kw[:returns], srv)
       required = kw[:required]
+      missing = kw[:missing]
+      bad(node, "current `#{name}` says both `missing:` and `required:`; `missing:` fails the request itself, `required:` leaves it to a `before` filter: pick one") if missing && required
+      if ret["bare"]
+        bad(node, "current `#{name}` returns :#{ret["record"]}, which may be missing: write `returns: :#{ret["record"]}?` (nil when absent) " \
+                  "or `returns: :#{ret["record"]}, missing: \"message\"` (the request fails with the message when the body yields nothing)") unless missing
+      elsif missing
+        bad(node, "`missing:` is for a current that returns a record without `?`, as in `returns: :Record, missing: \"message\"`; this one returns #{TypeNames.display(ret["rtype"].to_sym)}")
+      end
       if required
         nilable = ret["shape"] == "one" || ret["nilable"]
         bad(node, "current `#{name}` already returns #{TypeNames.display(ret['rtype'].to_sym)}; `required:` is for a nil-able current, `returns: :Record?` or a `:type?`") unless nilable
       end
       body = Body.new(@path, { "fields" => [] }, @regexes, srv["externs"], @flags, "current `#{name}`", @binding_modules,
                       @helper_table, srv["params"] + srv["records"], kind: :current).lower_current(blk, name, ret["rtype"].to_sym)
-      entry = { "name" => name, **ret, "body" => body, **located(node) }
+      entry = { "name" => name, **ret.except("bare"), "body" => body, **located(node) }
+      if missing # the body yields the row or nil; the value is the row, and nil fails the request like `raise`
+        entry["missing"] = missing
+        entry["rtype"] = "struct:#{ret["record"]}"
+      end
       if required
         entry["required"] = required
         entry["rtype_required"] = ret["shape"] == "one" ? "struct:#{ret['record']}" : ret["type"]
@@ -579,6 +672,117 @@ module AxumDsl
       srv["currents"] << entry
       (@current_nodes ||= {})[name] = node
       (@flags["currents"] ||= {})[name] = entry
+      return unless (reader = kw[:reader])
+
+      readers = (@flags["current_readers"] ||= {})
+      bad(node, "`reader: :#{reader}` already reads current `#{readers[reader]}`") if readers.key?(reader)
+      bad(node, "`reader: :#{reader}` is a name the DSL keeps; pick another") if RESERVED_HELPERS.include?(reader) || reader.start_with?("__")
+      readers[reader] = name
+      (@reader_nodes ||= {})[reader] = node
+    end
+
+    # view_local :vapid_key do setting(:vapid_public_key) end: a named value a view may read without a `locals:` entry
+    # (docs/views.md, "Locals without locals:"). Only the declaration is kept here; Body#bind_view_locals lowers the block
+    # in the route that renders a view reading the name, so a view_local no render reads costs nothing. In a controller
+    # the entry is scoped to that controller; a controller entry of the same name wins over a top-level one.
+    def view_local_decl(node, pos, blk, ctrl = nil)
+      name = pos[0]
+      table = view_local_table(ctrl)
+      bad(node, "duplicate view_local `#{name}`#{first_at(node, table[name] && table[name]['node'])}") if table.key?(name)
+      bad(blk.parameters, "a `view_local` block takes no parameters") if blk.parameters
+      bad(blk, "empty view_local body") unless blk.body.is_a?(Prism::StatementsNode)
+      table[name] = { "node" => node, "block" => blk, "kind" => "view_local", "scope" => nil }
+    end
+
+    # page_locals do account_css = account_custom_styles; signed_in = true end: a block of page locals declared once
+    # for a controller (or the top level). Each line is `name = value`, lowered only in a route whose render reads the
+    # name. A name the layout reads is refused here: it belongs in `layout_locals`. See view_local_decl for the
+    # scoping rule.
+    def page_locals_decl(node, blk, ctrl = nil) = locals_block_decl(node, blk, ctrl, :page)
+
+    # layout_locals do account_css = account_custom_styles; signed_in = true end: the same block for the names the
+    # layout reads. A layout local may also feed a page (a frame page, or a page that repeats a layout marker); a page
+    # local may not feed the layout, which is the shadowing the split prevents.
+    def layout_locals_decl(node, blk, ctrl = nil) = locals_block_decl(node, blk, ctrl, :layout)
+
+    def locals_block_decl(node, blk, ctrl, scope)
+      label = "#{scope}_locals"
+      bad(blk.parameters, "a `#{label}` block takes no parameters") if blk.parameters
+      st = blk.body
+      bad(blk, "empty #{label} body") unless st.is_a?(Prism::StatementsNode) && !st.body.empty?
+      table = view_local_table(ctrl, scope)
+      st.body.each do |n|
+        unless n.is_a?(Prism::LocalVariableWriteNode) || n.is_a?(Prism::InstanceVariableWriteNode)
+          bad(n, "#{label} takes `name = value` or `@name = value` lines, as in `#{label} do title = \"Campfire\" end`")
+        end
+        # `@x = ...` is read by a template as `{{ @x }}`; it lives in the same table under the name the parser gives
+        # the marker (Views.mangle) and lowers to the same `let`, so it costs nothing a plain entry does not.
+        ivar = n.is_a?(Prism::InstanceVariableWriteNode)
+        name = ivar ? "#{Views::IVAR_PREFIX}#{n.name.to_s.delete_prefix("@")}" : n.name.to_s
+        unless name.match?(Views::NAME)
+          bad(n, "`#{name}` cannot be a #{scope} local's name: a marker spells it literally, so the name is letters, " \
+                 "digits and _, and does not start with a digit")
+        end
+        bad(n, "duplicate #{scope} local `#{Views.show(name)}`#{first_at(n, table[name] && table[name]['node'])}") if table.key?(name)
+        table[name] = { "node" => n, "value" => n.value, "kind" => label, "scope" => scope.to_s }
+        table[name]["ivar"] = true if ivar
+      end
+    end
+
+    # The view_locals a controller (or the top level, when ctrl is nil) declares. A controller's table is merged over
+    # the top-level one by Body#bind_view_locals. `view_local` is the agnostic single-name form (scope nil); the two
+    # blocks say which side of the layout/page split a name belongs to.
+    def view_local_table(ctrl, scope = :page)
+      if ctrl
+        key = scope == :layout ? "controller_layout_view_locals" : "controller_view_locals"
+        (@flags[key] ||= {})[ctrl] ||= {}
+      else
+        key = scope == :layout ? "layout_view_locals" : "view_locals"
+        @flags[key] ||= {}
+      end
+    end
+
+    # A current's `reader:` is a bare call in a body, so no def, helper or statement may share its name: one of them
+    # would hide the other, and a reader of the code could not tell which `current_user` they are reading.
+    def check_current_readers(srv)
+      (@flags["current_readers"] || {}).each_key do |reader|
+        node = @reader_nodes.fetch(reader)
+        defs = (@global_defs || {}).merge(*(@controller_defs || {}).values)
+        bad(node, "`reader: :#{reader}` has the name of a def#{first_at(node, defs[reader])}") if defs.key?(reader)
+        bad(node, "`reader: :#{reader}` has the name of a helper") if @helper_table.key?(reader)
+        bad(node, "`reader: :#{reader}` has the name of a query") if srv["queries"].any? { |q| q["name"] == reader }
+      end
+    end
+
+    # flash cookie: "_campfire_session", notice: { notice_saved: "✓" }, alert: { room_not_found: "..." }: Rails' flash
+    # as Campfire's port carries it, a suffix `.<key>` on a plain cookie's value (docs/sessions.md, "Flash"). The keys
+    # are every message the service can show; `redirect(path, notice: :key)` and `take_flash` name them.
+    def add_flash(node, kw, srv)
+      bad(node, "duplicate `flash`#{first_at(node, @flash_node)}; a service declares its messages once") if @flash_node
+      @flash_node = node
+      cookie = kw[:cookie]
+      bad(node, "flash `cookie:` names a cookie, such as \"_campfire_session\"") unless cookie.match?(SNAKE) || cookie.match?(/\A_[a-z][a-z0-9_]*\z/)
+      messages = []
+      { notice: false, alert: true }.each do |kind, alert|
+        (kw[kind] || {}).each do |key, text|
+          bad(node, "flash `#{kind}:` key `#{key}` must be snake_case: it is the cookie's `.#{key}` suffix") unless key.match?(SNAKE)
+          bad(node, "flash `#{kind}: { #{key}: ... }` is the message's text, a string") unless text.is_a?(String)
+          bad(node, "flash key `#{key}` is declared twice") if messages.any? { |m| m["key"] == key }
+          messages << { "key" => key, "text" => text, "alert" => alert }
+        end
+      end
+      bad(node, "flash declares no message; give `notice: { key: \"text\" }` or `alert: { ... }`") if messages.empty?
+      srv["flash"] = { "cookie" => cookie, "messages" => messages, **located(node) }
+      @flags["flash"] = srv["flash"]
+    end
+
+    # default_locale :en: the locale a request is answered in when its `locale` query parameter names none that a locale
+    # file holds (docs/views.md, "Locales"). Optional: a file that calls `t` and never says it uses :en when a file holds it,
+    # else the only locale there is. Whether a file holds the locale is checked when the files are read (Body#i18n_table).
+    def default_locale_decl(node, pos)
+      bad(node, "duplicate `default_locale`#{first_at(node, @default_locale_node)}; a service has one default locale") if @default_locale_node
+      @default_locale_node = node
+      @flags["default_locale"] = pos[0].to_s
     end
 
     # What a current answers, resolved against the records like a query's `returns:` (check_queries): the shape,
@@ -663,7 +867,10 @@ module AxumDsl
       earlier = srv["records"].find { |r| r["name"] == name }
       bad(node, "duplicate record `#{name}`#{first_at(node, earlier && @record_nodes[name])}") if earlier
       fields = []
+      defs = {}
       each_child(blk, :record) do |n, p, k, _b|
+        next add_record_method(n, name, defs) if n.is_a?(Prism::DefNode)
+
         fname, ftype = p
         bad(n, "duplicate field `#{fname}`") if fields.any? { |f| f["name"] == fname }
         if (elem = CompositeTypes.object_list_name(ftype))
@@ -676,28 +883,71 @@ module AxumDsl
           fields << field
           next
         end
-        unless Db::SCALARS.include?(ftype)
-          bad(n, "record field `#{fname}` is a column, so its type is one of #{Db::SCALARS.map { |t| ":#{t}" }.join(', ')}, not :#{ftype}; a list of records is `list(:Record), from: :a_query`")
-        end
-        k.each_key do |key|
-          bad(n, "`from:` fills a list field; a column has none") if key == :from
-          bad(n, "`#{key}:` does not apply to a record field; the only option is `optional: true`, for a column that may be NULL") unless key == :optional
-        end
-        bad(n, "`optional: false` is the default; leave `optional:` out") if k[:optional] == false
-        field = { "name" => fname, "type" => ftype }
-        field["optional"] = true if k[:optional]
-        note_field(n, field)
-        fields << field
+        fields << column_field(n, fname, ftype, k, "record", "; a list of records is `list(:Record), from: :a_query`")
       end
       bad(node, "record `#{name}` has no fields") if fields.empty?
+      defs.each do |mname, dnode|
+        bad(dnode, "record `#{name}` has a field and a def named `#{mname}`; a name is a field or a def, never both") if fields.any? { |f| f["name"] == mname }
+      end
+      (@record_defs ||= {})[name] = defs unless defs.empty?
       srv["records"] << { "name" => name, "kind" => "record", "fields" => fields, **located(node) }
       (@record_nodes ||= {})[name] = node
+    end
+
+    # A `def` in a record block is a method of the row (docs/database.md, "Record methods"): no parameters, the body
+    # language, compiled by lower_record_methods once every record is read.
+    def add_record_method(node, rname, defs)
+      mname = node.name.to_s
+      bad(node, "a def takes no receiver (`def self.x` is a class method; write `def x`)") if node.receiver
+      bad(node, "record method `#{mname}` must be snake_case") unless mname.match?(SNAKE)
+      bad(node.parameters, "record method `#{mname}` of #{rname} takes parameters, and parameters are not supported on record methods yet; write it without, and read the row's fields by name") if node.parameters
+      bad(node, "duplicate def `#{mname}` in record `#{rname}`#{first_at(node, defs[mname])}") if defs[mname]
+      bad(node, "record method `#{mname}` is empty") unless node.body
+      defs[mname] = node
+    end
+
+    # One column of a record or a table: a scalar type, and `optional: true` for a column that may be NULL.
+    # `owner` ("record" or "table") words the refusals; `hint` is what a record adds to the type refusal.
+    def column_field(n, fname, ftype, k, owner, hint = "")
+      unless Db::COLUMNS.include?(ftype)
+        bad(n, "#{owner} field `#{fname}` is a column, so its type is one of #{Db::COLUMNS.map { |t| ":#{t}" }.join(', ')}, not :#{ftype}#{hint}")
+      end
+      k.each_key do |key|
+        bad(n, "`from:` fills a list field; a column has none") if key == :from
+        bad(n, "`#{key}:` does not apply to a #{owner} field; the only option is `optional: true`, for a column that may be NULL") unless key == :optional
+      end
+      bad(n, "`optional: false` is the default; leave `optional:` out") if k[:optional] == false
+      field = { "name" => fname, "type" => ftype }
+      field["optional"] = true if k[:optional]
+      note_field(n, field)
+      field
+    end
+
+    # table :rooms do field :id, :i64 ... end: a table of the database, for the schema registry (Db::Schema) the model
+    # layer will read. It emits no Rust and adds no statement, and nothing consumes it yet, so an unused one is not
+    # refused. Its fields are the columns of a record, and `id` is the primary key, which is never NULL.
+    def add_table(node, pos, blk, srv)
+      name = pos[0]
+      earlier = srv["tables"].find { |t| t["name"] == name }
+      bad(node, "duplicate table `#{name}`#{first_at(node, earlier && @table_nodes[name])}") if earlier
+      columns = []
+      each_child(blk, :table) do |n, p, k, _b|
+        fname, ftype = p
+        bad(n, "duplicate column `#{fname}` in table `#{name}`") if columns.any? { |c| c["name"] == fname }
+        column = column_field(n, fname, ftype, k, "table")
+        bad(n, "`id` is the primary key of table `#{name}`, which is never NULL; leave `optional:` out") if fname == "id" && column["optional"]
+        columns << column
+        @graph&.declare("column:#{name}.#{fname}", at: n, type: column["type"].to_s)
+      end
+      bad(node, "table `#{name}` has no fields") if columns.empty?
+      srv["tables"] << { "name" => name, "columns" => columns.map { |c| { "name" => c["name"], "type" => c["type"], "optional" => c["optional"] == true } }, **located(node) }
+      (@table_nodes ||= {})[name] = node
     end
 
     # What `returns:` of a query says, as the IR carries it until the records are all read (check_queries):
     # `list(:Note)` is every row, `:Note?` the first row or nil, and a scalar type (`:i64`, `?` for nil-able)
     # the first column of the first row.
-    def query_returns(node)
+    def query_returns(node, bare: false)
       if node.is_a?(Prism::CallNode) && node.receiver.nil? && node.name == :list
         args = node.arguments&.arguments || []
         unless args.size == 1 && node.block.nil? && args[0].is_a?(Prism::SymbolNode) && args[0].unescaped.match?(CAMEL)
@@ -712,6 +962,7 @@ module AxumDsl
       base = text.delete_suffix("?")
       nilable = text.end_with?("?")
       if base.match?(CAMEL)
+        return { "shape" => "one", "record" => base, "bare" => true } if bare && !nilable # a `current`: Reader#current_decl asks for `missing:`
         unless nilable
           bad(node, "`returns: :#{text}` would be one row, which may be missing: write `:#{text}?` for the first row or nil, or list(:#{text}) for every row")
         end
@@ -729,7 +980,9 @@ module AxumDsl
     # refuses a placeholder `args:` does not declare, an argument no placeholder uses, and the other
     # placeholder spellings (`?`, `?NNN`, `$name`, `@name`). A body calls the statement by name with keyword
     # arguments (Body#query_call); what it returns is checked against the database once, as the server starts.
-    def add_query(node, pos, kw, srv)
+    # Inside a `model` that names its table the statement may take a block (`relation`) instead of `sql:`, one
+    # relation chain that RelationQueries renders to SQL once the file is read (docs/database.md, "Queries as relations").
+    def add_query(node, pos, kw, srv, relation = nil)
       name = pos[0]
       what = node.name.to_s
       if (earlier = srv["queries"].find { |q| q["name"] == name })
@@ -738,39 +991,7 @@ module AxumDsl
       if RESERVED_HELPERS.include?(name) || %w[errors headers render h raw].include?(name)
         bad(node, "`#{name}` is reserved; pick another #{what} name")
       end
-      sql = kw[:sql]
-      bad(node, "`sql:` is empty") if sql.strip.empty?
-      args = kw[:args]
-      named = []
-      Db::Sql.placeholders(sql).each do |ph|
-        case ph.kind
-        when :named then named << ph.name
-        when :anonymous, :numbered
-          bad(node, "#{what} `#{name}` uses a `?` placeholder; write `:name` and declare it in `args:` (SQLite binds `:name` natively, so the SQL stays as written)")
-        else
-          sigil = ph.kind == :dollar ? "$" : "@"
-          bad(node, "#{what} `#{name}` uses `#{sigil}#{ph.name}`; write `:#{ph.name}` instead: `:name` is the placeholder syntax here")
-        end
-      end
-      named.uniq!
-      if (missing = (named - args.keys).first)
-        declared = args.empty? ? "" : " (declared: #{args.keys.join(', ')})"
-        bad(node, "#{what} `#{name}`: the SQL uses `:#{missing}` but `args:` does not declare it#{declared}", word: missing, from: args.keys)
-      end
-      if (extra = (args.keys - named).first)
-        bad(node, "#{what} `#{name}`: `args:` declares `#{extra}` but the SQL has no `:#{extra}` placeholder")
-      end
-      entry = { "name" => name, "kind" => what, "args" => args.to_a, "sql" => sql,
-                "at" => "#{AxumDsl.file_of(node) || @path}:#{node.location.start_line}", **located(node) }
-      if what == "query"
-        entry["returns"] = kw[:returns]
-      else
-        entry["shape"] = "execute"
-        entry["rtype"] = "i64"
-      end
-      srv["queries"] << entry
-      (@query_nodes ||= {})[name] = node
-      (@flags["queries"] ||= {})[name] = entry
+      add_statement(srv, node, name, what, kw[:args], kw[:returns], kw[:sql], relation)
     end
 
     # Once every declaration is read: a statement, a record or a migrations folder needs the `database` they
@@ -818,6 +1039,33 @@ module AxumDsl
       end
     end
 
+    # The methods of each record, compiled (Body#lower_record_method) once every record is read, in dependency order:
+    # a method that reads another is compiled after it, so it knows the type. A method that reaches itself, directly
+    # or through others, is refused. The IR record then carries "methods", which the body and view compilers read like
+    # fields (Body#struct_field) and the emitter writes as `impl` functions (Db::Sqlite.record_lines).
+    def lower_record_methods(srv)
+      srv["records"].each do |r|
+        defs = (@record_defs ||= {})[r["name"]] or next
+        done = {}
+        pending = []
+        compile = lambda do |mname|
+          next done[mname] if done[mname]
+
+          node = defs.fetch(mname)
+          if (i = pending.index(mname))
+            bad(node, "record method `#{mname}` of #{r['name']} reaches itself (#{(pending[i..] + [mname]).join(' -> ')}); a record method is a plain function, so it cannot recurse")
+          end
+          pending.push(mname)
+          deps = Body.bare_reads(node, defs.keys).to_h { |d| [d, compile.call(d)] }
+          sibling_types = deps.to_h { |d, m| [d, TypeNames.field_symbol(m)] }
+          pending.pop
+          done[mname] = Body.new(@path, { "fields" => [] }, @regexes, srv["externs"], @flags, "record method `#{mname}` of #{r['name']}", @binding_modules, {})
+                            .lower_record_method(node, r, sibling_types, @helper_names.to_a)
+        end
+        r["methods"] = defs.keys.map { |m| compile.call(m) }
+      end
+    end
+
     # What a query returns, resolved against the records (a record may be declared after the query that returns
     # it): the IR then carries the shape, the record's field names the server checks the columns against at
     # startup, and the type a body sees the call as.
@@ -828,6 +1076,7 @@ module AxumDsl
         bad(@record_nodes.fetch(r["name"]), "record `#{r['name']}` has the same name as a params group; both become a struct of that name")
       end
       check_record_lists(srv)
+      lower_record_methods(srv)
       srv["queries"].each do |q|
         node = @query_nodes.fetch(q["name"])
         bad(node, "#{q['kind']} `#{q['name']}` has the same name as a rust_fn, cmd_fn or script_fn") if srv["externs"].key?(q["name"])
@@ -1147,7 +1396,7 @@ module AxumDsl
       name = kw[:authenticate_with]
       cur = srv["currents"].find { |c| c["name"] == name } or
         undeclared(node, "`cable` authenticates with current `#{name}`, which is not declared", name, srv["currents"].map { |c| c["name"] })
-      unless cur["shape"] == "one" || (cur["shape"] == "scalar" && cur["nilable"])
+      unless (cur["shape"] == "one" && !cur["missing"]) || (cur["shape"] == "scalar" && cur["nilable"])
         bad(node, "`cable authenticate_with: :#{name}` needs a nil-able current (`returns: :Record?` or a `:type?`): nil is the connection that is not signed in")
       end
       (@flags["used_currents"] ||= {})[name] = true
@@ -1371,9 +1620,9 @@ module AxumDsl
     # response, or takes `except:` to leave them off the public files under a `static` mount. A name declared
     # twice is refused rather than emitted twice.
     LAYER_KEYWORDS = { "compression" => [], "cors" => [:origins], "timeout" => [:secs], "trace" => [:forwarded],
-                       "fetch_metadata" => [], "csrf" => [], "rate_limit" => [:per, :burst, :path],
+                       "fetch_metadata" => [], "csrf" => [], "rate_limit" => [:per, :burst, :path, :enabled],
                        "private_cache" => [:except],
-                       "rack_defaults" => RackDefaults::KEYWORDS, "front" => [:cache_mb], "method_override" => [] }.freeze
+                       "rack_defaults" => RackDefaults::KEYWORDS, "front" => [:cache_mb, :enabled], "method_override" => [], "format_extension" => [] }.freeze
     LAYER_ORIGIN = /\A[A-Za-z][A-Za-z0-9+.\-]*:\/\/[!-~]+\z/
     def add_layer(node, pos, kw, srv)
       name = pos[0].to_s
@@ -1417,6 +1666,10 @@ module AxumDsl
         entry["per"] = per
         entry["burst"] = burst
         entry["path"] = limit_path if limit_path
+        if kw.key?(:enabled)
+          entry["enabled"] = kw[:enabled].to_s
+          (@enabled_nodes ||= {})["rate_limit"] = node
+        end
         # The limiter counts per client address, from the same runtime `request_ip` reads.
         (@flags["builtins"] ||= {})["request_ip"] = true
       when "csrf"
@@ -1460,6 +1713,10 @@ module AxumDsl
         add_rack_defaults(node, kw, entry)
       when "front"
         entry["cache_mb"] = kw[:cache_mb] if kw[:cache_mb]
+        if kw.key?(:enabled)
+          entry["enabled"] = kw[:enabled].to_s
+          (@enabled_nodes ||= {})["front"] = node
+        end
       end
       srv["layers"] << entry
     end
@@ -1933,11 +2190,12 @@ module AxumDsl
 
       bad(node, "expected a type symbol like :string, or map(...) / list(...), got #{nodename(node)}") unless node.is_a?(Prism::SymbolNode)
       s = node.unescaped
-      unless TYPES.key?(s.to_sym) || FIELD_LISTS.include?(s.to_sym) || FIELD_UPLOADS.include?(s.to_sym) || s.match?(CAMEL)
+      unless TYPES.key?(s.to_sym) || FIELD_LISTS.include?(s.to_sym) || FIELD_UPLOADS.include?(s.to_sym) || s.match?(CAMEL) || s == "time"
         bad(node, "`:#{s}` is not a field type (#{(TYPES.keys + FIELD_LISTS + FIELD_UPLOADS).map(&:inspect).join(" ")}, map(...), list(...), or the CamelCase name of another params)",
             word: s, from: TYPES.keys + FIELD_LISTS + FIELD_UPLOADS)
       end
       bad(node, "`:#{s}` is a Rust keyword") if RUST_KW.include?(s)
+      bad(node, "`:time` is a column type of a `record` or a `table` (a Rails timestamp stored as text); it cannot be the element of a #{inside}") if s == "time" && inside
       s
     end
 
@@ -2030,6 +2288,7 @@ module AxumDsl
         bad(n, "duplicate field `#{p[0]}`") if fields.any? { |f| f["name"] == p[0] }
         field = { "name" => p[0], "type" => p[1].to_s }
         bad(n, "`from:` fills a list field of a `record` (docs/database.md); a params field is read from the request") if k.key?(:from)
+        bad(n, "`:time` is a column type of a `record` or a `table`; a params field is read from the request, so declare it :string") if field["type"] == "time"
         field["description"] = k[:description] if k[:description]
         field["in"] = k.delete(:in).to_s if k.key?(:in)
         field["wire_name"] = k.delete(:name) if k.key?(:name)
@@ -2079,7 +2338,7 @@ module AxumDsl
     RESERVED_HELPERS = %w[main check run_subprocess arith_error str_to_i str_to_int result rust setting
                           file_text file_path entry entry_args json text html halt redirect status content_type
                           etag params raise Integer current cookie set_cookie delete_cookie random_token request_ip
-                          request_base_url request_path request_method user_agent turbo_frame_request? transaction plain_text request_body url_encode urlsafe_decode64 qr_code_svg active_storage_disk_path active_storage_verified_id active_storage_verified_key inline_disposition].freeze
+                          request_base_url request_path request_query request_method user_agent request_referrer turbo_frame_request? turbo_stream_request? transaction plain_text action_text_html request_body request_upload image_variant url_encode urlsafe_decode64 qr_code_svg opengraph_unfurl web_push webhook_post later active_storage_disk_path active_storage_verified_id active_storage_verified_key active_storage_direct_upload_url active_storage_disk_upload active_storage_key active_storage_blob_id rate_limited? respond cookie_header inline_disposition].freeze
 
     # helper :guard, args: [:string], returns: :string do |url| ... end. A helper is compiled in declaration
     # order and may only call helpers declared above it, so recursion cannot happen. Types are never inferred.
@@ -2131,6 +2390,445 @@ module AxumDsl
                               "returns" => ret.to_s, "body" => body, "async" => async, "async_reason" => reason,
                               **located(node) }
     end
+    # law :name, forall: :Params, cases: 256 do |a, b| <bool> end. Laws::Decl (lib/laws, shared with clap_dsl) does
+    # the law's own checks; this supplies what is axum_dsl's: params groups as domains, and the body compiler for the
+    # boolean body, compiled as a helper's is. The helpers a law calls count as called, and those only laws call are
+    # compiled out of the release build (#[cfg(test)] dead-code allowance).
+    LAW_CONVERTIBLE = %w[string i32 i64 f64 bool string_list i64_list f64_list].freeze
+
+    def law_decl(node, pos, kw, blk, srv)
+      parsed = helper_params(blk, node)
+      bad(node, "a law's block takes only plain parameters (the fields of its forall: params group)") unless parsed[:kw].empty?
+      resolve = lambda do |name|
+        prm = srv["params"].find { |x| x["name"] == name } or
+          bad(node, "law `#{pos[0]}` quantifies over `#{name}`, but no params group has that name", word: name, from: srv["params"].map { |x| x["name"] })
+        { "name" => name, "fields" => prm["fields"].map { |f| law_domain(node, pos[0], name, f) } }
+      end
+      compile = lambda do |label, names, domains|
+        types = domains.map { |d| HELPER_TYPES.fetch(:"#{d['type']}#{d['optional'] ? '?' : ''}") }
+        body = Body.new(@path, { "fields" => [] }, @regexes, srv["externs"], @flags, label, @binding_modules,
+                        @helper_table.dup, srv["params"] + srv["records"]).lower_helper(blk, names, types, :bool, [])
+        bad(node, "#{label} calls an async helper (#{body['async_reason']}); a law's body runs synchronously") if body["uses_async"]
+        body
+      end
+      law = Laws::Decl.read(node: node, blk: blk, name: pos[0], forall: kw[:forall], cases: kw[:cases], params: parsed[:pos],
+                            known: srv["laws"].map { |l| l["name"] }, diag: self, resolve: resolve, compile: compile)
+      srv["laws"] << law.merge(located(node))
+    end
+
+    # The helpers nothing but a law calls, directly or through other such helpers: the release build has no caller for
+    # them. Callers are body labels ("law `x`", "helper `y`", a route's), recorded at each call.
+    def law_only_helpers
+      callers = @flags["helper_callers"] || {}
+      only = {}
+      loop do
+        grew = false
+        callers.each do |name, by|
+          next if only[name]
+
+          next unless by.keys.all? { |c| c.start_with?("law `") || ((h = c[/\Ahelper `(\w+)`\z/, 1]) && only[h]) }
+
+          only[name] = true
+          grew = true
+        end
+        break unless grew
+      end
+      only.keys.sort
+    end
+
+    # One params field as a Laws::Domain record. The domain has inclusive bounds only, so an exclusive integer bound
+    # becomes the inclusive one beside it; what a domain cannot generate exactly is refused rather than approximated.
+    def law_domain(node, law, group, f)
+      where = "law `#{law}`: #{group}.#{f['name']}"
+      bad(node, "#{where} is :#{f['type']}; a law generates :#{LAW_CONVERTIBLE.join(', :')} fields") unless LAW_CONVERTIBLE.include?(f["type"])
+      %w[multiple_of format].each { |k| bad(node, "#{where} has `#{k}:`, which a law cannot generate exactly yet") if f.key?(k) }
+      d = f.dup
+      if f.key?("exclusive_min") || f.key?("exclusive_max")
+        bad(node, "#{where} has an exclusive bound on an :f64; a law needs inclusive bounds there") if f["type"] == "f64"
+        d["min"] = f["exclusive_min"] + 1 if f.key?("exclusive_min")
+        d["max"] = f["exclusive_max"] - 1 if f.key?("exclusive_max")
+      end
+      Laws::Domain.of(d)
+    end
+
+    # ---- controllers and defs ------------------------------------------------------------------------------------
+    # `controller "Accounts::Bots" do ... end`: its routes, params, `before :name, only:/except:` filters and defs.
+    # A def is a private method expanded inline where it is called (Body#def_call): its `return` answers the request,
+    # as a Rails before_action's head/render halts. Values are explicit: an action calls `bot = set_bot`; a filter only
+    # guards. Top-level defs are shared by every route (model and concern methods); a controller's are its own.
+    CONTROLLER_NAME = /\A[A-Z][A-Za-z0-9]*(::[A-Z][A-Za-z0-9]*)*\z/
+
+    def add_def(node, ctrl)
+      bad(node, "a def takes no receiver (`def self.x` is a class method; write `def x`)") if node.receiver
+      ps = node.parameters
+      if ps
+        extra = [ps.optionals, ps.posts, ps.keywords].any? { |x| !x.empty? } || ps.rest || ps.keyword_rest || ps.block
+        bad(ps, "a def takes plain required parameters only") if extra
+      end
+      name = node.name.to_s
+      bad(node, "def `#{name}` must be snake_case") unless name.match?(SNAKE)
+      table = ctrl ? ((@controller_defs ||= {})[ctrl] ||= {}) : (@global_defs ||= {})
+      clash = table[name] || (ctrl && @global_defs&.[](name))
+      bad(node, "duplicate def `#{name}`#{first_at(node, clash)}") if clash
+      table[name] = node
+    end
+
+    def defs_for(ctrl)
+      (@global_defs || {}).merge(ctrl ? (@controller_defs || {})[ctrl] || {} : {})
+    end
+
+    def controller_decl(node, pos, blk, srv, route_nodes, declare)
+      name = pos[0] || inferred_name(node, :controller)
+      bad(node, "a controller is named like a Rails one: \"Accounts::Bots\"") unless name.match?(CONTROLLER_NAME)
+      bad(node, "duplicate controller \"#{name}\"#{first_at(node, (@controller_nodes ||= {})[name])}") if @controller_nodes&.key?(name)
+      (@controller_nodes ||= {})[name] = node
+      filters = ((@controller_filters ||= {})[name] = [])
+      actions = {}
+      each_child(blk, :controller) do |n, p, k, b|
+        if n.is_a?(Prism::DefNode)
+          add_def(n, name)
+          next
+        end
+        case n.name
+        when :private then nil
+        when :params then srv["params"] << params_decl(n, p, b, srv)
+        when :helper, :law then declare.call(n, p, k, b) # a typed helper and a law are the file's, as at the top level
+        when :view_local then view_local_decl(n, p, b, name)
+        when :page_locals then page_locals_decl(n, b, name)
+        when :layout_locals then layout_locals_decl(n, b, name)
+        when :before
+          bad(n, "a controller's filter names one of its defs, `before :#{p[0] || 'name'}`; a do ... end filter is a top-level one") if b || p[0].nil?
+          bad(n, "`only:` and `except:` both say which actions; give one") if k[:only] && k[:except]
+          filters << { "def" => p[0], "only" => k[:only], "except" => k[:except], "provides" => k[:provides], "node" => n }
+        else # a route
+          if (a = k[:action])
+            bad(n, "duplicate action `#{a}` in #{name}#{first_at(n, actions[a])}") if actions[a]
+            actions[a] = n
+          end
+          (@route_controller ||= {})[n.object_id] = name
+          route_nodes << [n, p, k, b, nil]
+        end
+      end
+      filters.each do |f|
+        defs = defs_for(name)
+        bad(f["node"], "`before :#{f['def']}` names no def of #{name} or the top level", word: f["def"], from: defs.keys) unless defs.key?(f["def"])
+        (f["only"].to_a + f["except"].to_a).each do |a|
+          next if actions.key?(a.to_s) || defs.key?(a.to_s)
+
+          bad(f["node"], "#{name} has no action `#{a}` (its actions: #{actions.keys.join(', ')}; defs: #{defs.keys.join(', ')})",
+              word: a.to_s, from: actions.keys.map(&:to_s) + defs.keys)
+        end
+      end
+    end
+
+    # model "Room" do ... end, or `model do` in models/room.axum.rb: the records, statements and model methods of one
+    # model. Its declarations are the file's, as a fragment's are (a def is shared by every route, a query is called
+    # by name); the block only says what kind of file this is, so a route, a filter or a controller written in it is
+    # refused by the signature table (`in:`), which lists what a model may hold.
+    #
+    # `has_many`, `has_one`, `belongs_to` and `scope` are the model's own: they are kept in @models, and check_models
+    # resolves them against the tables and the other models once the whole file is read (nothing emits Rust from them).
+    # `table:` names the declared table the model owns; it is required once the model declares one of those.
+    MODEL_CALLS = %i[has_many has_one has_one_attached belongs_to scope include].freeze
+
+    def model_decl(node, pos, kw, blk, declare)
+      name = pos[0] || inferred_name(node, :model)
+      bad(node, "a model is named like a Rails one: \"Room\" or \"Account::Bot\"") unless name.match?(CONTROLLER_NAME)
+      bad(node, "duplicate model \"#{name}\"#{first_at(node, (@model_nodes ||= {})[name])}") if @model_nodes&.key?(name)
+      (@model_nodes ||= {})[name] = node
+      model = { "name" => name, "table" => kw[:table], "associations" => [], "scopes" => [], **located(node) }
+      (@models ||= {})[name] = model
+      @declaring_model = name # a query or execute inside is a relation of this model
+      each_child(blk, :model) do |n, p, k, b|
+        if n.is_a?(Prism::CallNode) && MODEL_CALLS.include?(n.name)
+          case n.name
+          when :scope then add_model_scope(n, model, p)
+          when :has_one_attached then add_attached(n, model, p)
+          when :include then add_include(n, model, p)
+          else add_association(n, model, p, k)
+          end
+        else
+          declare.call(n, p, k, b)
+        end
+      end
+      @declaring_model = nil
+      return unless model["table"].nil? && !(model["associations"].empty? && model["scopes"].empty?)
+
+      bad(node, "model \"#{name}\" declares associations or scopes, so it names its table: `model :#{name}, table: :a_declared_table`")
+    end
+
+    # `include :Timestamps` inside a model: the exprs of that concern are the model's. Whether the concern exists, whether the model's
+    # table has the columns the exprs read and whether two included concerns clash are checked once the file is read (check_includes).
+    def add_include(node, model, pos)
+      name = pos[0].to_s
+      list = (model["includes"] ||= [])
+      bad(node, "model \"#{model["name"]}\" includes concern \"#{name}\" twice#{first_at(node, (@include_nodes ||= {})[[model["name"], name]])}") if list.include?(name)
+      list << name
+      (@include_nodes ||= {})[[model["name"], name]] = node
+    end
+
+    # concern :Timestamps do expr ... end, or the one call of models/concerns/timestamps.axum.rb: the exprs several models share
+    # (docs/database.md, "Models"). It holds nothing but `expr`s; a model brings them in with `include :Timestamps`, and a relation
+    # of that model finds them by name.
+    def concern_decl(node, pos, blk, srv)
+      name = pos[0].to_s
+      bad(node, "a concern is named like a Rails one: \"Timestamps\"") unless name.match?(CONTROLLER_NAME)
+      bad(node, "duplicate concern \"#{name}\"#{first_at(node, (@concern_nodes ||= {})[name])}") if @concern_nodes&.key?(name)
+      (@concern_nodes ||= {})[name] = node
+      @declaring_concern = name
+      each_child(blk, :concern) { |n, p, k, _b| add_expr(n, p, k, srv) }
+      @declaring_concern = nil
+    end
+
+    # has_many / has_one / belongs_to inside a model: the keywords are checked against each other here, the names
+    # they point at once the file is read (check_models).
+    def add_association(node, model, pos, kw)
+      name = pos[0]
+      kind = node.name.to_s
+      who = "model \"#{model['name']}\" #{kind} :#{name}"
+      bad(node, "#{who} is declared twice") if model["associations"].any? { |a| a["name"] == name }
+      bad(node, "#{who}: `#{name}` is already a scope of the model") if model["scopes"].any? { |s| s["name"] == name }
+      if kind == "belongs_to"
+        %i[dependent through as].each { |key| bad(node, "#{who}: `#{key}:` applies to has_many and has_one, not belongs_to") if kw.key?(key) }
+      end
+      if kw[:through]
+        other = %i[table model foreign_key as dependent].find { |key| kw.key?(key) }
+        bad(node, "#{who}: `through:` takes its table and keys from the associations it goes through, so `#{other}:` does not apply") if other
+      end
+      bad(node, "#{who}: `as:` already names the foreign key (`#{kw[:as]}_id`), so leave `foreign_key:` out") if kw[:as] && kw[:foreign_key]
+      conditions = nil
+      if pos[1]
+        bad(node, "#{who}: `through:` takes its table and keys from the associations it goes through, so a condition lambda does not apply") if kw[:through]
+        bad(node, "#{who}: a condition lambda and `dependent:` can not be combined (it is not said whether destroy deletes every row or only those the condition names); leave one out") if kw[:dependent]
+        conditions = association_conditions(pos[1], who)
+      end
+      model["associations"] << { "name" => name, "kind" => kind, "through" => kw[:through], "dependent" => kw[:dependent]&.to_s,
+                                 "table" => kw[:table], "model" => kw[:model], "foreign_key" => kw[:foreign_key], "as" => kw[:as], "conditions" => conditions, **located(node) }
+      (@model_member_nodes ||= {})[[model["name"], name]] = node
+    end
+
+    # `has_one_attached :avatar` inside a model (docs/database.md, "Attachments"): the two associations it derives are declared
+    # here as if written, each carrying where it came from ("derived"); the Active Storage models are found, and the statements
+    # `attach` runs made, once the whole file is read (resolve_attached, check_attached).
+    def add_attached(node, model, pos)
+      name = pos[0]
+      who = "model \"#{model['name']}\" has_one_attached :#{name}"
+      attached = (model["attached"] ||= [])
+      bad(node, "#{who} is declared twice") if attached.any? { |a| a["name"] == name }
+      derived = { "from" => "has_one_attached :#{name}", "at" => "#{AxumDsl.file_of(node) || @path}:#{node.location.start_line}" }
+      ["#{name}_attachment", "#{name}_blob"].each do |assoc|
+        bad(node, "#{who} derives the association `#{assoc}`, which the model already declares") if model["associations"].any? { |a| a["name"] == assoc }
+        bad(node, "#{who} derives the association `#{assoc}`, which is already a scope of the model") if model["scopes"].any? { |s| s["name"] == assoc }
+      end
+      attached << { "name" => name, **derived }
+      model["associations"] << { "name" => "#{name}_attachment", "kind" => "has_one", "through" => nil, "dependent" => nil, "table" => nil, "model" => nil,
+                                 "foreign_key" => nil, "as" => "record", "conditions" => { "name" => name }, "derived" => derived, **located(node) }
+      model["associations"] << { "name" => "#{name}_blob", "kind" => "has_one", "through" => "#{name}_attachment", "source" => "blob", "dependent" => nil,
+                                 "table" => nil, "model" => nil, "foreign_key" => nil, "as" => nil, "conditions" => nil, "derived" => derived, **located(node) }
+      @model_member_nodes ||= {}
+      @model_member_nodes[[model["name"], "#{name}_attachment"]] = node
+      @model_member_nodes[[model["name"], "#{name}_blob"]] = node
+      (@attached_nodes ||= {})[[model["name"], name]] = node
+      graph_attached_associations(model["name"], name, derived)
+    end
+    # The lambda of `has_one :body_text, -> { where(name: "body") }, ...`: one `where` of `column: literal` pairs on the target
+    # table, as { column => String | Integer | true | false } in the order written.
+    def association_conditions(lam, who)
+      bad(lam, "#{who}: the condition lambda takes no parameters, `-> { where(name: \"body\") }`") if lam.parameters
+      call = lam.body
+      call = call.body.first if call.is_a?(Prism::StatementsNode) && call.body.size == 1
+      unless call.is_a?(Prism::CallNode) && call.receiver.nil? && call.name == :where && call.block.nil?
+        bad(lam, "#{who}: the condition lambda holds one `where(column: literal, ...)` on the target table and nothing else, `-> { where(name: \"body\") }`")
+      end
+      list = call.arguments&.arguments || []
+      unless list.size == 1 && list[0].is_a?(Prism::KeywordHashNode)
+        bad(call, "#{who}: the condition lambda's `where` takes `column: literal` pairs, `-> { where(name: \"body\") }`")
+      end
+      out = {}
+      list[0].elements.each do |el|
+        bad(el, "#{who}: write `column: literal` pairs in the condition lambda (no splat, no string keys, no shorthand)") unless el.is_a?(Prism::AssocNode) && el.key.is_a?(Prism::SymbolNode) && !el.value.is_a?(Prism::ImplicitNode)
+        column = el.key.unescaped
+        bad(el, "#{who}: the condition lambda gives `#{column}` twice") if out.key?(column)
+        out[column] = case el.value
+                      when Prism::StringNode then el.value.unescaped
+                      when Prism::IntegerNode then el.value.value
+                      when Prism::TrueNode then true
+                      when Prism::FalseNode then false
+                      else bad(el.value, "#{who}: a condition's value is a string, integer, true or false literal, got #{nodename(el.value)}")
+                      end
+      end
+      out
+    end
+
+    # scope :name, ->(a, b) { ... } inside a model: the lambda is kept unevaluated (its parameter names and its body
+    # node) for the queries that will call it.
+    def add_model_scope(node, model, pos)
+      name, lam = pos
+      who = "model \"#{model['name']}\" scope :#{name}"
+      bad(node, "#{who} is declared twice") if model["scopes"].any? { |s| s["name"] == name }
+      bad(node, "#{who}: `#{name}` is already an association of the model") if model["associations"].any? { |a| a["name"] == name }
+      if Db::Models::OPERATIONS.include?(name)
+        bad(node, "#{who}: `#{name}` is a relation operation (#{Db::Models::OPERATIONS.join(', ')}), which a scope would hide; name it differently")
+      end
+      bad(lam, "#{who} has an empty lambda; write the relation it stands for, `-> { where(...) }`") if lam.body.nil?
+      model["scopes"] << { "name" => name, "params" => scope_params(lam, who), "body" => lam.body, **located(node) }
+    end
+
+    # The parameter names of a scope's lambda: plain required names.
+    def scope_params(lam, who)
+      ps = lam.parameters
+      return [] if ps.nil?
+
+      bad(ps, "#{who}: a scope lambda names its parameters, `->(a, b) { ... }`, not `_1` or `it`") unless ps.is_a?(Prism::BlockParametersNode)
+      bad(ps, "#{who}: a scope lambda has no block-local variables") unless ps.locals.empty?
+      pn = ps.parameters
+      return [] if pn.nil?
+
+      extra = [pn.optionals, pn.posts, pn.keywords].any? { |x| !x.empty? } || pn.rest || pn.keyword_rest || pn.block
+      bad(pn, "#{who}: the parameters of a scope lambda are plain required names, `->(a, b) { ... }`") if extra
+      seen = []
+      pn.requireds.map do |r|
+        bad(r, "#{who}: unsupported #{nodename(r)} as a scope parameter") unless r.is_a?(Prism::RequiredParameterNode)
+        bad(r, "#{who}: parameter `#{r.name}` must be snake_case and not a Rust keyword") if !r.name.to_s.match?(SNAKE) || RUST_KW.include?(r.name.to_s)
+        bad(r, "#{who}: duplicate parameter `#{r.name}`") if seen.include?(r.name.to_s)
+        seen << r.name.to_s
+        r.name.to_s
+      end
+    end
+
+    # expr :name, type: :string, sql: "..." (of: :t when the template writes its table as `{t}`): a named SQL
+    # expression for the relations to come. It emits nothing, and an unused one is not refused. Written in a `model` it is that
+    # model's (`{t}` is its table, `of:` implied), in a `concern` it is shared, at the top level it is everyone's.
+    def add_expr(node, pos, kw, srv)
+      name = pos[0]
+      owner = @declaring_concern ? { "concern" => @declaring_concern } : @declaring_model ? { "model" => @declaring_model } : {}
+      # A model's expr is its own, so the same name on two models is two exprs, and so is the same name in two concerns (a model that
+      # includes both is refused); a concern's name may not be a top-level one, and a top-level name is taken once.
+      earlier = srv["exprs"].find do |e|
+        next false unless e["name"] == name
+
+        if owner.key?("model") then e["model"] == owner["model"]
+        elsif owner.key?("concern") then e["concern"] == owner["concern"] || !(e["model"] || e["concern"])
+        else !e["model"]
+        end
+      end
+      bad(node, "duplicate expr `#{name}`#{first_at(node, earlier)}") if earlier
+      sql = kw[:sql]
+      holes = sql.scan(/\{([A-Za-z_][A-Za-z0-9_]*)\}/).flatten
+      of = kw[:of] || (!owner.empty? && holes.include?("t") ? "t" : nil) # in a model or a concern `{t}` is that table: `of: :t` is implied
+      if of
+        bad(node, "expr `#{name}` says `of: :#{of}`, so its sql writes that table as `{#{of}}` at least once") unless holes.include?(of)
+        other = holes.find { |h| h != of }
+        bad(node, "expr `#{name}` takes one table reference, `{#{of}}`, and its sql also writes `{#{other}}`") if other
+      elsif holes.any?
+        bad(node, "expr `#{name}` writes `{#{holes.first}}` but has no `of:`; add `of: :#{holes.first}` to name the table it applies to")
+      end
+      args = kw[:args] || {}
+      named = []
+      Db::Sql.placeholders(sql).each do |ph|
+        text = sql[ph.offset, 1 + ph.name.to_s.size]
+        if ph.kind != :named || args.empty?
+          bad(node, "expr `#{name}` has the placeholder `#{text}` in its sql; an expression is a fixed piece of SQL, so the value is bound where the relation uses it")
+        end
+        bad(node, "expr `#{name}` writes `:#{ph.name}` but `args:` does not declare it (declared: #{args.keys.join(', ')})") unless args.key?(ph.name)
+        named << ph.name
+      end
+      unused = args.keys - named
+      bad(node, "expr `#{name}` declares `args: { #{unused.first}: ... }` but its sql never writes `:#{unused.first}`") unless unused.empty?
+      rec = { "name" => name, "type" => kw[:type].to_s, "sql" => sql, "of" => of, **owner, **(args.empty? ? {} : { "args" => args }), **located(node) }
+      srv["exprs"] << rec
+      (@expr_nodes ||= {}.compare_by_identity)[rec] = node
+      @graph&.declare("expr:#{[owner.values.first, name].compact.join('.')}", at: node, type: kw[:type].to_s)
+    end
+
+    # A model's expr may not hide a top-level one or one of a concern it includes, and a concern is not named like a model: the two
+    # would share the owner part of an `expr:Owner.name` node of the type graph.
+    def check_expr_owners(srv, models)
+      (@concern_nodes || {}).each do |name, node|
+        bad(node, "concern \"#{name}\" is also the name of a model; name one of them differently") if models.key?(name)
+      end
+      srv["exprs"].each do |e|
+        next unless e["model"]
+
+        includes = models.fetch(e["model"])["includes"] || []
+        hidden = srv["exprs"].find { |s| s["name"] == e["name"] && !s["model"] && (!s["concern"] || includes.include?(s["concern"])) } or next
+        node = @expr_nodes.fetch(e)
+        owner = hidden["concern"] ? "concern #{hidden["concern"]}" : "the top level"
+        bad(node, "expr `#{e["name"]}` of model #{e["model"]} has the name of an expr of #{owner}#{first_at(node, hidden)}, which it would hide; name it differently")
+      end
+    end
+
+    # Each `include :Concern` of a model: the concern is declared, the model's table has every column its exprs read from `{t}` (the
+    # refusal is on the include line and names the concern, the expr, the table and the column), and no two included concerns have an
+    # expr of one name. An included expr is a node of the type graph of the model, `expr:User.updated_ms`, taken from the concern's.
+    def check_includes(models, registry)
+      models.each_value do |m|
+        seen = {}
+        (m["includes"] || []).each do |concern|
+          node = @include_nodes.fetch([m["name"], concern])
+          unless registry.concern?(concern)
+            names = registry.concern_names
+            bad(node, "model \"#{m["name"]}\" includes concern \"#{concern}\", which is not declared (#{names.empty? ? "none is declared" : "declared: #{names.join(", ")}"})", word: concern, from: names)
+          end
+          have = (m["table"] ? registry.schema.columns(m["table"]) : nil).to_a.map { |c| c[:name] }
+          registry.concern_exprs(concern).each do |name, found|
+            missing = registry.expr_columns(found).find { |c| !have.include?(c) }
+            if missing
+              why = m["table"] ? "table `#{m["table"]}` has no column `#{missing}`" : "the model names no table"
+              bad(node, "model \"#{m["name"]}\" includes concern \"#{concern}\", but its expr `#{name}` reads `{t}.#{missing}` and #{why}")
+            end
+            if (other = seen[name])
+              bad(node, "model \"#{m["name"]}\" includes concerns \"#{other}\" and \"#{concern}\", which both have an expr `#{name}`; include one of them")
+            end
+            seen[name] = concern
+            @graph&.derive("expr:#{m["name"]}.#{name}", from: ["expr:#{concern}.#{name}"], rule: "include", at: node, type: found[:type])
+          end
+        end
+      end
+    end
+
+    # The models read, resolved once every table and model is known: a model's table is a declared one, each
+    # association finds its target and its columns, and the dependent: tree has no cycle. Db::Models does the
+    # resolving and says what is wrong; this puts the message on the declaration.
+    def check_models(srv)
+      models = @models || {}
+      srv["models"] = models.values
+      tables = srv["tables"].map { |t| t["name"] }
+      models.each_value do |m|
+        next if m["table"].nil? || tables.include?(m["table"])
+
+        list = tables.empty? ? "none is declared" : "declared: #{tables.join(', ')}"
+        bad(@model_nodes.fetch(m["name"]), "model \"#{m['name']}\": table `#{m['table']}` is not declared (#{list})", word: m["table"], from: tables)
+      end
+      resolve_attached(models)
+      check_expr_owners(srv, models)
+      registry = Db::Models.from_ir(srv["models"], srv["exprs"], Db::Schema.from_ir(srv["tables"]))
+      check_includes(models, registry)
+      models.each_value do |m|
+        m["associations"].each do |a|
+          registry.association(m["name"], a["name"])
+        rescue Db::Models::Unresolved => e
+          bad(@model_member_nodes.fetch([m["name"], a["name"]]), e.message, word: e.word, from: e.from)
+        end
+      end
+      models.each_value do |m|
+        registry.destroy_plan(m["name"])
+      rescue Db::Models::Unresolved => e
+        bad(@model_nodes.fetch(m["name"]), e.message)
+      end
+    end
+
+    # The defs a controller's filters run first in a route with this action, in declaration order.
+    def controller_filters_for(ctrl, action)
+      @controller_filters.fetch(ctrl).filter_map do |f|
+        runs = if f["only"] then f["only"].map(&:to_s).include?(action.to_s)
+               elsif f["except"] then !f["except"].map(&:to_s).include?(action.to_s)
+               else true
+               end
+        [f["def"], f["node"], f["provides"]] if runs
+      end
+    end
+
     # The positional and keyword parameters a helper block declares. Positional parameters come first, then
     # keyword ones: a required keyword has no default, an optional one a literal default. Optional or post
     # positional parameters, rest/keyword-rest/block parameters and block-locals are refused.
@@ -2245,8 +2943,8 @@ module AxumDsl
     # fixes the default location of a field that does not say `in:` (:body for post/put/patch, :query for
     # get/delete/head/options). The block is a response body (Body kind :route): it ends in a string or one of
     # `json`, `text`, `html`, `halt`, `redirect`, and reads its inputs with `params[:name]`.
-    def route_decl(node, pos, kw, blk, srv)
-      verb = node.name.to_s
+    def route_decl(node, pos, kw, blk, srv, verb: nil)
+      verb = verb || node.name.to_s
       path = pos[0]
       axum_path, names = route_path(node, path)
       refuse_route_mount_clash(node, axum_path, srv)
@@ -2256,13 +2954,27 @@ module AxumDsl
         prm = srv["params"].find { |x| x["name"] == prm_name } or
           undeclared(node, "route `#{verb} #{path}` refers to undeclared params `#{prm_name}`", prm_name, srv["params"].map { |x| x["name"] })
       end
+      if (resource = kw[:resource])
+        if (model_name = kw[:resource_model]) && (@models || {}).values.none? { |m| m["name"] == model_name }
+          known = (@models || {}).values.map { |m| m["name"] }
+          bad(node, "`resources :#{resource}` names model `#{model_name}`, which is not declared#{known.empty? ? "" : " (declared: #{known.join(", ")})"}", word: model_name, from: known)
+        end
+        derived = resource_id_source(resource, srv, kw[:resource_model])
+        if derived
+          prm, prm_name = apply_derived_path(node, { "id" => derived }, prm, prm_name, srv)
+          graph_path_param("#{verb.upcase} #{path}", { "name" => "id", "type" => derived["type"], "derived" => derived.except("type") }, node)
+        elsif prm.nil?
+          bad(node, "`resources :#{resource}` generates `#{verb} #{path}`, whose path captures `:id`; no model with `table: :#{resource}` declares that table's `id` column, so add `params: :Group` naming a group with `field :id, :i64, in: :path`")
+        end
+      end
       default_in = %w[post put patch].include?(verb) ? "body" : "query"
       field_in = (prm ? prm["fields"] : []).to_h { |f| [f["name"], f["in"] || default_in] }
       if field_in.value?("form") && field_in.value?("body")
         bad(node, "route `#{verb} #{path}` reads params `#{prm_name}` from both a JSON body and a form; axum lets only one extractor consume the request body, so the group's fields must be all `in: :body` or all `in: :form`")
       end
-      if field_in.value?("form") && !%w[post put patch].include?(verb)
-        bad(node, "route `#{verb} #{path}` reads params `#{prm_name}` from a form, but a browser sends a form body only on POST (or PUT/PATCH); on `#{verb}` the fields belong in the query string — use `in: :query`, or make the route a `post`")
+      # A DELETE carries a form too: Rails' `button_to ..., method: :delete` posts its fields with `_method=delete`.
+      if field_in.value?("form") && !%w[post put patch delete].include?(verb)
+        bad(node, "route `#{verb} #{path}` reads params `#{prm_name}` from a form, but a browser sends a form body only on POST (or PUT/PATCH, or a DELETE through `_method`); on `#{verb}` the fields belong in the query string — use `in: :query`, or make the route a `post`")
       end
       path_fields = field_in.select { |_, loc| loc == "path" }.keys
       (names - path_fields).each do |name|
@@ -2279,9 +2991,40 @@ module AxumDsl
         bad(node, "route `#{verb} #{path}` skips `:#{filter_name}`, but no `before :#{filter_name}` filter is declared#{named_filters.empty? ? '' : " (named filters: #{named_filters.join(', ')})"}")
       end
       cache = kw[:cache]
-      check_route_cache(node, verb, path, blk, srv) if cache
+      ctrl = @route_controller&.[](node.object_id)
+      if (named = kw[:controller])
+        bad(node, "`controller:` is for a route outside a controller; this route is already in `#{ctrl}`") if ctrl
+        known = (@controller_nodes || {}).keys
+        bad(node, "no controller `#{named}` is declared#{known.empty? ? '' : " (declared: #{known.join(', ')})"}", word: named, from: known) unless known.include?(named)
+        ctrl = named
+      end
+      bad(node, "`action:` names a route in a controller; this route is in none") if kw[:action] && ctrl.nil?
+
+      def_node = nil
+      if blk.nil?
+        bad(node, "a route needs a do ... end block, or `action:` naming one of its controller's defs") unless kw[:action]
+        def_node = (@controller_defs || {}).dig(ctrl, kw[:action].to_s) if ctrl
+        unless def_node
+          known = ((@controller_defs || {})[ctrl] || {}).keys
+          bad(node, "#{ctrl} has no def `#{kw[:action]}` for this route#{known.empty? ? '' : " (its defs: #{known.join(', ')})"}",
+              word: kw[:action].to_s, from: known)
+        end
+      end
+      check_route_cache(node, verb, path, def_node ? def_node.body : blk, srv) if cache
       body = Body.new(@path, prm || { "fields" => [] }, @regexes, srv["externs"], @flags, "route `#{verb} #{path}`",
-                      @binding_modules, @helper_table, srv["params"] + srv["records"], kind: :route, skip: skips).lower(blk)
+                      @binding_modules, @helper_table, srv["params"] + srv["records"], kind: :route, skip: skips)
+      body.defs = defs_for(ctrl)
+      body.controller = ctrl
+      body.preludes = ctrl ? controller_filters_for(ctrl, kw[:action]) : []
+      body.controller_provides = ctrl ? @controller_filters.fetch(ctrl).select { |f| f["provides"] }.to_h { |f| [f["provides"].to_s, f["def"]] } : {}
+      body.action = kw[:action]
+      provided = {}
+      body.preludes.each do |fname, fnode, provides|
+        next unless provides
+        bad(fnode, "`before :#{fname}` provides `#{provides}`, but another filter on this action already provides it") if provided[provides]
+        provided[provides] = true
+      end
+      body = def_node ? body.lower_action_def(def_node) : body.lower(blk)
       if body["content_type"]
         bad(node, "`content_type(...)` is only meaningful in a `before` filter; it sets the default for the routes that follow")
       end
@@ -2297,13 +3040,212 @@ module AxumDsl
       decl["field_in"] = field_in unless field_in.empty?
       decl["skip"] = skips unless skips.empty?
       decl["cache"] = cache.to_s if cache
+      also = (kw[:also] || []).map(&:to_s)
+      unless also.empty?
+        # Rails' `resources` routes `update` on both PATCH and PUT; `also: [:put]` answers the second verb with this body.
+        bad(node, "route `#{verb} #{path}` has `also:`, which is for an update route (`patch` or `put`) answering the other verb as Rails' resources do") unless %w[patch put].include?(verb)
+        also.each do |m|
+          bad(node, "route `#{verb} #{path}` `also:` takes :put or :patch, got :#{m}") unless %w[patch put].include?(m)
+          bad(node, "route `#{verb} #{path}` lists its own verb in `also:`") if m == verb
+          clash = srv["routes"].find { |r| r["path"] == axum_path && (r["method"] == m || r["also"].to_a.include?(m)) }
+          bad(node, "route `#{verb} #{path}` `also: [:#{m}]` clashes with `#{m} #{path}` (line #{clash['line']})") if clash
+        end
+        decl["also"] = also
+      end
+      if (twin = srv["routes"].find { |r| r["path"] == axum_path && r["also"].to_a.include?(verb) })
+        bad(node, "route `#{verb} #{path}` is already answered by `#{twin['method']} #{path}`'s `also: [:#{verb}]`")
+      end
       decl
     end
+
+    RESOURCE_ACTIONS = %w[index new create show edit update destroy].freeze
+    RESOURCE_MEMBER = %w[show edit update destroy].freeze
+
+    # `resources :rooms, only: %i[show edit], params: :RoomPath, controller: "Rooms"`: Rails' resource table,
+    # lowered to the routes an explicit `get`/`patch` would declare. The controller's action defs (RB2) and
+    # their `before` filters apply as they do to any `action:` route. A member route captures `:id`, so it
+    # needs `params:` naming a group with an `id` field `in: :path`. Nested resources are not implemented yet,
+    # and `create`/`update` take no form group of their own: write those routes explicitly until the strong
+    # params envelope lands (Track RB4). The resource also declares Rails' path helpers (rooms_path, room_path,
+    # new_room_path, edit_room_path and their _url forms) for the bodies to call.
+    def resources_decl(node, pos, kw, blk, srv, route_nodes)
+      name = pos[0]
+      bad(node, "nested `resources` is not implemented yet; write the nested routes explicitly") if blk
+      only = kw[:only]
+      except = kw[:except]
+      bad(node, "`resources :#{name}` takes `only:` or `except:`, not both") if only && except
+      named = only || except
+      unknown = named.to_a - RESOURCE_ACTIONS
+      unless unknown.empty?
+        bad(node, "`resources :#{name}` `#{only ? 'only' : 'except'}:` names #{unknown.map { |a| "`:#{a}`" }.join(', ')}, which #{unknown.size == 1 ? 'is' : 'are'} not one of the seven: #{RESOURCE_ACTIONS.join(', ')}",
+            word: unknown.first, from: RESOURCE_ACTIONS)
+      end
+      chosen = (only || (except ? RESOURCE_ACTIONS - except : RESOURCE_ACTIONS)).uniq
+      bad(node, "`resources :#{name}` has `except:` naming every action, so it routes nothing") if chosen.empty?
+      controller = kw[:controller] || camelize(name)
+      known = (@controller_nodes || {}).keys
+      unless known.include?(controller)
+        bad(node, "`resources :#{name}` names no controller `#{controller}`#{known.empty? ? '' : " (declared: #{known.join(', ')})"}; write `controller:` when the resource's name differs from its controller",
+            word: controller, from: known)
+      end
+      params = kw[:params]
+      descriptions = kw[:description]
+      { "params" => params, "description" => descriptions }.each do |what, given|
+        stray = given.is_a?(Hash) ? given.keys - chosen : []
+        bad(node, "`resources :#{name}` `#{what}:` names #{stray.map { |a| "`#{a}`" }.join(", ")}, which the resource does not route (it routes #{chosen.join(", ")})") unless stray.empty?
+      end
+      base = prefixed("/#{name}")
+      chosen.each do |action|
+        verb, path, also = resource_route(base, action)
+        route_kw = { controller: controller, action: action.to_sym }
+        # one group for every member action, or the hash's group for the action it names (create and update take their form group so)
+        group = params.is_a?(Hash) ? params[action] : (params if RESOURCE_MEMBER.include?(action))
+        route_kw[:params] = group if group
+        if RESOURCE_MEMBER.include?(action) # route_decl derives its :id once every model and table is read
+          route_kw[:resource] = name
+          route_kw[:resource_model] = kw[:model] if kw[:model]
+        end
+        route_kw[:cache] = kw[:cache] if kw[:cache]
+        text = descriptions.is_a?(Hash) ? descriptions[action] : descriptions
+        route_kw[:description] = text if text
+        route_kw[:also] = also if also
+        route_nodes << [node, [path], route_kw, nil, verb]
+      end
+      register_resource_paths(node, name, base, chosen)
+    end
+
+    # What `resources :rooms` knows about its `:id` (Track RR6): the model declared with `table: :rooms`, that table, and
+    # the type of the table's `id` column (the primary key). Nothing is read from the URL or guessed from a plural: the
+    # resource name is the table name, as `model :Room, table: :rooms` says. Nil when no model owns that table or its
+    # `id` is not a scalar a path can carry, and the resource then needs a `params:` group as before. The hash is the
+    # provenance, kept as data for the notice, the hover and a later derivation graph.
+    def resource_id_source(name, srv, model_name = nil)
+      model = (@models || {}).values.find { |m| model_name ? m["name"] == model_name : m["table"].to_s == name.to_s }
+      table = model && srv["tables"].find { |t| t["name"].to_s == model["table"].to_s }
+      column = table && table["columns"].find { |c| c["name"] == "id" }
+      return nil unless column && SCALAR_FIELD_TYPES.include?(column["type"])
+
+      { "type" => column["type"], "from" => "#{table['name']}.id", "via" => "resources :#{name}", "resource" => name.to_s,
+        "model" => model["name"], "at" => "#{table['file'] || @path}:#{table['line']}" }
+    end
+
+    # Applies what a resource derives for its captures to the route: a declared `in: :path` field of another type is
+    # refused naming both sources; one that repeats the type gets the notice N-PATH-PARAM-DERIVED; a capture the group
+    # does not declare is added to it, or to a group of the resource's own when the route names none.
+    def apply_derived_path(node, derived, prm, prm_name, srv)
+      fields = prm ? prm["fields"] : []
+      derived.each do |cap, d|
+        f = fields.find { |x| x["name"] == cap && x["in"] == "path" && !x["derived"] } or next
+        sources = "`#{d['via']}` derives `:#{cap}` as :#{d['type']} (#{d['from']}, model #{d['model']}, table at #{d['at']})"
+        if f["type"] != d["type"]
+          bad(node, "field `#{cap}` of params `#{prm_name}` is declared :#{f['type']}, but #{sources}; the declaration contradicts the derivation, so delete the line (or fix the table)")
+        end
+        Notify.add(@path, node, "N-PATH-PARAM-DERIVED", "field `#{cap}` of params `#{prm_name}` repeats what #{sources}; the line can go unless another route that uses the group needs it")
+      end
+      missing = derived.reject { |cap, _| fields.any? { |x| x["name"] == cap } }
+      return [prm, prm_name] if missing.empty?
+
+      added = missing.map { |cap, d| { "name" => cap, "type" => d["type"], "in" => "path", "derived" => d.except("type") } }
+      if prm
+        prm["fields"].unshift(*added)
+      else
+        name = "#{camelize(missing.first[1]['resource'])}MemberPath"
+        prm = srv["params"].find { |x| x["name"] == name && x["synthesized"] }
+        unless prm
+          bad(node, "`resources :#{missing.first[1]['resource']}` needs the params name `#{name}`, which is declared") if srv["params"].any? { |x| x["name"] == name }
+          prm = { "name" => name, "fields" => added, "synthesized" => true, **located(node) }
+          srv["params"] << prm
+        end
+        prm_name = name
+      end
+      if @types
+        at = (node.respond_to?(:arguments) && node.arguments&.arguments&.first) || node
+        added.each do |f|
+          @types.add(at.location, "path param", TypeNames.display(TypeNames.field_symbol(f)), name: f["name"], detail: "#{f['derived']['from']} via #{f['derived']['via']}")
+        end
+      end
+      [prm, prm_name]
+    end
+
+    # The verb, path and second update verb (`also:`) of one Rails resource action.
+
+    def resource_route(base, action)
+      case action
+      when "index" then ["get", base, nil]
+      when "new" then ["get", "#{base}/new", nil]
+      when "create" then ["post", base, nil]
+      when "show" then ["get", "#{base}/:id", nil]
+      when "edit" then ["get", "#{base}/:id/edit", nil]
+      when "update" then ["patch", "#{base}/:id", ["put"]]
+      when "destroy" then ["delete", "#{base}/:id", nil]
+      end
+    end
+
+    # The path helpers a resource declares, for a body to call: `room_path(id)` compiles to the same
+    # `format!` a hand-written interpolation would, and `room_url(id)` puts request_base_url in front.
+    def register_resource_paths(node, name, base, chosen)
+      helpers = (@flags["path_helpers"] ||= {})
+      singular = name.sub(/s\z/, "")
+      add = lambda do |hname, path, url|
+        bad(node, "resource `#{name}` needs the path helper `#{hname}`, which another resource already declares") if helpers.key?(hname)
+        helpers[hname] = { "path" => path, "captures" => path.scan(/:([A-Za-z_][A-Za-z0-9_]*)/).flatten, "url" => url }
+      end
+      if (chosen & %w[index create]).any?
+        add.call("#{name}_path", base, false)
+        add.call("#{name}_url", base, true)
+      end
+      if chosen.include?("new")
+        add.call("new_#{singular}_path", "#{base}/new", false)
+        add.call("new_#{singular}_url", "#{base}/new", true)
+      end
+      if (chosen & RESOURCE_MEMBER).any?
+        add.call("#{singular}_path", "#{base}/:id", false)
+        add.call("#{singular}_url", "#{base}/:id", true)
+      end
+      return unless chosen.include?("edit")
+
+      add.call("edit_#{singular}_path", "#{base}/:id/edit", false)
+      add.call("edit_#{singular}_url", "#{base}/:id/edit", true)
+    end
+
+    # `scope path: "rooms/opens" do ... end`: a path prefix for the routes in the block, as Rails' `scope`.
+    def scope_decl(node, kw, blk, declare)
+      path = kw[:path]
+      bad(node, "`scope path:` is a path such as \"rooms/opens\"") if path.nil? || path.empty?
+      if path.include?("?") || path.match?(/[()]/)
+        bad(node, "`scope path:` #{path.inspect} uses an optional segment or a group, which axum's router cannot express; a scope path is literal text and `:name` captures")
+      end
+      outer = @route_prefix
+      @route_prefix = join_prefix(outer, path)
+      begin
+        each_child(blk, :top) { |n, p, k, b| declare.call(n, p, k, b) }
+      ensure
+        @route_prefix = outer
+      end
+    end
+
+    # A route path under the innermost scope. Only explicit routes and a resource's base path use it: a route
+    # inside a controller is not scoped.
+    def prefixed(path)
+      return path if @route_prefix.nil? || @route_prefix.empty?
+
+      "/#{@route_prefix}/#{path.to_s.sub(%r{\A/}, '')}"
+    end
+
+    def prefixed_pos(pos) = [prefixed(pos[0])] + pos[1..]
+
+    def join_prefix(outer, path)
+      inner = path.to_s.sub(%r{\A/}, "").sub(%r{/\z}, "")
+      outer.nil? || outer.empty? ? inner : "#{outer.sub(%r{/\z}, '')}/#{inner}"
+    end
+
+    # The controller Rails names for `resources :account_bots`: AccountBots.
+    def camelize(name) = name.split("_").map { |part| part[0].upcase + part[1..] }.join
 
     # The calls whose answer a database commit does not explain: a cached copy would repeat a random token, a
     # file read from disk, the caller's address (it is not in the cache key) or the result of Rust or a
     # subprocess the compiler cannot see into.
-    UNCACHEABLE_CALLS = %i[random_token send_file file_text request_ip request_body rust].freeze
+    UNCACHEABLE_CALLS = %i[random_token send_file file_text request_ip request_body rust active_storage_key active_storage_disk_upload active_storage_direct_upload_url rate_limited?].freeze
 
     # `get "/x", cache: :private do ... end` (AP1, the reference is once-campfire-rust/crates/campfire/src/response_cache.rs):
     # the whole response is kept until the next commit, so the route must be a read of the database, and the crate
@@ -2337,6 +3279,25 @@ module AxumDsl
       nil
     end
 
+    # `use_layer :rate_limit, enabled: :name` (and :front's): a declared integer setting the layer reads on each request;
+    # 0 lets every request through, as Rails' test environment has rate_limit on a :null_store cache and no Thruster.
+    def check_rate_limit(srv)
+      srv["layers"].each do |entry|
+        next unless %w[rate_limit front].include?(entry["name"]) && entry["enabled"]
+
+        check_enabled_setting(srv, entry)
+      end
+    end
+
+    def check_enabled_setting(srv, entry)
+      layer = entry["name"]
+      s = srv["settings"].find { |x| x["name"].to_s == entry["enabled"] }
+      declared = srv["settings"].map { |x| x["name"] }
+      bad(@enabled_nodes[layer], "`use_layer :#{layer}` `enabled:` names setting `#{entry['enabled']}`, which is not declared (declared: #{declared.join(', ')})", word: entry["enabled"], from: declared) unless s
+      bad(@setting_nodes[s["name"]], "setting `#{s['name']}` turns `use_layer :#{layer}` on or off (0 is off), so it must be a required-or-defaulted integer: `setting :#{s['name']}, env: \"...\", default: 1, type: :i64`") unless s["type"] == "i64" && !s["optional"]
+      (@flags["used_settings"] ||= {})[s["name"]] = true
+    end
+
     # The cache's size is the setting `response_cache_mb` when the file declares one, so it has to be a whole number of MB.
     def check_response_cache(srv)
       return unless srv["routes"].any? { |r| r["cache"] }
@@ -2360,6 +3321,11 @@ module AxumDsl
 
           bad(@static_nodes[s["prefix"]], "static `#{s['prefix']}` skips `:#{filter_name}`, but no `before :#{filter_name}` filter is declared#{named.empty? ? '' : " (named filters: #{named.join(', ')})"}")
         end
+      end
+      srv["not_found"]&.[]("skip").to_a.each do |filter_name|
+        next if named.include?(filter_name)
+
+        bad(@filter_nodes["not_found"], "not_found skips `:#{filter_name}`, but no `before :#{filter_name}` filter is declared#{named.empty? ? '' : " (named filters: #{named.join(', ')})"}")
       end
       srv["serve_files"].each do |f|
         f["skip"].to_a.each do |filter_name|
@@ -2489,13 +3455,16 @@ module AxumDsl
     # `before`, `not_found` and `error` are request filters; each is a response body (Body kinds :before,
     # :not_found, :error), so the response helpers are in scope. `before` may be repeated and runs before the
     # routes that follow it; `not_found` and `error` describe what one request answers with.
-    def filter_decl(node, pos, _kw, blk, srv)
+    def filter_decl(node, pos, kw, blk, srv)
       if node.name == :not_found && srv["statics"].any? { |s| s["prefix"] == "/" }
         bad(node, "a `not_found` filter and a directory mounted at \"/\" (`set :public_folder`) both answer a request no route matched, and axum has one fallback; mount the directory at a prefix with `static \"/assets\", dir: ...` instead")
       end
       # `located` gives the filter body the line and file of its declaration, so Emit's source map can
       # point a generated-rustc error back at the filter, like every other declaration.
       if node.name == :before
+        bad(node, "a `before` filter outside a controller needs a do ... end block; `before :name, only:` naming a def is for a controller") unless blk
+        bad(node, "`only:` and `except:` are for a controller's `before :name`; a top-level filter runs for every route (`skip:` opts one out)") if kw[:only] || kw[:except]
+        bad(node, "`provides:` is for a controller's `before :name` filter; a top-level filter is a layer and sets nothing a route reads") if kw[:provides]
         name = pos[0]
         if name
           earlier = srv["before"].find { |f| f["name"] == name }
@@ -2507,6 +3476,7 @@ module AxumDsl
         key = node.name.to_s
         bad(node, "duplicate `#{node.name}` filter#{first_at(node, @filter_nodes&.[](key))}") if srv[key]
         srv[key] = filter_body(node, blk, srv).merge(located(node))
+        srv[key]["skip"] = kw[:skip].map(&:to_s) if node.name == :not_found && kw[:skip]
         (@filter_nodes ||= {})[key] = node
       end
     end
@@ -2576,6 +3546,14 @@ module AxumDsl
         srv["views"] = value
         @flags["views"] = value # a render resolves its views against it (Body#render_response)
         @views_node = node
+      when :locales
+        bad(node, "`set :locales` takes the folder of the locale files as a string, such as \"config/locales\"") unless value.is_a?(String)
+        bad(node, "duplicate `set :locales`#{first_at(node, @locales_node)}") if @flags["locales_dir"]
+        if value.start_with?("/") || value.include?("\0") || value.split("/").include?("..")
+          bad(node, "`set :locales` is a folder inside the DSL file's folder, without a leading /, without .., got #{value.inspect}")
+        end
+        @flags["locales_dir"] = value # Body#i18n_table reads the files there, when a body or a view calls `t`
+        @locales_node = node
       when :layout
         unless value.is_a?(String) || value.is_a?(Symbol)
           bad(node, "`set :layout` names a view with a symbol (:app) or a string (\"app\"), or leave the setting out")
@@ -2586,6 +3564,15 @@ module AxumDsl
         srv["layout"] = value.to_s
         @flags["layout"] = value.to_s # every render that names no `layout:` gets it (Body#render_layout)
         @layout_node = node
+      when :turbo_frame_layout
+        # turbo-rails' `layout "turbo_rails/frame"` for a request with a Turbo-Frame header: every render that has a
+        # layout uses this one instead for such a request (Body#render_response).
+        unless value.is_a?(String) || value.is_a?(Symbol)
+          bad(node, "`set :turbo_frame_layout` names a view with a symbol (:turbo_frame) or a string")
+        end
+        bad(node, "duplicate `set :turbo_frame_layout`") if srv["turbo_frame_layout"]
+        srv["turbo_frame_layout"] = value.to_s
+        @flags["turbo_frame_layout"] = value.to_s
       when :listener
         # The type is spelled module::Type, the module being the `as:` of a rust_file; check_listener
         # looks for that module once the whole file is walked, because the rust_file may come after.
@@ -2609,6 +3596,12 @@ module AxumDsl
         bad(node, "duplicate `set :log`#{first_at(node, @log_node)}") if srv["log"]
         srv["log"] = value.to_s
         @log_node = node
+      when :merge_query_params
+        # Rails' params: query_parameters.merge(request_parameters), so a form field the body lacks is read from the
+        # query string (the body wins a key both carry, a list included).
+        bad(node, "`set :merge_query_params` is true or false, written out") unless value == true || value == false
+        bad(node, "duplicate `set :merge_query_params`") if srv.key?("merge_query_params")
+        srv["merge_query_params"] = value
       when :trust_forwarded_for
         unless value == true || value == false
           bad(node, "`set :trust_forwarded_for` is true or false, written out: it trusts the first " \
@@ -2670,6 +3663,8 @@ module AxumDsl
       return unless st
       bad(st, "unsupported #{nodename(st)} in `#{ctx}` block") unless st.is_a?(Prism::StatementsNode)
       st.body.each do |n|
+        next yield(n, nil, nil, nil) if n.is_a?(Prism::DefNode) && %i[top controller model record].include?(ctx)
+
         p, k, b = call(n, ctx)
         yield n, p, k, b
       end
@@ -2679,18 +3674,23 @@ module AxumDsl
     def call(node, ctx)
       where = ctx == :top ? "the top level" : "`#{ctx}`"
       bad(node, "unsupported #{nodename(node)} in #{where} (only DSL calls are allowed)") unless node.is_a?(Prism::CallNode)
-      sig = SIG[node.name] or bad(node, "unknown DSL call `#{node.name}` (valid in #{where}: #{calls_in(ctx).join(", ")})", word: node.name, from: calls_in(ctx))
-      unless Array(sig[:in]).include?(ctx)
-        bad(node, "`#{node.name}` is not allowed in #{where} (valid there: #{calls_in(ctx).join(", ")}); it belongs in #{Array(sig[:in]).map { |c| c == :top ? "the top level" : "`#{c}`" }.join(" or ")}")
+      variants = AxumDsl.sig_variants(node.name)
+      bad(node, "unknown DSL call `#{node.name}` (valid in #{where}: #{calls_in(ctx).join(", ")})", word: node.name, from: calls_in(ctx)) if variants.empty?
+      sig = AxumDsl.sig(node.name, ctx)
+      if sig.nil?
+        bad(node, "`#{node.name}` is not allowed in #{where} (valid there: #{calls_in(ctx).join(", ")}); it belongs in #{variants.flat_map { |s| Array(s[:in]) }.map { |c| c == :top ? "the top level" : "`#{c}`" }.join(" or ")}")
       end
       bad(node.receiver, "`#{node.name}` takes no receiver") if node.receiver
+      if node.block && sig[:pos].include?(:lambda)
+        bad(node.block, "`#{node.name}` takes its body as a lambda, not a block: write `#{node.name} :name, -> { where(...) }` or `#{node.name} :name, ->(arg) { where(...) }`")
+      end
       pos, kw = args(node, sig)
       note_declaration(node, pos, kw) if @types
       [pos, kw, block(node, sig)]
     end
 
     # The DSL calls allowed directly inside `ctx`.
-    def calls_in(ctx) = SIG.select { |_, s| Array(s[:in]).include?(ctx) }.keys.map(&:to_s)
+    def calls_in(ctx) = AxumDsl.sig_names(ctx).map(&:to_s)
 
     # The call shape for error messages, e.g. `tool(name, params:, description:, [title:], ...)`: optional keywords are bracketed.
     def shape(name, sig)
@@ -2778,6 +3778,7 @@ module AxumDsl
         return out
       end
       return query_returns(node) if want == :qreturns
+      return query_returns(node, bare: true) if want == :creturns
       if want == :htypes
         bad(node, "expected an array of type symbols, got #{nodename(node)}") unless node.is_a?(Prism::ArrayNode)
         return node.elements.map { |el| value(el, HELPER_TYPES.keys).to_s }
@@ -2830,6 +3831,21 @@ module AxumDsl
         end
         return out
       end
+      if want == :camel_or_actions || want == :str_or_actions
+        # `resources`: one value for every action (`params: :RoomPath`), or a hash by action (`params: { edit: :BotPath }`).
+        each = want == :camel_or_actions ? :camel : :str
+        return value(node, each) unless node.is_a?(Prism::HashNode)
+
+        out = {}
+        node.elements.each do |el|
+          bad(el, "unsupported #{nodename(el)} in a by-action hash (write `edit: value`)") unless el.is_a?(Prism::AssocNode) && el.key.is_a?(Prism::SymbolNode)
+          key = el.key.unescaped
+          bad(el, "`#{key}` is not one of the seven resource actions: #{RESOURCE_ACTIONS.join(', ')}", word: key, from: RESOURCE_ACTIONS) unless RESOURCE_ACTIONS.include?(key)
+          bad(el, "duplicate action #{key}") if out.key?(key)
+          out[key] = value(el.value, each)
+        end
+        return out
+      end
       if want == :strs
         bad(node, "expected an array of string literals, got #{nodename(node)}") unless node.is_a?(Prism::ArrayNode)
         return node.elements.map { |el| value(el, :str) }
@@ -2839,6 +3855,17 @@ module AxumDsl
           bad(node, "`required:` names the `before` filter that establishes the current, as in `required: :authenticate`; `required: true` cannot say which filter stops the request")
         end
         return value(node, :snake)
+      end
+      if want == :model_name
+        # A model is named like a Rails class: `model :Room`, or a string for a namespaced one, `model "Account::Bot"`.
+        name = node.unescaped if node.is_a?(Prism::SymbolNode) || node.is_a?(Prism::StringNode)
+        bad(node, "expected a model name such as :Room or \"Account::Bot\", got #{nodename(node)}") unless name
+        bad(node, "a model is named like a Rails one: \"Room\" or \"Account::Bot\"") unless name.match?(CONTROLLER_NAME)
+        return name
+      end
+      if want == :lambda
+        bad(node, "expected a lambda such as `-> { where(...) }` or `->(arg) { where(...) }`, got #{nodename(node)}") unless node.is_a?(Prism::LambdaNode)
+        return node
       end
       if want == :str
         # A squiggly heredoc (<<~) arrives as an InterpolatedStringNode whose parts are plain
@@ -2852,6 +3879,10 @@ module AxumDsl
       end
       bad(node, "expected a symbol literal, got #{nodename(node)}") unless node.is_a?(Prism::SymbolNode)
       s = node.unescaped
+      if want == :column
+        bad(node, "`:#{s}` must be snake_case") unless s.match?(SNAKE)
+        return s
+      end
       if want == :snake || want == :camel
         shape = want == :snake ? "snake_case" : "CamelCase"
         bad(node, "`:#{s}` must be #{shape}") unless s.match?(want == :snake ? SNAKE : CAMEL)

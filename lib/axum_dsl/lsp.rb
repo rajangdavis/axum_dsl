@@ -13,9 +13,13 @@ module AxumDsl
   module Lsp
     autoload :Sources, File.expand_path("lsp/sources", __dir__)
     autoload :Position, File.expand_path("lsp/position", __dir__)
+    autoload :Spans, File.expand_path("lsp/spans", __dir__)
+    autoload :Root, File.expand_path("lsp/root", __dir__)
+    autoload :AxumSource, File.expand_path("lsp/axum_source", __dir__)
     autoload :Analysis, File.expand_path("lsp/analysis", __dir__)
     autoload :SigDoc, File.expand_path("lsp/sig_doc", __dir__)
     autoload :Hover, File.expand_path("lsp/hover", __dir__)
+    autoload :Definition, File.expand_path("lsp/definition", __dir__)
     autoload :Completion, File.expand_path("lsp/completion", __dir__)
     autoload :Server, File.expand_path("lsp/server", __dir__)
   end

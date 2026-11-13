@@ -437,6 +437,17 @@ module AxumDsl
       }
     RS
 
+    # `action_text_html(html)`: the HTML Action Text stores for a body it is given (ActionText::Content.new: the text
+    # stripped as Ruby's strip does, parsed as an HTML5 fragment in a body context -- Nokogiri::HTML5, gumbo -- and
+    # serialized back): `&` becomes `&amp;`, CRLF becomes LF, unclosed tags close. html5ever implements the same parsing
+    # and fragment serialization algorithms.
+    ACTION_TEXT_HTML_CALL = <<~'RS'
+      fn axum_dsl_action_text_html(html: &str) -> String {
+          let stripped = html.trim_matches(|c: char| matches!(c, '\0' | ' ' | '\t' | '\n' | '\x0b' | '\x0c' | '\r'));
+          ::scraper::Html::parse_fragment(stripped).root_element().inner_html()
+      }
+    RS
+
     # What `attachments:` shares: an Action Text opengraph embed read from an <action-text-attachment> (OpengraphEmbed
     # in once-campfire's lib/rails_ext), the web_url rules that keep a preview off this host, and the rewrite of a body
     # that draws each embed and applies RemoveSoloUnfurledLinkText. The markup of an embed is the sanitizer's partial.
@@ -1028,18 +1039,23 @@ module AxumDsl
     # The declared sanitizers some view named, in declaration order.
     def profiles(ir) = ir["sanitizers"].to_a.select { |s| ir["sanitize_profiles"].to_a.include?(s["name"]) }
 
+    # scraper, for every reader of HTML as a DOM: `deterministic` keeps an element's attributes in source order, as
+    # Nokogiri does (without it they are sorted, and a serialized body reorders them). One line, so the emitter's
+    # deduplication merges the sanitizer's and opengraph's.
+    SCRAPER_DEP = 'scraper = { version = "0.20", features = ["deterministic"] }'
+
     # The Cargo.toml dependency line, led by a newline like the others: ammonia only when a view sanitises.
     def deps(ir)
       unless used?(ir)
         line = attachable?(ir) ? "\nbase64 = \"0.22\"" : ""
-        return plain_text?(ir) ? "#{line}\nscraper = \"0.20\"" : line
+        return plain_text?(ir) ? "#{line}\n#{SCRAPER_DEP}" : line
       end
 
       # the regex line is written by Emit#regex_dep when the file has regexes of its own
       line = ir["all_emoji"] && ir["regexes"].to_a.empty? ? "\nammonia = \"4\"\nregex = \"1\"" : "\nammonia = \"4\""
       line += "\nbase64 = \"0.22\"" if attachable?(ir)
       # `attachments:` reads a body and a preview's markup as a DOM, as Nokogiri does
-      attachments?(ir) || plain_text?(ir) ? "#{line}\nscraper = \"0.20\"" : line
+      attachments?(ir) || plain_text?(ir) ? "#{line}\n#{SCRAPER_DEP}" : line
     end
 
     def attachments?(ir) = profiles(ir).any? { |p| p["attachments"] }
@@ -1051,7 +1067,8 @@ module AxumDsl
     def editable_fn_name(name) = "axum_dsl_editable_#{name}_into"
 
     # A body called `plain_text(html)`: the conversion above is written, with the scraper it reads the HTML with.
-    def plain_text?(ir) = ir["builtins"].to_a.include?("plain_text")
+    def plain_text?(ir) = ir["builtins"].to_a.include?("plain_text") || action_text_html?(ir)
+    def action_text_html?(ir) = ir["builtins"].to_a.include?("action_text_html")
     def sounds?(ir) = profiles(ir).any? { |p| p["sounds"] }
 
     # The Rust function a view's `{% if x|sound :name %}` calls.
@@ -1123,6 +1140,7 @@ module AxumDsl
         lines.push("// `plain_text(html)` (ActionText::PlainTextConversion): written by the compiler")
         lines.push(*RAILS_PLAIN_TEXT.lines.map(&:chomp)) unless attachments?(ir) # the attachments runtime holds it already
         lines.push(*PLAIN_TEXT_CALL.lines.map(&:chomp), "")
+        lines.push(*ACTION_TEXT_HTML_CALL.lines.map(&:chomp), "") if action_text_html?(ir)
       end
       return lines unless used?(ir)
 

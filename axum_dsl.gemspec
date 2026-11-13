@@ -31,4 +31,5 @@ Gem::Specification.new do |spec|
   # resolved (1.9.x); widen it only after `make check` passes on the newer one.
   spec.add_dependency "prism", "~> 1.9"
   spec.add_dependency "sorbet-runtime", ">= 0.5"
+  spec.add_dependency "r2r-laws", "~> 0.1"
 end

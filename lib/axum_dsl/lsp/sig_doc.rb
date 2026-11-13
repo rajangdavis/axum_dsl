@@ -16,6 +16,9 @@ module AxumDsl
         str: "a string literal",
         snake: "a snake_case symbol",
         camel: "a CamelCase symbol (the name of something the file declares)",
+        model_name: "a model name, a symbol such as :Room or a string such as \"Account::Bot\"",
+        lambda: "a lambda such as `-> { where(...) }` or `->(arg) { where(...) }`",
+        column: "a snake_case symbol, a Rust keyword allowed (the name of a table column)",
         fieldtype: "a field type",
         htypes: "a list of helper argument types",
         helper_kw: "a keyword parameter table such as `{ limit: [:i32, false] }`",
@@ -24,7 +27,8 @@ module AxumDsl
         snakes: "a list of snake_case symbols",
         file_checks: "a list of file checks",
         sqlargs: "a hash of the query's arguments, such as `{ limit: :i64 }`, each a scalar type (:string, :i64, :f64, :bool)",
-        qreturns: "what a query returns: `list(:Record)`, `:Record?` (the first row or nil) or a scalar type, with ? for nil-able"
+        qreturns: "what a query returns: `list(:Record)`, `:Record?` (the first row or nil) or a scalar type, with ? for nil-able",
+        creturns: "what a current returns: as a query, or `:Record` with `missing:` (a non-nil record)"
       }.freeze
 
       # A field's scalar and list types; a field may also name a CamelCase params group.
@@ -65,12 +69,13 @@ module AxumDsl
 
       # The calls the reader allows directly inside `ctx`.
       def declarations_for(ctx)
-        SIG.select { |_, s| Array(s[:in]).include?(ctx) }.keys.map(&:to_s)
+        AxumDsl.sig_names(ctx).map(&:to_s)
       end
 
-      # The declarations allowed inside the block of `name`. There are three :decls blocks: `params` and
-      # `record`, whose blocks hold fields, and `fragment`, whose block holds the top-level declarations.
-      def block_calls(name) = declarations_for(%i[params record].include?(name) ? name : :top)
+      # The declarations allowed inside the block of `name`. There are five :decls blocks: `params`,
+      # `record` and `table`, whose blocks hold fields, `model`, whose block holds its own declarations, and
+      # `fragment`, whose block holds the top-level declarations.
+      def block_calls(name) = declarations_for(%i[params record table model].include?(name) ? name : :top)
 
       def context_doc(where)
         Array(where).map { |c| c == :top ? "the top level" : "`#{c}`" }.join(" or ")
@@ -78,18 +83,23 @@ module AxumDsl
 
       def block_doc(name, block)
         case block
-        when :body then "the body language (a Ruby subset), `do ... end`"
+        when :body then AxumDsl::Docs.block(name) ? "#{AxumDsl::Docs.block(name)}, `do ... end`" : "the body language (a Ruby subset), `do ... end`"
         when :decls then "declarations only: #{block_calls(name).join(', ')} - `do ... end`"
         else "none"
         end
       end
 
-      # The markdown a hover shows for a declaration, or nil when the name is not one.
+      # The markdown a hover shows for a declaration, or nil when the name is not one. A name with a signature
+      # per context (SIG, AxumDsl.sig_variants) shows each, its "may appear" line saying where.
       def hover(name)
         key = name.to_sym # a caller may hold the name as the string a completion label carries
-        sig = SIG[key]
-        return nil if sig.nil?
+        variants = AxumDsl.sig_variants(key)
+        return nil if variants.empty?
 
+        variants.map { |sig| hover_one(key, sig) }.join("\n\n")
+      end
+
+      def hover_one(key, sig)
         lines = ["**`#{key}`** - an axum_dsl declaration: `#{shape(key, sig)}`", ""]
         sig[:pos].each_with_index do |kind, i|
           lines << "- `#{sig[:names][i]}` - #{kind_doc(kind)}"
@@ -105,15 +115,15 @@ module AxumDsl
       # One line for a completion item.
       def detail(name)
         key = name.to_sym
-        sig = SIG[key]
-        sig ? "#{key} - may appear in #{context_doc(sig[:in])}" : name.to_s
+        variants = AxumDsl.sig_variants(key)
+        variants.empty? ? name.to_s : "#{key} - may appear in #{variants.map { |sig| context_doc(sig[:in]) }.join("; ")}"
       end
 
       # The keywords a declaration accepts, for completion.
-      def keywords(name) = SIG[name][:kw].keys
+      def keywords(name) = AxumDsl.sig_variants(name).flat_map { |sig| sig[:kw].keys }.uniq
 
       def keyword_detail(name, key)
-        kind, required = SIG[name][:kw][key]
+        kind, required = AxumDsl.sig_variants(name).filter_map { |sig| sig[:kw][key] }.first
         "#{key}: - #{kind_doc(kind)}#{required ? ' (required)' : ' (optional)'}"
       end
     end

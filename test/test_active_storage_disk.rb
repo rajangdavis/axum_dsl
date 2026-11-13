@@ -33,6 +33,20 @@ class TestActiveStorageDisk < Minitest::Test
       headers "Content-Disposition" => inline_disposition(params[:filename])
       "ok"
     end
+    params :DiskPut do
+      field :token, :string, in: :path
+    end
+    post "/direct" do
+      key = active_storage_key
+      headers "X-Signed" => active_storage_blob_id(7, secret: :secret_key)
+      text("\#{request_base_url}\#{active_storage_direct_upload_url(key, "text/plain", 6, "XrY7u+Ae7tCTyyK7j1rNww==", secret: :secret_key)}")
+    end
+    put "/disk/:token", params: :DiskPut do
+      status = active_storage_disk_upload(params[:token], "/tmp/storage", secret: :secret_key)
+      return head(204) if status == 204
+      return head(404) if status == 404
+      head(422)
+    end
   RB
 
   def main_rs
@@ -56,6 +70,39 @@ class TestActiveStorageDisk < Minitest::Test
     assert_includes main, 'axum_dsl_active_storage_verified(secret, token, "blob_id")'
     assert_includes main, 'axum_dsl_active_storage_verified(secret, token, "blob_key")'
     assert_includes main, "if expires <= axum_dsl_iso8601_ms(now).as_str()"
+  end
+
+  def test_direct_upload_token_is_rails_blob_token
+    main = main_rs
+    assert_includes main, '{{\"key\":{},\"content_type\":{},\"content_length\":{},\"checksum\":{},\"service_name\":\"local\"}}'
+    assert_includes main, '"blob_token", Some(&expires)'
+    assert_includes main, 'format!("/rails/active_storage/disk/{}", axum_dsl_path_segment(&token))'
+    assert_equal 1, main.scan("fn axum_dsl_path_segment(").size, "the segment escaper is written once"
+  end
+
+  def test_disk_upload_is_disk_controller_update
+    main = main_rs
+    assert_includes main, 'axum_dsl_active_storage_verified(secret, token, "blob_token") else { return 404 }'
+    assert_includes main, "::md5::Md5::digest(body)"
+    assert_includes main, "axum_dsl_active_storage_disk_upload(settings().secret_key.as_bytes(), "
+    assert_includes main, "&__headers, &__body, "
+    assert_includes main, "fn axum_dsl_active_storage_key() -> String"
+    assert_includes main, "axum_dsl_active_storage_blob_id(settings().secret_key.as_bytes(), (7) as i64)"
+  end
+
+  def test_disk_upload_is_for_a_route_body
+    Dir.mktmpdir("as") do |dir|
+      file = File.join(dir, "as.axum.rb")
+      File.write(file, <<~RB)
+        server "as", version: "0.1.0"
+        setting :secret_key, env: "SECRET_KEY_BASE", secret: true
+        helper :up, args: [:string], returns: :i64 do |t|
+          active_storage_disk_upload(t, "/tmp", secret: :secret_key)
+        end
+      RB
+      err = assert_raises(AxumDsl::CompileError) { AxumDsl.read(file) }
+      assert_includes err.message, "active_storage_disk_upload reads the request body"
+    end
   end
 
   def test_the_disposition_is_actiondispatch_content_disposition

@@ -364,8 +364,29 @@ module AxumDsl
 
       // Hands one message (JSON text) to every subscription listening on the name, in the order the calls are made.
       // `try_send` never waits: a connection whose queue is full loses the frame, and the route that broadcast goes on.
+      // AXUM_DSL_CABLE_LOG=<file>: every broadcast is also appended to the file as one JSON line,
+      // {"stream": name, "message": the JSON text sent}, and every stream counts as listened to, so a test outside the
+      // process sees what Action Cable's test adapter would hold (campfire_axum_dsl's test/rails_tests replays it into
+      // Rails' pubsub for assert_broadcasts and assert_turbo_stream_broadcasts).
+      #[allow(dead_code)]
+      fn axum_dsl_cable_log() -> Option<&'static ::std::sync::Mutex<::std::fs::File>> {
+          static LOG: ::std::sync::OnceLock<Option<::std::sync::Mutex<::std::fs::File>>> = ::std::sync::OnceLock::new();
+          LOG.get_or_init(|| {
+              let path = ::std::env::var("AXUM_DSL_CABLE_LOG").ok().filter(|path| !path.is_empty())?;
+              ::std::fs::OpenOptions::new().create(true).append(true).open(path).ok().map(::std::sync::Mutex::new)
+          })
+          .as_ref()
+      }
+
       #[allow(dead_code)]
       fn axum_dsl_cable_broadcast(stream: &str, json: String) {
+          if let Some(log) = axum_dsl_cable_log() {
+              use ::std::io::Write;
+              let line = ::serde_json::json!({ "stream": stream, "message": json }).to_string();
+              let mut file = log.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+              let _ = writeln!(file, "{line}");
+              let _ = file.flush();
+          }
           let message = axum_dsl_cable_escape(&json);
           let hub = AXUM_DSL_CABLE_HUB.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
           if let Some(targets) = hub.get(stream) {
@@ -382,6 +403,9 @@ module AxumDsl
           let parts: Vec<&str> = parts.iter().copied().filter(|part| !part.trim().is_empty()).collect();
           if parts.is_empty() {
               return false;
+          }
+          if axum_dsl_cable_log().is_some() {
+              return true;
           }
           let hub = AXUM_DSL_CABLE_HUB.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
           hub.get(&parts.join(":")).is_some_and(|targets| !targets.is_empty())

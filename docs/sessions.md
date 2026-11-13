@@ -149,7 +149,7 @@ safe to reject, while accepting it without checking the expiry would not be. `ch
 and an `exp` now or in the past is nil. The crates are `hmac` 0.12,
 `sha2` 0.10, `pbkdf2` 0.12 and `base64` 0.22, added only when a body calls the verifier.
 
-## Values: `random_token`, `request_ip`, `request_base_url`, `user_agent`
+## Values: `random_token`, `request_ip`, `request_base_url`, `user_agent`, `request_referrer`
 
 - `random_token` is a string of 24 characters from the base58 alphabet Rails' `has_secure_token` uses
   (`123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz`), drawn from `rand` 0.9's thread generator, which
@@ -167,11 +167,14 @@ and an `exp` now or in the past is nil. The crates are `hmac` 0.12,
   `X-Forwarded-Proto` entry makes the scheme `https`. Without that layer option a client cannot choose the host. It is
   empty when the request names no host.
 - `user_agent` is the `User-Agent` header, empty when the request has none.
+- `request_referrer` is the `Referer` header (Rails' `request.referrer`), empty when the request has none: where
+  Rails' `link_back` goes.
+- `turbo_stream_request?` is true when the Accept header lists `text/vnd.turbo-stream.html` (Rails' `request.format.turbo_stream?` when no `format` parameter overrides it).
 - `turbo_frame_request?` is true when the request has a non-blank `Turbo-Frame` header (turbo-rails' `turbo_frame_request?`). A layout is chosen at compile time, so branch with `if turbo_frame_request?` and give each branch its own `render ..., layout:`.
 
 `request_path` is the URI path (no query string) and is for a `before` filter only: a filter has no `params`, yet must tell which request it is running for (a bot key in the path). `request_method` is the HTTP method in upper case (`"GET"`, `"POST"`) for a route or a `before` filter (Rails' `request.get?`/`request.head?`); it reads the method after `use_layer :method_override` has rewritten it.
 
-`request_ip`, `request_base_url`, `user_agent` and `turbo_frame_request?` read the request, so they are for route, `before` and `current` bodies; a helper or
+`request_ip`, `request_base_url`, `user_agent`, `request_referrer` and `turbo_frame_request?` read the request, so they are for route, `before` and `current` bodies; a helper or
 a binding computes from its arguments, and `not_found` and `error` run without the request. `request_method` is for a route or a `before` filter only:
 a `current` body does not receive the method.
 
@@ -186,6 +189,65 @@ It is computed at most once per request, on the first read, however many filters
 compiler adds a layer, outside every `before` filter, that gives each request an `Arc` of `OnceCell`s in its
 extensions, and each read is `get_or_try_init` on the cell (tokio's `sync` feature is added then). An error in the
 block behaves like a `raise` in the body that read it. A `current` nothing reads is a compile error.
+
+`reader: :current_user` names it as a bare call as well, Rails' `current_user`: `current_user.id` is exactly
+`current(:user).id`, read under the same `required:` rule. The declaration is the one place the name comes from; a def,
+helper or query of the same name is refused, so a reader of a route can always find what `current_user` is.
+
+### A non-nil record: `missing:`
+
+`returns: :Record?` leaves every reader holding an optional. When the body's row is expected to be there, say what
+happens if it is not, and the current is a plain `Record`:
+
+```ruby
+current :flags, returns: :BodyFlags, reader: :current_flags, missing: "the user was not read back" do
+  user = current(:user)
+  user.nil? ? nil : body_flags(user_id: user.id)      # the body still yields the row or nil
+end
+
+get "/x" do
+  current_flags.title                                 # a BodyFlags: no `|| raise(...)`
+end
+```
+
+When the body yields nothing the request fails exactly as `raise "the user was not read back"` does there (a 500
+through the body's error path), and the failure is not kept: the cell stays empty, so a later read in the request
+computes again. `returns: :Record` without `missing:` is refused (the message shows both spellings); `missing:` on
+any other `returns:` is refused; `missing:` and `required:` are mutually exclusive (`required:` leaves the nil to a
+`before` filter, `missing:` fails the request itself). A scalar `returns: :string` is already non-nil and takes no
+`missing:`. A `cable authenticate_with:` current must stay nil-able. `current(:flags)` and the `reader:` read the
+same `Record` type everywhere (routes, filters, other `current` bodies, view locals).
+
+## Flash
+
+Rails' flash (`redirect_to path, notice: "..."` and the page it lands on), carried on a plain cookie as a suffix on its
+value, the shape Campfire's port uses for `_campfire_session`:
+
+```ruby
+flash cookie: "_campfire_session",
+      notice: { notice_saved: "✓" },
+      alert: { room_not_found: "Room not found or inaccessible" }
+
+patch "/account" do
+  ...
+  redirect("/account/edit", notice: :notice_saved)   # Set-Cookie: _campfire_session=<token>.notice_saved
+end
+
+get "/account/edit" do
+  flash = take_flash                                 # Set-Cookie: _campfire_session=<token>
+  render :account_edit, locals: { flash_on: flash.on, flash_alert: flash.alert, flash_text: flash.text }
+end
+```
+
+- The declaration lists every message the service can show. A key is the cookie's `.<key>` suffix and is snake_case;
+  `redirect(path, notice: :key)` and `redirect(path, alert: :key)` name one, and a key the declaration does not list
+  under that kind is refused. A redirect carries one message, and replaces one already waiting.
+- `take_flash` is Rails reading the flash: a `Flash::Message` record (`on`, `alert`, `key`, `text`; false and empty when nothing
+  waits), and the bare token written back so the message shows once. A route that never calls it leaves the cookie as
+  it came, as Rails keeps a flash nothing read: `/` redirecting on to a room passes the alert to that room's page.
+- The locals stay explicit: the view gets `flash_on`/`flash_text` from the route, so each value can be traced to the
+  `take_flash` that read it. The cookie is written as `set_cookie name, value, signed: false` writes it.
+- Both need `cookies secret:` and run in a route (a def a route calls included).
 
 ## Named `before` filters, `skip:` and `required:`
 

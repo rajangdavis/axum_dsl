@@ -229,6 +229,21 @@ broadcast_turbo global_id_param("Rooms::Open", room.id, app: "campfire"), :messa
   then `action`, then `target`; the target is HTML-escaped. When `html:` is written directly as
   `render_string(...)`, the render is skipped when no subscription is listening on the stream, so a POST with no open
   socket does not build markup nobody will receive.
+- `broadcast_append_to`, `broadcast_prepend_to`, `broadcast_replace_to`, `broadcast_update_to` and `broadcast_remove_to`
+  `(streamable, *parts, target:, html:, maintain_scroll:, app:)` are turbo-rails' own spellings of the five common actions, and
+  pure sugar: each lowers to exactly the Rust of the `broadcast_turbo` call with that `action:` (`broadcast_remove_to` takes
+  no `html:`, as `action: :remove` takes none). The first argument is the streamable: a record (a `record` or a params
+  struct) with `class_name` and `id` fields, whose stream part is `global_id_param(rec.class_name, rec.id, app: app)`, or
+  anything `broadcast_turbo` takes as a part, unchanged. The other positionals are the rest of the stream name. No
+  declaration names the GlobalID app, so a record needs `app: "campfire"` on the call; `app:` is refused when the first
+  argument is not a record. `action:` is refused: the name says it.
+
+  ```ruby
+  # broadcast_remove_to room, :messages, target: "message_#{id}"   (turbo-rails)
+  broadcast_remove_to room, :messages, target: "message_#{id}", app: "campfire"
+  # the same call, spelled out
+  broadcast_turbo global_id_param(room.class_name, room.id, app: "campfire"), :messages, action: :remove, target: "message_#{id}"
+  ```
 - `render_string(:message, locals: {...})` is the markup: a view rendered to a string, with no layout and no response. It is
   compiled into the crate and follows `render`'s rule for locals, partials and `{% for %}` (see [Views](views.md)); it is
   allowed in a route, a filter and a channel callback.
@@ -261,6 +276,14 @@ checked against the frames Rails sends (the parity harness's cable logs and `onc
 - Cleanup: an `unsubscribe` removes the subscription's entries from the hub, and so does the close of the socket, for
   every subscription it held, before `on_unsubscribe` runs. A hub entry never outlives its connection.
 - A broadcast to a name no one listens on is dropped.
+
+### Watching broadcasts from a test
+
+With `AXUM_DSL_CABLE_LOG=<file>` in the environment, every broadcast is also appended to the file as one JSON line,
+`{"stream": "<name>", "message": "<the JSON text sent>"}`, and every stream counts as listened to (so a Turbo
+broadcast renders even with no subscriber). A test in another process reads what Action Cable's test adapter would
+hold: Campfire's `test/rails_tests` replays the lines into Rails' pubsub for `assert_broadcasts` and
+`assert_turbo_stream_broadcasts`.
 
 ## Closing a user's connections
 

@@ -19,6 +19,10 @@ module AxumDsl
   # `before`, `not_found` or `error` body carries its own line and file too (Reader#filter_decl), so a
   # filter is mapped like every other declaration.
   module Emit
+    # The dependency set every generated crate is pinned to (Lockfile.pin), resolved from the examples by
+    # bin/vet_lock; it ships in the gem (lib/**).
+    VETTED_LOCK = File.expand_path("vetted/Cargo.lock", __dir__)
+
     # Rust helper for cmd_fn / script_fn. Arguments are separate argv entries (never shell
     # text); the environment is reduced to PATH; 10 s timeout; 1 MB output cap.
     RUN_SUBPROCESS = <<~'RS'
@@ -172,6 +176,57 @@ module AxumDsl
               ));
           }
           Ok(signed as i64)
+      }
+    RS
+    # The three conversions of a `:time` field (a Rails timestamp stored as text, YYYY-MM-DD HH:MM:SS.ffffff in UTC).
+    # They equal SQLite's strftime('%Y%m%d%H%M%S', x), strftime('%Y-%m-%dT%H:%M:%SZ', x) and
+    # CAST(strftime('%s', x) AS INTEGER) * 1000 + CAST(substr(strftime('%f', x), 4) AS INTEGER) for a well-formed
+    # text; a malformed one never panics (the first two work on the characters there, to_ms answers 0).
+    TIME_NUMBER = <<~'RS'
+      fn axum_dsl_time_number(t: &str) -> String {
+          t.chars().take(19).filter(|c| !matches!(*c, '-' | ' ' | ':' | 'T')).collect()
+      }
+    RS
+    TIME_ISO8601 = <<~'RS'
+      fn axum_dsl_time_iso8601(t: &str) -> String {
+          let mut s: String = t.chars().take(19).enumerate().map(|(i, c)| if i == 10 && c == ' ' { 'T' } else { c }).collect();
+          s.push('Z');
+          s
+      }
+    RS
+    TIME_MS = <<~'RS'
+      fn axum_dsl_time_ms(t: &str) -> i64 {
+          let b = t.as_bytes();
+          let num = |from: usize, to: usize| -> Option<i64> {
+              let s = b.get(from..to)?;
+              if s.iter().all(|c| c.is_ascii_digit()) { std::str::from_utf8(s).ok()?.parse().ok() } else { None }
+          };
+          let parse = || -> Option<i64> {
+              let (y, m, d) = (num(0, 4)?, num(5, 7)?, num(8, 10)?);
+              let (h, mi, s) = (num(11, 13)?, num(14, 16)?, num(17, 19)?);
+              if b[4] != b'-' || b[7] != b'-' || !(b[10] == b' ' || b[10] == b'T') || b[13] != b':' || b[16] != b':' {
+                  return None;
+              }
+              if !(1..=12).contains(&m) || !(1..=31).contains(&d) || h > 23 || mi > 59 || s > 59 {
+                  return None;
+              }
+              let y = if m <= 2 { y - 1 } else { y };
+              let era = y.div_euclid(400);
+              let yoe = y - era * 400;
+              let doy = (153 * (if m > 2 { m - 3 } else { m + 9 }) + 2) / 5 + d - 1;
+              let days = era * 146097 + yoe * 365 + yoe / 4 - yoe / 100 + doy - 719468;
+              let ms = if b.get(19) == Some(&b'.') {
+                  let mut first4 = 0;
+                  for i in 0..4 {
+                      first4 = first4 * 10 + b.get(20 + i).filter(|c| c.is_ascii_digit()).map_or(0, |c| (c - b'0') as i64);
+                  }
+                  (first4 + 5) / 10
+              } else {
+                  0
+              };
+              Some((days * 86400 + h * 3600 + mi * 60 + s) * 1000 + ms)
+          };
+          parse().unwrap_or(0)
       }
     RS
     # Integer(text, 10): strict decimal parsing. Surrounding whitespace, a sign and single underscores
@@ -400,11 +455,11 @@ module AxumDsl
         axum = { version = "0.8", default-features = false, features = [#{axum_features(ir).map { |f| "\"#{f}\"" }.join(", ")}] }
         tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "signal"#{ir["database"] && Sessions.tokio_features(ir).empty? ? ", \"sync\"" : ""}#{Sessions.tokio_features(ir)}#{SendFile.tokio_features(ir)}#{Multipart.tokio_features(ir)}#{Cable.tokio_features(ir)}] }
         serde = { version = "1", features = ["derive"] }
-        serde_json = "1"
+        #{serde_json_dep(ir)}
         anyhow = "1"
-        tikv-jemallocator = "0.6"#{regex_dep(ir)}#{tower_http_dep(ir)}#{tracing_deps(ir)}#{crate_deps(ir)}#{database_deps(ir)}#{dependency_lines(Cookies.deps(ir), SignedId.deps(ir), Sessions.deps(ir), Sanitize.deps(ir), ResponseCache.deps(ir), Front.deps(ir), Multipart.deps(ir))}
+        tikv-jemallocator = "0.6"#{regex_dep(ir)}#{tower_http_dep(ir)}#{tracing_deps(ir)}#{crate_deps(ir)}#{database_deps(ir)}#{dependency_lines(Cookies.deps(ir), SignedId.deps(ir), Sessions.deps(ir), Sanitize.deps(ir), ResponseCache.deps(ir), Front.deps(ir), Multipart.deps(ir), Opengraph.deps(ir), ImageVariant.deps(ir), WebPush.deps(ir), Webhook.deps(ir))}
 
-        [target.'cfg(target_os = "linux")'.dependencies]
+        #{laws_dev_dep(ir)}[target.'cfg(target_os = "linux")'.dependencies]
         libc = "0.2"
 
         # One codegen unit with fat LTO; not `panic = "abort"`, so a panicking request still answers 500.
@@ -414,6 +469,20 @@ module AxumDsl
       TOML
     end
 
+    # proptest for the laws, a dev-dependency: `cargo test` builds it, the release binary does not.
+    def laws_dev_dep(ir)
+      return "" if ir["laws"].to_a.empty?
+
+      tower = ir["route_laws"] ? "tower = { version = \"0.5\", features = [\"util\"] }\n" : ""
+      "[dev-dependencies]\nproptest = \"#{Laws::Proptest::VERSION}\"\n#{tower}\n"
+    end
+
+    # serde_json, with `preserve_order` when a body builds JSON with json_object: Ruby's to_json writes a hash's keys in
+    # the order they were written, while serde_json's default map sorts them.
+    def serde_json_dep(ir)
+      ir["builtins"].to_a.include?("json_object") ? 'serde_json = { version = "1", features = ["preserve_order"] }' : 'serde_json = "1"'
+    end
+
     # The axum features the emitted service names. The query and json extractors (and the Json response
     # a body's `json(...)` builds) are always on; the "form" feature is added only when a route reads a
     # field `in: :form`, because it is the one that turns on axum's Form extractor. axum's own `query`
@@ -421,12 +490,16 @@ module AxumDsl
     # serde_urlencoded entry in the generated Cargo.toml, and none is needed.
     def axum_features(ir)
       feats = %w[http1 tokio query json]
-      feats << "form" if ir["routes"].to_a.any? { |r| (r["field_in"] || {}).value?("form") }
+      # The upload runtime (Multipart) carries the form extractor too, so an upload made by request_upload or
+      # image_variant alone still needs it.
+      feats << "form" if ir["routes"].to_a.any? { |r| (r["field_in"] || {}).value?("form") } || Multipart.uploads_used?(ir)
       feats.concat(Cable.axum_features(ir))
+      # `not_found skip:` tells an unmatched request by the MatchedPath the router puts on a matched one.
+      feats << "matched-path" if ir["not_found"]&.[]("skip").to_a.any?
       feats
     end
 
-    # The database backend's crates (rusqlite and deadpool-sqlite for SQLite), only when `database` is declared.
+    # The database backend's crates (rusqlite for SQLite), only when `database` is declared.
     def database_deps(ir)
       return "" unless ir["database"]
 
@@ -626,6 +699,7 @@ module AxumDsl
     # use_layer :rate_limit: the compiler's own fixed-window limiter, in std only. One process-wide map
     # counts requests per client address (the same address `request_ip` reads) in windows of `per` seconds;
     # a request past `burst` answers 429. `path:` counts one exact path, and without it every route is counted.
+    # `enabled:` names an integer setting read on each request: 0 lets every request through uncounted.
     # The three values are this file's, so the runtime is written here rather than in a fixed snippet.
     def rate_limit_runtime(ir)
       entry = layer_entry(ir, "rate_limit")
@@ -638,6 +712,7 @@ module AxumDsl
        "    ::std::sync::OnceLock::new();",
        "",
        "async fn axum_dsl_rate_limit(request: ::axum::extract::Request, next: ::axum::middleware::Next) -> ::axum::response::Response {",
+       *(entry["enabled"] ? ["    if settings().#{entry['enabled']} == 0 {", "        return next.run(request).await;", "    }"] : []),
        "    if !AXUM_DSL_RATE_LIMIT_PATH.is_empty() && request.uri().path() != AXUM_DSL_RATE_LIMIT_PATH {",
        "        return next.run(request).await;",
        "    }",
@@ -710,7 +785,8 @@ module AxumDsl
             # A body that read errors[:field] (body.rb: errors_read) takes this part's check messages into
             # the body instead of the 400 a route that did not read them is answered with.
             parts << { "source" => source, "struct" => name, "binding" => "__#{source}", "fields" => fields,
-                       "check" => enforced, "errors" => enforced && r["body"]["errors"] }
+                       "check" => enforced, "errors" => enforced && r["body"]["errors"],
+                       "merge_query" => source == "form" && ir["merge_query_params"] == true }
           end
         end
         { "route" => r, "parts" => parts }
@@ -884,10 +960,12 @@ module AxumDsl
 
       case type.to_sym
       when :string then param ? "&str" : "String"
+      when :time then param ? "&str" : "String"
       when :strs then param ? "&[String]" : "Vec<String>"
       when :i64s then param ? "&[i64]" : "Vec<i64>"
       when :f64s then param ? "&[f64]" : "Vec<f64>"
       when :ostr then "Option<String>"
+      when :otime then "Option<String>"
       when :oi64 then "Option<i64>"
       when :oi32 then "Option<i32>"
       when :of64 then "Option<f64>"
@@ -900,14 +978,19 @@ module AxumDsl
     end
 
     # Rust for exactly the checked operations a server uses (keys like "add:i32", "neg:i64").
-    def checked_int_lines(used)
+    LAW_ONLY = "#[cfg_attr(not(test), allow(dead_code))]" # runtime only laws call: compiled, but uncalled, in release
+
+    def checked_int_lines(used, law_only = [])
       lines = []
       unless used.all? { |u| u.start_with?("neg:") }
+        binary = used.reject { |u| u.start_with?("neg:") }
+        lines << LAW_ONLY if binary.all? { |u| law_only.include?(u) }
         lines.concat(ARITH_ERROR.lines.map(&:chomp))
         lines << ""
       end
       used.each do |key|
         kind, ty = key.split(":")
+        lines << LAW_ONLY if law_only.include?(key)
         if kind == "neg"
           lines << "fn ck_neg_#{ty}(a: #{ty}, at: &str) -> Result<#{ty}, String> {"
           lines << "    a.checked_neg().ok_or_else(|| {"
@@ -1466,6 +1549,98 @@ module AxumDsl
       lines << "}"
     end
 
+    # A law that sends requests (respond) needs the startup and the router `main` uses, so they become functions the
+    # laws module calls too; main is otherwise the same.
+    def split_main(ir, start, chain, wrap)
+      ["/// The startup checks and state main runs before it listens (settings, cookie keys, files, the database).",
+       "async fn axum_dsl_start() {",
+       *start,
+       "}",
+       "",
+       "/// The service's router, as main serves it.",
+       "fn axum_dsl_app() -> axum::Router {",
+       "    let router = #{chain.join("\n        ")}",
+       *wrap,
+       "    router",
+       "}",
+       "",
+       "#[tokio::main]",
+       "async fn main() -> anyhow::Result<()> {",
+       "    disable_transparent_huge_pages();",
+       "    axum_dsl_start().await;",
+       "    let router = axum_dsl_app();",
+       *main_tail(ir)]
+    end
+
+    # What a law's respond(...) runs on: one runtime and one startup per test binary, then the router answering a
+    # request in-process (tower's oneshot), the peer address 127.0.0.1 as ConnectInfo.
+    LAW_RESPOND = <<~'RS'
+      #[derive(Clone, Debug)]
+      #[allow(dead_code)] // a law reads the fields it needs
+      struct AxumDslLawResponse {
+          status: i64,
+          body: String,
+          location: String,
+          content_type: String,
+          headers: String,
+      }
+
+      fn law_runtime() -> &'static tokio::runtime::Runtime {
+          static RT: std::sync::OnceLock<tokio::runtime::Runtime> = std::sync::OnceLock::new();
+          RT.get_or_init(|| tokio::runtime::Builder::new_multi_thread().enable_all().build().expect("the laws' runtime"))
+      }
+
+      /// The service's startup, once per test binary, before a law sends a request or signs a cookie.
+      fn axum_dsl_law_started() {
+          static STARTED: std::sync::OnceLock<()> = std::sync::OnceLock::new();
+          STARTED.get_or_init(|| law_runtime().block_on(axum_dsl_start()));
+      }
+
+      #[allow(dead_code)] // a law that only runs queries never sends a request
+      fn axum_dsl_law_respond(method: &str, path: &str, body: String, headers: Vec<(String, String)>) -> Result<AxumDslLawResponse, String> {
+          axum_dsl_law_started();
+          law_runtime().block_on(async move {
+              let mut req = axum::http::Request::builder().method(method).uri(path);
+              let typed = headers.iter().any(|(k, _)| k.eq_ignore_ascii_case("content-type"));
+              for (k, v) in &headers {
+                  req = req.header(k.as_str(), v.as_str());
+              }
+              if !body.is_empty() && !typed {
+                  req = req.header("content-type", "application/x-www-form-urlencoded");
+              }
+              let mut req = req.body(axum::body::Body::from(body)).map_err(|e| format!("respond {method} {path}: {e}"))?;
+              req.extensions_mut().insert(axum::extract::ConnectInfo(std::net::SocketAddr::from(([127, 0, 0, 1], 40000))));
+              let res = tower::ServiceExt::oneshot(axum_dsl_app(), req).await.map_err(|e| format!("respond {method} {path}: {e}"))?;
+              let header = |name: &str| res.headers().get(name).and_then(|v| v.to_str().ok()).unwrap_or("").to_string();
+              let (location, content_type) = (header("location"), header("content-type"));
+              let mut lines = String::new();
+              for (k, v) in res.headers() {
+                  lines.push_str(&format!("{}: {}\n", k.as_str(), v.to_str().unwrap_or("")));
+              }
+              let status = i64::from(res.status().as_u16());
+              let bytes = axum::body::to_bytes(res.into_body(), usize::MAX).await.map_err(|e| format!("respond {method} {path}: {e}"))?;
+              Ok(AxumDslLawResponse { status, body: String::from_utf8_lossy(&bytes).into_owned(), location, content_type, headers: lines })
+          })
+      }
+
+    RS
+
+    # The laws (lib/laws): one seeded proptest test per `law`, under #[cfg(test)], run with `cargo test`.
+    LAWS_SEED_ENV = "AXUM_DSL_SEED"
+
+    def laws_mod(ir, src)
+      return [] if ir["laws"].to_a.empty?
+
+      o = ["", "// ---- laws: `cargo test` checks them ----", "#[cfg(test)]", "mod laws {",
+           "    #![allow(unused_imports)] // example laws alone use none of proptest's prelude",
+           "    use super::*;", *Laws::Proptest.prelude(seed_env: LAWS_SEED_ENV)]
+      o.concat(LAW_RESPOND.lines.map { |l| l.chomp.empty? ? "" : "    #{l.chomp}" }) if ir["route_laws"]
+      ir["laws"].each do |l|
+        o.concat(Laws::Proptest.law(l, at: "#{File.basename(l['file'] || src)}:#{l['line']}"))
+      end
+      o << "}"
+    end
+
     def regex_test(regexes)
       return [] if regexes.empty?
 
@@ -1554,12 +1729,15 @@ module AxumDsl
       CompositeTypes::Opaque.types.reject { |t| t.fields.to_a.empty? }.each { |t| record_check(o, ranges, t) }
       unless ir["checked"].to_a.empty?
         o << "// overflow-checked integer arithmetic (only what this server uses): written by the compiler"
-        o.concat(checked_int_lines(ir["checked"]))
+        o.concat(checked_int_lines(ir["checked"], ir["law_only_runtime"].to_a))
       end
-      { "str_to_i" => ["String#to_i", STR_TO_I], "str_to_int" => ["Integer(text, 10)", STR_TO_INT] }.each do |key, (what, rust)|
+      { "str_to_i" => ["String#to_i", STR_TO_I], "str_to_int" => ["Integer(text, 10)", STR_TO_INT],
+        "time_number" => ["Time#to_fs(:number)", TIME_NUMBER], "time_iso8601" => ["Time#iso8601", TIME_ISO8601],
+        "time_ms" => ["a :time in milliseconds", TIME_MS] }.each do |key, (what, rust)|
         next unless ir["helpers"].to_a.include?(key)
 
         o << "// #{what} (Ruby rules, i64 result): written by the compiler"
+        o << LAW_ONLY if ir["law_only_runtime"].to_a.include?(key)
         o.concat(rust.lines.map(&:chomp))
         o << ""
       end
@@ -1577,23 +1755,34 @@ module AxumDsl
       end
       o.concat(Sanitize.items(ir))
       ir["user_helpers"].to_a.each do |h|
-        mapped(o, ranges, h, "helper `#{h['name']}`") { o.concat(helper_fn(h)) }
+        mapped(o, ranges, h, "helper `#{h['name']}`") do
+          # Called only by laws: the release build compiles it but nothing calls it there.
+          o << LAW_ONLY if ir["law_only_helpers"].to_a.include?(h["name"])
+          o.concat(helper_fn(h))
+        end
         o << ""
       end
       o.concat([*settings_runtime(ir), ""]) if settings?(ir)
       database_items(o, ranges, ir) if ir["database"]
       o.concat([*Cookies.runtime_lines(ir), ""]) if ir["cookies"]
+      o.concat([*Cookies.flash_lines(ir["flash"]), ""]) if ir["flash_used"]
       o.concat([*SignedId.items(ir), ""]) if SignedId.used?(ir)
       o.concat([*Crc32.items(ir), ""]) if Crc32.used?(ir)
       o.concat([*Url.items(ir), ""]) if Url.used?(ir)
       o.concat([*Qr.items(ir), ""]) if Qr.used?(ir)
+      o.concat(Opengraph.items(ir))
+      o.concat(ImageVariant.items(ir))
+      o.concat(WebPush.items(ir))
+      o.concat(Webhook.items(ir))
       o.concat(Sessions.items(ir))
+      o.concat(Locales.items(ir))
       o.concat(Csrf.items(ir))
       o.concat(ResponseCache.items(ir))
       o.concat([*private_cache_runtime(ir), ""]) if layer?(ir, "private_cache")
       o.concat([*RackDefaults.runtime(ir), ""]) if RackDefaults.used?(ir)
       o.concat(Multipart.items(ir))
       o.concat([*MethodOverride.runtime, ""]) if MethodOverride.used?(ir)
+      o.concat([*FormatExtension.runtime(ir), ""]) if FormatExtension.used?(ir)
       o.concat(Front.items(ir)) if Front.used?(ir)
       o.concat(Front.static_items(ir))
       o.concat(Front.serve_file_items(ir))
@@ -1651,6 +1840,7 @@ module AxumDsl
       o << ""
       o.concat(main_fn(ir, plan))
       o.concat(regex_test(regexes))
+      o.concat(laws_mod(ir, src))
       ["#{o.join("\n")}\n", source_map(o, ranges, src)]
     end
 
@@ -1740,15 +1930,16 @@ module AxumDsl
       lines.concat(header_inserts(headers, "__stated").map { |l| "    #{l}" })
       # A computed header: a value no header may carry (a control character) is left off rather than failing the request.
       computed.each_with_index do |(name, _), i|
-        lines << "    if let Ok(__header_value) = ::axum::http::HeaderValue::from_str(&__header_#{i}) {"
+        lines << "    if let Some(Ok(__header_value)) = __header_#{i}.as_deref().map(::axum::http::HeaderValue::from_str) {"
         lines << "        __stated.headers_mut().insert(::axum::http::HeaderName::from_static(#{AxumDsl.rstr(name.to_s.downcase)}), __header_value);"
         lines << "    }"
       end
       # A route body's `etag(value)`: the ETag rides on the final response, and a request whose
       # If-None-Match lists the value is answered 304 with no body. `__etag` was computed above, before the
-      # response was built; only the comparison and the header happen here.
+      # response was built; only the comparison and the header happen here. An empty value writes no ETag, as
+      # Rails' `stale?(etag: nil)` does, so a body can leave it off with `etag(x.nil? ? "" : ...)`.
       if b["etag"]
-        lines << "    if let Ok(__etag_value) = ::axum::http::HeaderValue::from_str(&__etag) {"
+        lines << "    if let (false, Ok(__etag_value)) = (__etag.is_empty(), ::axum::http::HeaderValue::from_str(&__etag)) {"
         lines << "        let __not_modified = __headers"
         lines << "            .get(::axum::http::header::IF_NONE_MATCH)"
         lines << "            .and_then(|value| value.to_str().ok())"
@@ -1820,6 +2011,7 @@ module AxumDsl
       # What the body read of the request (body.rb: need): the peer address becomes the Option the body's code reads,
       # and a body that sets cookies keeps their Set-Cookie lines until the response is built (response_expr).
       lines << "    let __peer = Some(__connect);" if body["request"].to_a.include?("peer")
+      lines << "    let __locale = axum_dsl_locale(__raw_query.as_deref());" if body["request"].to_a.include?("locale")
       lines << "    let mut __cookies: Vec<String> = Vec::new();" if body["cookies"]
       # A cached route answers a hit here, after the filters, before anything of its body runs (ResponseCache).
       lines.concat(ResponseCache.lookup_lines(entry["route"]["path"])) if cached
@@ -1873,6 +2065,7 @@ module AxumDsl
       out << "::axum::extract::ConnectInfo(__connect): ::axum::extract::ConnectInfo<::std::net::SocketAddr>" if want.include?("peer")
       out << "::axum::Extension(__currents): ::axum::Extension<::std::sync::Arc<AxumDslCurrents>>" if want.include?("currents")
       out << "::axum::Extension(__csrf): ::axum::Extension<AxumDslCsrfToken>" if want.include?("csrf")
+      out << "::axum::extract::RawQuery(__raw_query): ::axum::extract::RawQuery" if want.include?("locale")
       out
     end
 
@@ -1883,6 +2076,8 @@ module AxumDsl
       when "form"
         if Multipart.upload_form?(p["fields"]) # a multipart body too, with the file fields (multipart.rb)
           "AxumDslForm(#{p['binding']}): AxumDslForm<#{p['struct']}>"
+        elsif p["merge_query"] # set :merge_query_params: the query's keys under the body's (multipart.rb)
+          "AxumDslMergedForm(#{p['binding']}): AxumDslMergedForm<#{p['struct']}>"
         else
           "axum::extract::Form(#{p['binding']}): axum::extract::Form<#{p['struct']}>"
         end
@@ -1906,6 +2101,13 @@ module AxumDsl
         lines << ""
       end
       lines << "async fn #{name}(request: ::axum::extract::Request, next: ::axum::middleware::Next) -> ::axum::response::Response {"
+      # `not_found skip: [:name]`: a request no route matched (the router put no MatchedPath on it) goes on to the
+      # fallback without this filter.
+      if b["name"] && ir["not_found"]&.[]("skip").to_a.include?(b["name"])
+        lines << "    if request.extensions().get::<::axum::extract::MatchedPath>().is_none() {"
+        lines << "        return next.run(request).await;"
+        lines << "    }"
+      end
       unless skips.empty?
         lines << "    if #{name}_skip(request.method(), request.uri().path()) {"
         lines << "        return next.run(request).await;"
@@ -1916,10 +2118,12 @@ module AxumDsl
       want = b["request"].to_a
       lines << "    let __headers = request.headers().clone();" if want.include?("headers")
       lines << "    let __path = request.uri().path().to_string();" if want.include?("path")
+      lines << "    let __query = request.uri().query().unwrap_or(\"\").to_string();" if want.include?("query")
       lines << "    let __method = request.method().clone();" if want.include?("method")
       lines << "    let __peer = request.extensions().get::<::axum::extract::ConnectInfo<::std::net::SocketAddr>>().map(|__c| __c.0);" if want.include?("peer")
       lines << "    let __currents = request.extensions().get::<::std::sync::Arc<AxumDslCurrents>>().cloned().unwrap_or_default();" if want.include?("currents")
       lines << "    let __csrf = request.extensions().get::<AxumDslCsrfToken>().cloned().unwrap_or_default();" if want.include?("csrf")
+      lines << "    let __locale = axum_dsl_locale(request.uri().query());" if want.include?("locale")
       if b["type"] == "response"
         # The body answers the request itself; a content type below still has to change the response.
         lines.concat(assign_response(b, "response", mutable: !b["content_type"].nil?).map { |l| "    #{l}" })
@@ -2052,6 +2256,10 @@ module AxumDsl
                                "    }"] : []
       start.concat(Cookies.start_lines(ir)) # a key that is too short stops the server, like a setting that cannot load
       start.unshift(*subscriber_lines(ir)) if logging?(ir)
+      # `--schema-check` runs the database startup on a fresh database and exits, before the settings are read
+      start.unshift(*Db.backend(ir["database"]["adapter"]).schema_check_lines) if ir["database"]
+      # `--console DB_PATH` is the read-only line protocol of `axum_dsl console` (console_rust.rb), also before the settings
+      start.unshift(*Console.main_lines) if ir["database"]
       # a `file` that is missing, or whose entries no longer match the build, stops the server before it serves
       unless ir["files"].to_a.empty?
         start += ["    if let Err(message) = check_files() {",
@@ -2064,6 +2272,10 @@ module AxumDsl
       chain = ["axum::Router::new()"]
       plan["routes"].each_with_index do |entry, i|
         chain << ".route(#{AxumDsl.rstr(entry['route']['path'])}, #{routing_fn(entry['route']['method'])}(route_#{i + 1}))"
+        # `also: [:put]`: the same handler answers the other update verb (Rails' resources route both).
+        entry["route"]["also"].to_a.each do |m|
+          chain << ".route(#{AxumDsl.rstr(entry['route']['path'])}, #{routing_fn(m)}(route_#{i + 1}))"
+        end
       end
       # One route per `serve_file`, and one service for each `static` mount: ServeDir nested at the mount
       # prefix, or the fallback when the prefix is "/" (axum refuses to nest at "/").
@@ -2097,7 +2309,10 @@ module AxumDsl
       chain[-1] = "#{chain[-1]};"
       # :method_override is not in LAYER_ORDER: it wraps the finished router (MethodOverride), so its method
       # change comes before routing, which Router::layer cannot do.
-      wrap = MethodOverride.used?(ir) ? MethodOverride.wrap_lines : []
+      # :format_extension wraps it the same way (FormatExtension), so the path is rewritten before routing too.
+      wrap = (FormatExtension.used?(ir) ? FormatExtension.wrap_lines : []) + (MethodOverride.used?(ir) ? MethodOverride.wrap_lines : [])
+      return split_main(ir, start, chain, wrap) if ir["route_laws"]
+
       [
         "#[tokio::main]",
         "async fn main() -> anyhow::Result<()> {",
@@ -2105,6 +2320,14 @@ module AxumDsl
         *start,
         "    let router = #{chain.join("\n        ")}",
         *wrap,
+        *main_tail(ir)
+      ]
+    end
+
+    # main after its router: the port and bind address (the environment wins over `set`), the listener, and serve
+    # with the graceful shutdown.
+    def main_tail(ir)
+      [
         # the environment wins over `set :port`/`set :bind`; a PORT that is not a port is refused like a
         # setting that cannot load, before anything listens
         "    let port = match std::env::var(\"PORT\") {",

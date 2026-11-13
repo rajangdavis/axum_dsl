@@ -154,6 +154,32 @@ While the rust code is not terrible, I have a strong preference for the ruby cod
 My hypothesis with this library is that having a middle layer between prompt and rust code output
 can be beneficial.
 
+## Dependencies
+
+Each axum_dsl version ships one vetted dependency set, `lib/axum_dsl/vetted/Cargo.lock`: a single resolve of every
+crate and feature the examples and the vet-only fixtures in `test/vet/` exercise, so it covers whatever the emitter declares (axum,
+tokio, serde_json, tower-http, tracing, SQLite, cookies, uploads, sanitising, laws, and so on). `build`, `run`,
+`test` and `dev` copy it into the crate and let `cargo metadata` drop what this crate does not use, which keeps every
+locked version; a package the vetted set lacks fails the build, naming it. cargo then runs with `--locked`, so it
+builds exactly the versions this axum_dsl was tested and audited with. A `.axum.rb` that adds a `rust_crate` (or loads
+a binding whose `crate` line does) leaves the vetted set: that crate is not pinned, cargo runs without `--locked`, and
+the command says so. `bin/vet_lock` fails when a module that writes Cargo lines is exercised by no example or fixture, so
+a new one needs a fixture in `test/vet/` before the lock can be re-made.
+
+`build --release`, `run --release` and `dev --release` go through [cargo auditable](https://github.com/rust-secure-code/cargo-auditable)
+(`cargo install cargo-auditable --locked`): the binary carries its dependency list, so `cargo audit bin BINARY`
+checks a deployed service against new advisories without its source.
+
+```sh
+make vet-lock     # re-resolve the vetted lock from the examples, then audit it; run make check before committing it
+make audit        # RustSec advisories against the vetted set (needs cargo-audit)
+make deny         # licenses, bans and sources against the vetted set (needs cargo-deny)
+```
+
+`make deny` checks the vetted set against `deny.toml`: permissive licenses only (copyleft, source-available and unknown licenses
+are rejected until a human adds a `[[licenses.exceptions]]` entry), and crates.io as the only source. The `supply-chain` job in
+`.github/workflows/ci.yml` runs `make audit` and `make deny` on every push and pull request.
+
 ## Install
 
 As a gem: `gem build axum_dsl.gemspec`, then `gem install axum_dsl-0.1.0.gem`, then `axum_dsl --help`.
@@ -166,6 +192,8 @@ writes an agent skill folder (`axum-dsl/`) into the current directory, for any a
 - [The command line](docs/cli.md) — the `axum_dsl` subcommands and their flags.
 - [The DSL](docs/dsl.md) — declaring a service, its params groups, routes and filters.
 - [The body language](docs/body-language.md) — what a route body may contain, and helpers.
+- [Controllers](docs/controllers.md) — `controller` blocks: routes with their own `before` filters and `def` methods.
+- [Laws](docs/laws.md) — properties over params groups, compiled to proptest tests that `axum_dsl test` runs.
 - [Views](docs/views.md) — `render`, layouts, partials, `{% for %}` loops and fingerprinted asset paths: `.html` pages compiled into the crate.
 - [Database](docs/database.md) — SQLite state, SQL first: `database`, `record`, `query`/`execute` and migrations.
 - [Sessions](docs/sessions.md) — signed cookies, `current`, `Bcrypt`, `random_token`, `use_layer :fetch_metadata`, `use_layer :csrf` and `set :rust, :none`, all compiler-owned.

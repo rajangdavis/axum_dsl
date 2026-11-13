@@ -1,0 +1,82 @@
+#!/usr/bin/env ruby
+# frozen_string_literal: true
+
+# Resolves every crate and feature the examples exercise into lib/axum_dsl/vetted/Cargo.lock: the dependency set this
+# axum_dsl version ships. Each generated crate is pinned to it (Lockfile.pin) and builds with --locked.
+#   ruby bin/vet_lock      (make vet-lock also runs cargo audit on the result)
+#   ruby bin/vet_lock --deny   (make deny) runs cargo deny on that same workspace with the EXISTING vetted lock copied in;
+#                              the vetted lock is not rewritten
+# The emitted Cargo.toml switches crates and features per DSL feature, so no hand-written template covers them.
+# Instead every example is emitted into one temporary cargo workspace and `cargo generate-lockfile` resolves the
+# lot once; cargo's feature unification then covers whatever any example uses. An example with a `rust_crate` (or a
+# binding's `crate`) is left out: its crate is the author's, so it is built unpinned and is not part of the set.
+# test/vet/*.axum.rb are vet-only fixtures (emitted, never built or run) for the modules no example exercises; vet_lock
+# fails when a module that writes Cargo lines is still uncovered, so a crate that uses it is never refused later.
+# A new resolve is vetted when make check passes against it: goldens, laws, e2e, audit.
+$LOAD_PATH.unshift File.expand_path("../lib", __dir__)
+require "axum_dsl"
+require "fileutils"
+require "tmpdir"
+
+deny = ARGV.delete("--deny")
+root = File.expand_path("..", __dir__)
+members = {}
+skipped = []
+irs = []
+Dir.mktmpdir do |dir|
+  Dir.glob(File.join(root, "{examples,test/vet}/*.axum.rb")).sort.each do |file|
+    ir = AxumDsl.read(file)
+    unless ir["crates"].to_a.empty?
+      skipped << "#{File.basename(file)} (#{ir['crates'].map { |c| c['name'] }.join(', ')})"
+      next
+    end
+    abort "bin/vet_lock: #{file} and #{members[ir['name']]} both emit a package named #{ir['name'].inspect}" if members.key?(ir["name"])
+
+    members[ir["name"]] = file
+    irs << ir
+    AxumDsl::Emit.files(ir, file).each do |rel, text|
+      path = File.join(dir, ir["name"], rel)
+      FileUtils.mkdir_p(File.dirname(path))
+      File.binwrite(path, text)
+    end
+  end
+  abort "bin/vet_lock: no example to resolve" if members.empty?
+
+  # Every module that writes Cargo lines (a module-level `deps(ir)`) must write some for at least one member, and so
+  # must each of the other switches below: a crate that uses a feature nothing here exercises would be refused at
+  # build time. This fails, not warns, so a new module cannot ship without a fixture in test/vet/.
+  mods = AxumDsl.constants.map { |c| AxumDsl.const_get(c) }.select do |m|
+    m.is_a?(Module) && !m.is_a?(Class) && m.respond_to?(:deps) && m.method(:deps).arity == 1
+  end
+  uncovered = mods.reject { |m| irs.any? { |ir| !m.deps(ir).to_s.empty? } }.map { |m| m.name.delete_prefix("AxumDsl::") }
+  {
+    "database" => ->(ir) { ir["database"] },
+    "set :log, :json" => ->(ir) { ir["log"] == "json" },
+    "plain_text (Sanitize)" => ->(ir) { AxumDsl::Sanitize.plain_text?(ir) },
+    "laws (proptest)" => ->(ir) { ir["laws"].to_a.any? },
+    "route laws (tower)" => ->(ir) { ir["route_laws"] }
+  }.each { |name, used| uncovered << name unless irs.any?(&used) }
+  abort "bin/vet_lock: no example or test/vet fixture exercises: #{uncovered.join(', ')}; add one" unless uncovered.empty?
+
+  File.write(File.join(dir, "Cargo.toml"), <<~TOML)
+    [workspace]
+    resolver = "2"
+    members = [#{members.keys.map(&:inspect).join(', ')}]
+  TOML
+  if deny
+    FileUtils.cp(AxumDsl::Emit::VETTED_LOCK, File.join(dir, "Cargo.lock"))
+    ok = system("cargo", "deny", "--manifest-path", File.join(dir, "Cargo.toml"), "--locked", "check", "--config", File.join(root, "deny.toml"))
+    warn "bin/vet_lock --deny: if cargo said the lock needs updating, the vetted lock is stale: run make vet-lock" unless ok
+    # cargo-deny has no warning level for a license, so MPL-2.0 is allowed in deny.toml and named here instead: the
+    # owner wants to know when the set picks one up, not to be stopped by it.
+    listed = IO.popen(["cargo", "deny", "--manifest-path", File.join(dir, "Cargo.toml"), "--locked", "list"], err: File::NULL, &:read).to_s
+    mpl = listed.lines.grep(/MPL-2\.0/)
+    warn "bin/vet_lock --deny: warning: MPL-2.0 crates in the vetted set (allowed, but avoid adding more):\n#{mpl.join}" unless mpl.empty?
+    exit(ok ? 0 : 1)
+  end
+  system("cargo", "generate-lockfile", chdir: dir) or abort "bin/vet_lock: cargo generate-lockfile failed"
+  FileUtils.mkdir_p(File.dirname(AxumDsl::Emit::VETTED_LOCK))
+  FileUtils.cp(File.join(dir, "Cargo.lock"), AxumDsl::Emit::VETTED_LOCK)
+end
+puts "wrote #{AxumDsl::Emit::VETTED_LOCK} from #{members.size} examples and fixtures"
+puts "left out (own rust_crate, built unpinned): #{skipped.join('; ')}" unless skipped.empty?

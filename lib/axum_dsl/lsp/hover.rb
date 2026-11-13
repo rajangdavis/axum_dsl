@@ -22,10 +22,43 @@ module AxumDsl
 
         calls = []
         each_node(program) { |node| calls << node if node.is_a?(Prism::CallNode) && contains?(node.location, offset) }
-        return nil if calls.empty?
-
         named = calls.select { |call| contains?(call.message_loc, offset) }
-        declaration(lines, named.last) || argument(analysis, lines, program, calls.last, offset)
+        # A statement call and a typed position in a body come first: inside a body `params` is a read of the
+        # route's params, not the `params` declaration.
+        found = statement(analysis, lines, named.last) || typed(analysis, line0 + 1, byte_col) ||
+                (calls.empty? ? nil : declaration(lines, named.last) || argument(analysis, lines, program, calls.last, offset))
+        with_derivation(analysis, found, line0 + 1, byte_col)
+      end
+
+      # How the types derive (TypeGraph), appended to whatever the position already says: for a derived node there, what it takes
+      # its type from, e.g. a record field from the column a relation selects.
+      def with_derivation(analysis, found, line, byte_col)
+        text = analysis.graph&.hover_markdown(analysis.real, line, byte_col)
+        return found if text.nil?
+        return { contents: { kind: "markdown", value: text } } if found.nil?
+
+        found.merge(contents: found[:contents].merge(value: "#{found[:contents][:value]}\n\n#{text}"))
+      end
+
+      # The cursor is on the name of a call to a declared `query` or `execute`: its signature and its SQL.
+      def statement(analysis, lines, call)
+        return nil if call.nil? || call.receiver
+
+        query = AxumSource.statements(analysis.ir)[call.name.to_s]
+        query && item(lines, call.message_loc, AxumSource.statement_markdown(query))
+      end
+
+      # What the compiler typed that is not a declaration (those are described from SIG): a parameter, a local
+      # or an expression of a body. The entries of the compile are the ones `check --types` prints.
+      DECLARATION_KINDS = %w[declaration field helper].freeze
+
+      def typed(analysis, line, byte_col)
+        entries = analysis.entries.reject { |e| DECLARATION_KINDS.include?(e[:kind]) }
+        entry = Spans.smallest(entries, line, byte_col) { |e| e[:kind] == "expression" ? 1 : 0 } # a named kind over a bare expression
+        return nil if entry.nil?
+
+        head = entry[:name] ? "**`#{entry[:name]}`** - #{entry[:kind]}" : "**#{entry[:kind]}**"
+        { contents: { kind: "markdown", value: "#{head}\n\n`#{entry[:type]}`" }, range: Spans.range(analysis.lines, entry) }
       end
 
       # The cursor is on the call's own name: describe the declaration.
@@ -43,7 +76,7 @@ module AxumDsl
 
       # The cursor is on an argument or a keyword of `call`: describe what SIG accepts there.
       def argument(analysis, lines, program, call, offset)
-        sig = SIG[call.name]
+        sig = AxumDsl.sig_variants(call.name).first # the cursor knows no context: the first signature describes the arguments
         return nil if sig.nil?
 
         args = call.arguments&.arguments || []

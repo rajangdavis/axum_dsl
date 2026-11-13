@@ -59,9 +59,9 @@ module AxumDsl
   # The notes accumulate in the module across compiles; a long-lived process (the language server) compiles
   # many times, so every compile starts from an empty set. `check` and `build` read once and report, so this
   # is invisible to them.
-  def self.read(path, types: nil)
+  def self.read(path, types: nil, graph: nil)
     Notify.reset!
-    Reader.new(path, types: types).read
+    Reader.new(path, types: types, graph: graph).read
   end
 
   # A short content digest, for a notice that names which bytes of an input a build read: a driver can
@@ -70,14 +70,23 @@ module AxumDsl
 end
 
 require_relative "axum_dsl/suggest"
+begin
+  require "laws"
+rescue LoadError
+  # r2r-laws is not installed: use the sibling checkout, as the Gemfile's path entry does.
+  $LOAD_PATH.unshift(File.expand_path("../../r2r-laws/lib", __dir__))
+  require "laws"
+end
 require_relative "axum_dsl/schema"
 require_relative "axum_dsl/notify"
 require_relative "axum_dsl/regex_translate"
 require_relative "axum_dsl/bindings"
 require_relative "axum_dsl/composite_types"
 require_relative "axum_dsl/type_names"
+require_relative "axum_dsl/type_graph"
 require_relative "axum_dsl/json_literal"
 require_relative "axum_dsl/views"
+require_relative "axum_dsl/locales"
 require_relative "axum_dsl/db"
 require_relative "axum_dsl/cookies"
 require_relative "axum_dsl/signed_id"
@@ -86,10 +95,15 @@ require_relative "axum_dsl/crc32"
 require_relative "axum_dsl/url"
 require_relative "axum_dsl/multipart"
 require_relative "axum_dsl/qr_code"
+require_relative "axum_dsl/opengraph"
+require_relative "axum_dsl/image_variant"
+require_relative "axum_dsl/web_push"
+require_relative "axum_dsl/webhook"
 require_relative "axum_dsl/sessions"
 require_relative "axum_dsl/csrf"
 require_relative "axum_dsl/rack_defaults"
 require_relative "axum_dsl/method_override"
+require_relative "axum_dsl/format_extension"
 require_relative "axum_dsl/propshaft"
 require_relative "axum_dsl/front"
 require_relative "axum_dsl/cable"
@@ -97,10 +111,15 @@ require_relative "axum_dsl/response_cache"
 require_relative "axum_dsl/sanitize"
 require_relative "axum_dsl/body"
 require_relative "axum_dsl/cargo_build"
+require_relative "axum_dsl/console_rust"
+require_relative "axum_dsl/console"
+require_relative "axum_dsl/lockfile"
 require_relative "axum_dsl/manifest"
 require_relative "axum_dsl/rbi"
+require_relative "axum_dsl/relation_queries"
 require_relative "axum_dsl/reader"
 require_relative "axum_dsl/emit"
+require_relative "axum_dsl/emit_diff"
 
 # The doc sentences and the generated skill read the compiler's tables (SIG, TYPES, Body::ALLOWED_METHODS,
 # Notify::CODES and the shim catalog), so a reference page cannot drift from the compiler.

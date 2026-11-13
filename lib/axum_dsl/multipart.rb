@@ -43,14 +43,23 @@ module AxumDsl
 
     def stores?(ir) = ir["builtins"].to_a.include?(STORE)
 
+    REQUEST_UPLOAD = "request_upload"
+
+    # Some route body reads a file part beside its raw body: `request_upload(:name)`.
+    def request_upload?(ir) = ir["builtins"].to_a.include?(REQUEST_UPLOAD)
+
+    # The upload value and its checksum are written (an upload form, request_upload or image_variant); and the form
+    # runtime with set :merge_query_params, whose merged form reads the same pairs.
+    def uploads_used?(ir) = forms?(ir) || request_upload?(ir) || ImageVariant.used?(ir) || ir["merge_query_params"] == true
+
     # The parser is needed by an upload form and by the method override layer.
-    def used?(ir) = forms?(ir) || ir["layers"].to_a.any? { |l| l["name"] == "method_override" }
+    def used?(ir) = uploads_used?(ir) || ir["layers"].to_a.any? { |l| l["name"] == "method_override" }
 
     # Cargo.toml lines, each led by a newline (the emitter deduplicates them): the MD5 checksum and its base64 for
     # an upload's `checksum`, and rand for a stored key.
     def deps(ir)
       lines = []
-      lines.push("md-5 = \"0.10\"", "base64 = \"0.22\"") if forms?(ir)
+      lines.push("md-5 = \"0.10\"", "base64 = \"0.22\"") if uploads_used?(ir)
       lines.push("rand = \"0.9\"") if stores?(ir)
       lines.map { |line| "\n#{line}" }.join
     end
@@ -129,10 +138,17 @@ module AxumDsl
 
       out = ["// multipart/form-data (see lib/axum_dsl/multipart.rb): the parser, an upload form's extractor and a stored upload: written by the compiler"]
       out.concat(parser.lines.map(&:chomp))
-      out << "const AXUM_DSL_MULTIPART_LIMIT: usize = #{LIMIT};"
+      out << "#[allow(dead_code)]"
+    out << "const AXUM_DSL_MULTIPART_LIMIT: usize = #{LIMIT};"
       out << ""
-      if forms?(ir)
+      if uploads_used?(ir)
         out.concat(uploads.lines.map(&:chomp))
+        out.concat(merged_form(ir["merge_query_params"] == true))
+        out.concat(marcel_tables)
+        out << ""
+      end
+      if request_upload?(ir)
+        out.concat(request_upload.lines.map(&:chomp))
         out << ""
       end
       if stores?(ir)
@@ -331,6 +347,136 @@ module AxumDsl
     end
 
 
+    # request_upload(:name): Rack's params[name] for a multipart body, when it is a file: the last file part of that
+    # name (Rack's last value wins), nil for a body that is not multipart or does not parse, or a part with no file.
+    def request_upload
+      <<~'RS'
+        #[allow(dead_code)]
+        fn axum_dsl_request_upload(headers: &::axum::http::HeaderMap, body: &[u8], name: &str) -> Option<AxumDslUpload> {
+            let content_type = headers.get(::axum::http::header::CONTENT_TYPE)?.to_str().ok()?;
+            if !axum_dsl_is_multipart(content_type) || body.len() > AXUM_DSL_MULTIPART_LIMIT {
+                return None;
+            }
+            let boundary = axum_dsl_multipart_boundary(content_type)?;
+            let parts = axum_dsl_multipart_parse(body, &boundary).ok()?;
+            let mut found = None;
+            for part in parts {
+                if part.name != name {
+                    continue;
+                }
+                let data = &body[part.data.clone()];
+                found = match part.filename {
+                    Some(filename) if !filename.is_empty() => Some(AxumDslUpload {
+                        content_type: axum_dsl_identify_content_type(data, &filename, part.content_type.as_deref()),
+                        filename,
+                        size: data.len() as i64,
+                        checksum: axum_dsl_upload_checksum(data),
+                        metadata: axum_dsl_upload_metadata(data),
+                        bytes: data.to_vec(),
+                    }),
+                    _ => None,
+                };
+            }
+            found
+        }
+      RS
+    end
+
+    MARCEL = File.join(__dir__, "data", "marcel-1.1.0.json")
+
+    # set :merge_query_params (Rails' `params`: query_parameters.merge(request_parameters)): the switch the upload form
+    # reads, the query's pairs, and AxumDslMergedForm, a plain form group's extractor: the query string's pairs whose
+    # name the urlencoded body does not carry, then the body's, deserialized by axum's Form as one body.
+    def merged_form(on)
+      <<~RS.lines.map(&:chomp)
+        #[allow(dead_code)]
+        const AXUM_DSL_MERGE_QUERY_PARAMS: bool = #{on};
+
+        #[allow(dead_code)]
+        fn axum_dsl_query_pairs(query: &str) -> Vec<(String, String)> {
+            query
+                .split('&')
+                .filter(|piece| !piece.is_empty())
+                .map(|piece| match piece.split_once('=') {
+                    Some((name, value)) => (axum_dsl_urldecode(name.as_bytes()), axum_dsl_urldecode(value.as_bytes())),
+                    None => (axum_dsl_urldecode(piece.as_bytes()), String::new()),
+                })
+                .collect()
+        }
+
+        #[allow(dead_code)]
+        struct AxumDslMergedForm<T>(T);
+
+        impl<S, T> ::axum::extract::FromRequest<S> for AxumDslMergedForm<T>
+        where
+            S: Send + Sync,
+            T: ::serde::de::DeserializeOwned,
+        {
+            type Rejection = ::axum::response::Response;
+
+            async fn from_request(req: ::axum::extract::Request, state: &S) -> Result<Self, Self::Rejection> {
+                let (mut parts, body) = req.into_parts();
+                let content_type = parts.headers.get(::axum::http::header::CONTENT_TYPE).and_then(|v| v.to_str().ok()).unwrap_or("").to_string();
+                let urlencoded = content_type.split(';').next().unwrap_or("").trim().eq_ignore_ascii_case("application/x-www-form-urlencoded");
+                let bytes = match ::axum::body::to_bytes(body, 2 * 1024 * 1024).await {
+                    Ok(bytes) => bytes,
+                    Err(_) => {
+                        let mut response = ::axum::response::IntoResponse::into_response("payload too large");
+                        *response.status_mut() = ::axum::http::StatusCode::PAYLOAD_TOO_LARGE;
+                        return Err(response);
+                    }
+                };
+                // A body that is no form (and is not empty) is axum Form's own answer, as without the merge.
+                if !urlencoded && !bytes.is_empty() {
+                    let req = ::axum::extract::Request::from_parts(parts, ::axum::body::Body::from(bytes));
+                    return match <::axum::extract::Form<T> as ::axum::extract::FromRequest<S>>::from_request(req, state).await {
+                        Ok(::axum::extract::Form(value)) => Ok(AxumDslMergedForm(value)),
+                        Err(rejection) => Err(::axum::response::IntoResponse::into_response(rejection)),
+                    };
+                }
+                let body_text = String::from_utf8_lossy(&bytes).into_owned();
+                let body_names: Vec<String> = axum_dsl_query_pairs(&body_text).into_iter().map(|(name, _)| name).collect();
+                let mut pieces: Vec<&str> = parts
+                    .uri
+                    .query()
+                    .unwrap_or("")
+                    .split('&')
+                    .filter(|piece| !piece.is_empty())
+                    .filter(|piece| !body_names.contains(&axum_dsl_urldecode(piece.split('=').next().unwrap_or("").as_bytes())))
+                    .collect();
+                pieces.extend(body_text.split('&').filter(|piece| !piece.is_empty()));
+                let merged = pieces.join("&");
+                parts.headers.insert(::axum::http::header::CONTENT_TYPE, ::axum::http::HeaderValue::from_static("application/x-www-form-urlencoded"));
+                parts.headers.remove(::axum::http::header::CONTENT_LENGTH);
+                let req = ::axum::extract::Request::from_parts(parts, ::axum::body::Body::from(merged));
+                match <::axum::extract::Form<T> as ::axum::extract::FromRequest<S>>::from_request(req, state).await {
+                    Ok(::axum::extract::Form(value)) => Ok(AxumDslMergedForm(value)),
+                    Err(rejection) => Err(::axum::response::IntoResponse::into_response(rejection)),
+                }
+            }
+        }
+      RS
+    end
+
+    # Marcel 1.1's MAGIC (in its order), EXTENSIONS and TYPE_PARENTS (sorted): its Tika-derived tables (MIT), read from
+    # the gem after its definitions.rb has extended them, for the content type an upload is identified as
+    # (axum_dsl_identify_content_type).
+    def marcel_tables
+      data = JSON.parse(File.read(MARCEL))
+      exts = data["extensions"].sort_by(&:first).map { |e, t| "    (#{AxumDsl.rstr(e)}, #{AxumDsl.rstr(t)})," }
+      parents = data["parents"].sort_by(&:first).map { |t, ps| "    (#{AxumDsl.rstr(t)}, &[#{ps.map { |x| AxumDsl.rstr(x) }.join(', ')}])," }
+      rule = lambda do |r|
+        at, upto, value, children = r
+        bytes = value ? "Some(b\"#{value.unpack1('m0').bytes.map { |b| format('\\x%02x', b) }.join}\")" : "None"
+        kids = children ? "Some(&[#{children.map(&rule).join(', ')}])" : "None"
+        "AxumDslMarcelRule { at: #{at}, upto: #{upto.nil? ? 'None' : "Some(#{upto})"}, value: #{bytes}, children: #{kids} }"
+      end
+      magic = data["magic"].map { |t, rules| "    (#{AxumDsl.rstr(t)}, &[#{rules.map(&rule).join(', ')}])," }
+      ["#[allow(dead_code)]", "static AXUM_DSL_MARCEL_MAGIC: &[(&str, &[AxumDslMarcelRule])] = &[", *magic, "];",
+       "#[allow(dead_code)]", "static AXUM_DSL_MARCEL_EXTENSIONS: &[(&str, &str)] = &[", *exts, "];",
+       "#[allow(dead_code)]", "static AXUM_DSL_MARCEL_PARENTS: &[(&str, &[&str])] = &[", *parents, "];"]
+    end
+
     def uploads
       <<~'RS'
         // A file from a multipart form (an `:upload` field): what Rack's UploadedFile holds, plus the MD5 checksum
@@ -353,15 +499,167 @@ module AxumDsl
             ::base64::Engine::encode(&::base64::engine::general_purpose::STANDARD, ::md5::Md5::digest(data))
         }
 
-        // The blob metadata Active Storage writes once a file is identified and analyzed: ImageAnalyzer's width and height
-        // for an image, in the order Rails' JSON has them. The size is read from the header of a JPEG, PNG, GIF or WebP;
-        // EXIF orientation is not applied (vips swaps the two for a rotated JPEG). Any other file is identified only.
+        // Blob#identify_content_type: `Marcel::MimeType.for(data, name: filename, declared_type: content_type)` (marcel 1.1),
+        // for the types Active Storage processes or previews by magic number: the type the bytes declare wins, else the
+        // declared type (application/octet-stream counts as none), else the filename's extension, else
+        // application/octet-stream. Marcel's `most_specific_type` keeps a later candidate only when it is a subtype of the
+        // magic one, and none of these types has subtypes. A file whose magic is another type keeps its declared type here,
+        // where Marcel's full table may name it (a ZIP declared as application/octet-stream, say).
+        #[allow(dead_code)]
+        fn axum_dsl_identify_content_type(data: &[u8], filename: &str, declared: Option<&str>) -> String {
+            // Marcel::Magic.by_magic over the first 4 KB Active Storage reads (download_identifiable_chunk): the first type
+            // in MAGIC's order with a matching rule.
+            let chunk = &data[..data.len().min(4096)];
+            let magic = AXUM_DSL_MARCEL_MAGIC.iter().find(|(_, rules)| axum_dsl_marcel_match(chunk, rules)).map(|(kind, _)| *kind);
+            // parse_media_type: lower case, up to the first `;`, `,` or white space, and it must hold a `/`; octet-stream is
+            // treated as no declared type.
+            let declared = declared
+                .map(|d| d.to_ascii_lowercase())
+                .and_then(|d| d.split([';', ',', ' ', '\t', '\n', '\r', '\x0b', '\x0c']).next().map(str::to_owned))
+                .filter(|d| d.contains('/') && d != "application/octet-stream");
+            // Marcel::Magic.by_path: File.extname of the name (leading dots are not an extension), looked up lower-cased.
+            let base = filename.rsplit('/').next().unwrap_or(filename);
+            let trimmed = base.trim_start_matches('.');
+            let extension = trimmed.rfind('.').map(|at| trimmed[at + 1..].to_ascii_lowercase()).unwrap_or_default();
+            let by_name = AXUM_DSL_MARCEL_EXTENSIONS
+                .binary_search_by(|(ext, _)| (*ext).cmp(extension.as_str()))
+                .ok()
+                .map(|at| AXUM_DSL_MARCEL_EXTENSIONS[at].1.to_string());
+            // most_specific_type(magic, declared, by name, binary): the first, unless a later one is a subtype of it.
+            let mut candidates: Vec<String> = Vec::new();
+            for candidate in [magic.map(str::to_string), declared, by_name, Some("application/octet-stream".to_string())].into_iter().flatten() {
+                if !candidates.contains(&candidate) {
+                    candidates.push(candidate);
+                }
+            }
+            let mut chosen = candidates[0].clone();
+            for candidate in &candidates[1..] {
+                if axum_dsl_marcel_child(candidate, &chosen) {
+                    chosen = candidate.clone();
+                }
+            }
+            chosen
+        }
+
+        // One rule of Marcel's MAGIC: `value` at `at`, or anywhere in at..=upto (the bytes from `at` through upto plus the
+        // value's length), and then one of `children`, read from the start again (magic_match_io over a StringIO).
+        #[allow(dead_code)]
+        struct AxumDslMarcelRule {
+            at: usize,
+            upto: Option<usize>,
+            value: Option<&'static [u8]>,
+            children: Option<&'static [AxumDslMarcelRule]>,
+        }
+
+        #[allow(dead_code)]
+        fn axum_dsl_marcel_match(data: &[u8], rules: &[AxumDslMarcelRule]) -> bool {
+            rules.iter().any(|rule| {
+                let Some(value) = rule.value else { return false };
+                let found = match rule.upto {
+                    Some(upto) if rule.at < data.len() => {
+                        let window = &data[rule.at..data.len().min(upto + value.len())];
+                        value.is_empty() || window.windows(value.len()).any(|w| w == value)
+                    }
+                    Some(_) => false,
+                    None => data.get(rule.at..rule.at + value.len()) == Some(value),
+                };
+                found && rule.children.is_none_or(|children| axum_dsl_marcel_match(data, children))
+            })
+        }
+
+        // Marcel::Magic.child?: the type itself, or one of its parents (TYPE_PARENTS, transitively) is the other.
+        #[allow(dead_code)]
+        fn axum_dsl_marcel_child(child: &str, parent: &str) -> bool {
+            child == parent
+                || AXUM_DSL_MARCEL_PARENTS
+                    .binary_search_by(|(kind, _)| (*kind).cmp(child))
+                    .ok()
+                    .is_some_and(|at| AXUM_DSL_MARCEL_PARENTS[at].1.iter().any(|p| axum_dsl_marcel_child(p, parent)))
+        }
+
+        // The blob metadata Active Storage writes once a file is identified and analyzed: ImageAnalyzer::Vips's width and
+        // height for an image, in the order Rails' JSON has them. The size is read from the header of a JPEG, PNG, GIF,
+        // WebP or TIFF (or a simple SVG's attributes), and swapped as Rails swaps it: when the EXIF orientation's name matches /Right-top|Left-bottom|Top-right|
+        // Bottom-left/ (orientations 6, 8, 2 and 4: Rails' list, which turns 2 and 4 rather than 5 and 7). Any other file is
+        // identified only.
         #[allow(dead_code)]
         fn axum_dsl_upload_metadata(data: &[u8]) -> String {
             match axum_dsl_image_size(data) {
-                Some((width, height)) => format!(r#"{{"identified":true,"width":{width},"height":{height},"analyzed":true}}"#),
+                Some((width, height)) => {
+                    let (width, height) = if matches!(axum_dsl_exif_orientation(data), Some(2 | 4 | 6 | 8)) { (height, width) } else { (width, height) };
+                    format!(r#"{{"identified":true,"width":{width},"height":{height},"analyzed":true}}"#)
+                }
                 None => r#"{"identified":true,"analyzed":true}"#.to_string(),
             }
+        }
+
+        // The EXIF Orientation (IFD0 tag 0x0112) libvips reads: a JPEG's first APP1 "Exif" segment, a PNG's eXIf chunk or
+        // a WebP's EXIF chunk, each a TIFF structure (a WebP's may carry the "Exif\0\0" header too).
+        #[allow(dead_code)]
+        fn axum_dsl_exif_orientation(d: &[u8]) -> Option<u16> {
+            let tiff: &[u8] = if d.starts_with(&[0xff, 0xd8]) {
+                let mut i = 2;
+                loop {
+                    if d.get(i) != Some(&0xff) {
+                        return None;
+                    }
+                    let marker = *d.get(i + 1)?;
+                    if marker == 0xda || marker == 0xd9 {
+                        return None;
+                    }
+                    let length = u16::from_be_bytes([*d.get(i + 2)?, *d.get(i + 3)?]) as usize;
+                    let segment = d.get(i + 4..i + 2 + length)?;
+                    if marker == 0xe1 && segment.starts_with(b"Exif\0\0") {
+                        break &segment[6..];
+                    }
+                    i += 2 + length;
+                }
+            } else if d.starts_with(b"\x89PNG\r\n\x1a\n") {
+                let mut i = 8;
+                loop {
+                    let length = u32::from_be_bytes(d.get(i..i + 4)?.try_into().ok()?) as usize;
+                    let kind = d.get(i + 4..i + 8)?;
+                    if kind == b"eXIf" {
+                        break d.get(i + 8..i + 8 + length)?;
+                    }
+                    if kind == b"IDAT" || kind == b"IEND" {
+                        return None;
+                    }
+                    i += 12 + length;
+                }
+            } else if d.get(0..4) == Some(b"RIFF") && d.get(8..12) == Some(b"WEBP") {
+                let mut i = 12;
+                loop {
+                    let kind = d.get(i..i + 4)?;
+                    let length = u32::from_le_bytes(d.get(i + 4..i + 8)?.try_into().ok()?) as usize;
+                    if kind == b"EXIF" {
+                        let chunk = d.get(i + 8..i + 8 + length)?;
+                        break chunk.strip_prefix(b"Exif\0\0").unwrap_or(chunk);
+                    }
+                    i += 8 + length + (length & 1);
+                }
+            } else {
+                return None;
+            };
+            let little = match tiff.get(0..2)? {
+                b"II" => true,
+                b"MM" => false,
+                _ => return None,
+            };
+            let u16_at = |i: usize| -> Option<u16> {
+                let b = [*tiff.get(i)?, *tiff.get(i + 1)?];
+                Some(if little { u16::from_le_bytes(b) } else { u16::from_be_bytes(b) })
+            };
+            let u32_at = |i: usize| -> Option<u32> {
+                let b: [u8; 4] = tiff.get(i..i + 4)?.try_into().ok()?;
+                Some(if little { u32::from_le_bytes(b) } else { u32::from_be_bytes(b) })
+            };
+            let ifd = u32_at(4)? as usize;
+            let entries = u16_at(ifd)? as usize;
+            (0..entries).find_map(|n| {
+                let entry = ifd + 2 + n * 12;
+                (u16_at(entry)? == 0x0112 && u16_at(entry + 2)? == 3).then(|| u16_at(entry + 8)).flatten()
+            })
         }
 
         #[allow(dead_code)]
@@ -387,6 +685,72 @@ module AxumDsl
                     b"VP8X" => Some((1 + le24(24)?, 1 + le24(27)?)),
                     _ => None,
                 };
+            }
+            // TIFF: IFD0's ImageWidth (256) and ImageLength (257), SHORT or LONG, the first page vips loads.
+            if d.starts_with(b"II*\0") || d.starts_with(b"MM\0*") {
+                let little = d[0] == b'I';
+                let u16_at = |i: usize| -> Option<u32> {
+                    let b = [*d.get(i)?, *d.get(i + 1)?];
+                    Some((if little { u16::from_le_bytes(b) } else { u16::from_be_bytes(b) }) as u32)
+                };
+                let u32_at = |i: usize| -> Option<u32> {
+                    let b: [u8; 4] = d.get(i..i + 4)?.try_into().ok()?;
+                    Some(if little { u32::from_le_bytes(b) } else { u32::from_be_bytes(b) })
+                };
+                let ifd = u32_at(4)? as usize;
+                let (mut width, mut height) = (None, None);
+                for n in 0..u16_at(ifd)? as usize {
+                    let entry = ifd + 2 + n * 12;
+                    let value = match u16_at(entry + 2)? {
+                        3 => u16_at(entry + 8),
+                        4 => u32_at(entry + 8),
+                        _ => None,
+                    };
+                    match u16_at(entry)? {
+                        256 => width = value,
+                        257 => height = value,
+                        _ => {}
+                    }
+                }
+                return Some((width?, height?));
+            }
+            // SVG (librsvg through vips' svgload): the root element's width and height when both are plain or `px` numbers,
+            // else its viewBox's; other units and percentages are not read here.
+            if let Some(start) = d[..d.len().min(4100)].windows(4).position(|w| w == b"<svg") {
+                let rest = &d[start..];
+                let tag = ::std::str::from_utf8(&rest[..rest.iter().position(|&b| b == b'>')?]).ok()?;
+                let attribute = |name: &str| -> Option<&str> {
+                    let mut from = 0;
+                    while let Some(at) = tag[from..].find(name) {
+                        let at = from + at;
+                        let before = tag[..at].chars().last();
+                        let after = tag[at + name.len()..].trim_start();
+                        if before.is_some_and(char::is_whitespace) && after.starts_with('=') {
+                            let value = after[1..].trim_start();
+                            let quote = value.chars().next()?;
+                            if quote == '"' || quote == '\'' {
+                                return value[1..].split(quote).next();
+                            }
+                        }
+                        from = at + name.len();
+                    }
+                    None
+                };
+                let pixels = |v: &str| -> Option<u32> {
+                    let v = v.trim();
+                    let n: f64 = v.strip_suffix("px").unwrap_or(v).trim().parse().ok()?;
+                    (n.is_finite() && n > 0.0).then(|| n.round() as u32)
+                };
+                if let (Some(w), Some(h)) = (attribute("width").and_then(pixels), attribute("height").and_then(pixels)) {
+                    return Some((w, h));
+                }
+                if attribute("width").is_none() && attribute("height").is_none() {
+                    let numbers: Vec<f64> = attribute("viewBox")?.split([' ', ',']).filter(|p| !p.is_empty()).filter_map(|p| p.parse().ok()).collect();
+                    if numbers.len() == 4 && numbers[2] > 0.0 && numbers[3] > 0.0 {
+                        return Some((numbers[2].round() as u32, numbers[3].round() as u32));
+                    }
+                }
+                return None;
             }
             if d.starts_with(&[0xff, 0xd8]) {
                 let mut i = 2;
@@ -507,6 +871,7 @@ module AxumDsl
                     response
                 };
                 let limit = if multipart { AXUM_DSL_MULTIPART_LIMIT } else { 2 * 1024 * 1024 };
+                let query = req.uri().query().unwrap_or("").to_string();
                 let bytes = match ::axum::body::to_bytes(req.into_body(), limit).await {
                     Ok(bytes) => bytes,
                     Err(_) => return Err(status_response(::axum::http::StatusCode::PAYLOAD_TOO_LARGE)),
@@ -530,8 +895,8 @@ module AxumDsl
                             Some(filename) => files.push((
                                 part.name,
                                 AxumDslUpload {
+                                    content_type: axum_dsl_identify_content_type(data, &filename, part.content_type.as_deref()),
                                     filename,
-                                    content_type: part.content_type.unwrap_or_else(|| "application/octet-stream".to_string()),
                                     size: data.len() as i64,
                                     checksum: axum_dsl_upload_checksum(data),
                                     metadata: axum_dsl_upload_metadata(data),
@@ -552,6 +917,16 @@ module AxumDsl
                         };
                         all.push((axum_dsl_urldecode(name), axum_dsl_urldecode(value)));
                     }
+                }
+                // set :merge_query_params: Rails' params, the query string's keys under the body's (a key the body
+                // carries, a list included, is the body's alone).
+                if AXUM_DSL_MERGE_QUERY_PARAMS {
+                    let mut merged: Vec<(String, String)> = axum_dsl_query_pairs(&query)
+                        .into_iter()
+                        .filter(|(name, _)| !all.iter().any(|(have, _)| have == name) && !files.iter().any(|(have, _)| have == name))
+                        .collect();
+                    merged.append(&mut all);
+                    all = merged;
                 }
                 let list_names = T::list_names();
                 let mut list_pairs: Vec<(String, String)> = Vec::new();
@@ -621,6 +996,31 @@ module AxumDsl
             let path = dir.join(&key);
             ::tokio::fs::write(&path, &upload.bytes).await.map_err(|e| format!("upload: cannot write {}: {e}", path.display()))?;
             Ok(key)
+        }
+
+        // upload.store_file(root): `store`, and the file as the fields of the Active Storage blob row it will have (`attach`).
+        #[derive(Clone)]
+        #[allow(dead_code)]
+        struct AxumDslStored {
+            key: String,
+            filename: String,
+            content_type: String,
+            size: i64,
+            checksum: String,
+            metadata: String,
+        }
+
+        #[allow(dead_code)]
+        async fn axum_dsl_upload_store_file(upload: &AxumDslUpload, root: &str) -> Result<AxumDslStored, String> {
+            let key = axum_dsl_upload_store(upload, root).await?;
+            Ok(AxumDslStored {
+                key,
+                filename: upload.filename.clone(),
+                content_type: upload.content_type.clone(),
+                size: upload.size,
+                checksum: upload.checksum.clone(),
+                metadata: upload.metadata.clone(),
+            })
         }
       RS
     end
